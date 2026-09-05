@@ -35,7 +35,7 @@ Reference machine: RTX 4080 SUPER 16 GB, 30 GB RAM, one NVMe. 163,840-token cont
 | one 14,000-token answer at 160K context, sustained | 11.7 tok/s | — |
 | llama.cpp on the same machine and file | 1.4–2.2 tok/s chat, 3 tok/s prefill (Unsloth Studio's defaults) | 4.6–6.3 tok/s at long context |
 
-The table was measured before the speculative next-layer block became the default: on the same file and settings, replayed sequences decode 10-12% faster with it (12.1 → 13.5 tok/s in short chat, 9.3 → 10.1 tok/s at 44K context of a real document), the expert cache's prediction of the next layer's experts goes from 76-80% to 95-96%, and the output is unchanged.
+The table was measured before the speculative next-layer block became the default: on the same file and settings, replayed sequences decode 10-12% faster with it (12.1 → 13.5 tok/s in short chat, 9.3 → 10.1 tok/s at 44K context of a real document), the expert cache's prediction of the next layer's experts goes from 76-80% to 95-96%, and the output is unchanged. A later rewrite of the dense-core graph into the shapes ggml's CUDA backend fuses (its fused top-k router, GLU ops, adjacent norm and gamma, an outer-product combine, matmul reductions) took graph A down another 9% and decode at 44K context to 10.3-10.6 tok/s on the same replay, still exact against the CPU path.
 
 While it serves Q4: 22 of 31 GB of RAM in use system-wide, 13.3 of 16 GB of VRAM, the GPU 70% busy, the engine on 3 of 16 threads. A browser with a video and a Discord or Teams call run alongside it without touching the token rate.
 

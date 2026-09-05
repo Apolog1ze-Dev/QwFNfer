@@ -406,6 +406,19 @@ private:
     ggml_tensor * t_emb_ = nullptr;   // token embeddings, before the hc repeat
     ggml_tensor * t_selnext_ = nullptr, * t_selnext2_ = nullptr;
     ggml_tensor * t_specscore_ = nullptr;   // logits of the predicted candidates, best first
+    // Decode readback pack: one F32 tensor aliasing the first rows of t_cur_ that
+    // holds, in order, this layer's FFN input (n_embd), the gate weights (U), the
+    // expert ids as floats (U), the predicted ids as floats (K) and their logits
+    // (K), so the host reads everything graph A produced in ONE device sync
+    // instead of five. Exact: ids below 2^24 convert to F32 and back exactly.
+    ggml_tensor *        t_pack_ = nullptr;
+    int64_t              pack_n_ = 0;
+    std::vector<float>   pack_host_;
+    std::vector<int32_t> pred_next_;          // unpacked prediction, consumed by issue_prefetch
+    std::vector<float>   scores_next_;
+    std::vector<uint8_t> gA_pack_;            // per layer: the cached graph writes the pack
+    ggml_tensor *        p_pc_ = nullptr;     // pinned staging for the CPU partial's async upload
+    ggml_tensor *        t_hcmean_ = nullptr; // F32 [hc]: 1/hc each, for the fused stream mean (GPU graphs)
     ggml_tensor * t_sh_ = nullptr, * t_pg_ = nullptr, * t_pc_ = nullptr, * t_ple_ = nullptr;
     ggml_tensor * inp_tok_ = nullptr, * inp_pos_ = nullptr, * inp_ple_ = nullptr;
     // persistent, host side

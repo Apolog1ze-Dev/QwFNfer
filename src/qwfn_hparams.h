@@ -56,6 +56,9 @@ struct hparams {
     // -- hyper-connections ------------------------------------------------
     // The residual stream carries hc_count parallel copies: width = hc_count*n_embd.
     uint32_t hc_count     = 4;      // -> residual width 10240
+    // The engine scales hc_*_inject.weight by 1/hc at load (exact: a power of two),
+    // so hc_combine skips that scale. Tools that build graphs without the engine leave it false.
+    bool hc_inject_prescaled = false;
     uint32_t hc_low_rank  = 320;
 
     // -- PLE (per-layer / n-gram embeddings) ------------------------------

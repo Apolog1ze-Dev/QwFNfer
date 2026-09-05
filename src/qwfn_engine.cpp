@@ -2,6 +2,7 @@
 #include "qwfn_ple.h"
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -130,6 +131,53 @@ bool engine::init(const model_index * hot, const model_index * cold,
     t_selnext_= ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, QWFN_SPEC_MAX, Bd);
     t_selnext2_= ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, QWFN_SPEC_MAX, Bd);
     t_specscore_= ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, QWFN_SPEC_MAX, Bd);
+    t_hcmean_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, hc, 1);   // (1/hc, ...): the stream mean as a matmul
+    // Shape the hyper-connection and PLE norm gammas [hc*n_embd] as [n_embd, hc]
+    // -- metadata only, same bytes -- so hc_mix and ple can multiply right after
+    // the RMSNorm without a reshape node between them: ggml-cuda fuses
+    // (rms_norm, mul) only when the two are adjacent.
+    {
+        auto reshape_gamma = [&](const std::string & name) {
+            ggml_tensor * t = w_.get(name);
+            if (!t || ggml_nelements(t) != (int64_t) hc * n_embd || t->ne[1] == (int64_t) hc) return;
+            if (ggml_blck_size(t->type) != 1) return;
+            t->ne[0] = n_embd; t->ne[1] = hc; t->ne[2] = 1; t->ne[3] = 1;
+            t->nb[1] = t->nb[0] * n_embd; t->nb[2] = t->nb[1] * hc; t->nb[3] = t->nb[2];
+        };
+        reshape_gamma("output_hc_norm.weight");
+        for (uint32_t l = 0; l < hp_.n_layer; l++) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            for (const char * n : { "hc_attn_norm", "hc_ffn_norm", "ple_norm_key", "ple_norm_query", "ple_norm_conv" })
+                reshape_gamma(b + n + ".weight");
+        }
+        // Fold the 1/hc of hc_combine's gate into the F32 inject weights: 0.25 is a
+        // power of two, so every product and partial sum rounds exactly as before
+        // and the scale kernel disappears. Only if every inject weight is F32.
+        bool all_f32 = true; std::vector<ggml_tensor *> inj;
+        for (uint32_t l = 0; l < hp_.n_layer && all_f32; l++)
+            for (const char * n : { "hc_attn_inject", "hc_ffn_inject" }) {
+                ggml_tensor * t = w_.get("blk." + std::to_string(l) + "." + n + ".weight");
+                if (!t) continue;
+                if (t->type != GGML_TYPE_F32) { all_f32 = false; break; }
+                inj.push_back(t);
+            }
+        if (all_f32 && !inj.empty() && !getenv("QWFN_NO_INJECT_FOLD")) {
+            std::vector<float> buf;
+            for (ggml_tensor * t : inj) {
+                buf.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+                for (float & v : buf) v *= 1.0f / (float) hc;
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
+            }
+            hp_.hc_inject_prescaled = true;
+        }
+    }
+    pack_n_ = n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX;
+    if ((int64_t) Bd * n_embd >= pack_n_ && cfg.use_gpu && !getenv("QWFN_NO_PACK")) {
+        t_pack_ = ggml_view_1d(wctx_, t_cur_, pack_n_, 0);
+        pack_host_.resize(pack_n_); pred_next_.resize(QWFN_SPEC_MAX); scores_next_.resize(QWFN_SPEC_MAX);
+    }
+    gA_pack_.assign(hp_.n_layer, 0);
     // Speculative-block mask by predicted layer, and the per-layer counters.
     spec_block_mask_.assign(hp_.n_layer, cfg.spec_block_layers.empty() ? 1 : 0);
     if (!cfg.spec_block_layers.empty()) {
@@ -159,6 +207,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     if (getenv("QWFN_ROUTE_DUMP_DECODE")) t_xdec_ = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, n_embd, hp_.n_layer);
     if (cfg.skip_miss) t_rscale_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_F32, 1);
     wbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(wctx_, w_.buft());
+    { std::vector<float> m(hc, 1.0f / (float) hc); ggml_backend_tensor_set(t_hcmean_, m.data(), 0, m.size() * sizeof(float)); }
     if (!wbuf_) { err = "failed to allocate engine work buffer"; return false; }
     if (t_rscale_) { const float one = 1.0f; ggml_backend_tensor_set(t_rscale_, &one, 0, 4); }
     save_work_set(dec_ws_);
@@ -185,11 +234,12 @@ bool engine::init(const model_index * hot, const model_index * cold,
             p_gw_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, U);
             p_vslot_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, hp_.n_expert);
             p_vmask_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, hp_.n_expert);
+            p_pc_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, n_embd);
             pbuf_    = ggml_backend_alloc_ctx_tensors_from_buft(pctx_, hb);
             if (!pbuf_ || ggml_backend_buffer_get_type(pbuf_) != hb) {
                 if (pbuf_) ggml_backend_buffer_free(pbuf_);
                 ggml_free(pctx_); pbuf_ = nullptr; pctx_ = nullptr; p_gids_ = nullptr; p_gw_ = nullptr;
-                p_vslot_ = nullptr; p_vmask_ = nullptr;
+                p_vslot_ = nullptr; p_vmask_ = nullptr; p_pc_ = nullptr;
             }
         }
     }
@@ -386,7 +436,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
 // nothing. Returns the [n_embd, 1] sum.
 static ggml_tensor * moe_id_graph(ggml_context * c, const tier_view & tv,
                                   ggml_tensor * ids, ggml_tensor * w, ggml_tensor * x_in,
-                                  int64_t n_embd, int64_t n_ff, int n, int64_t T = 1) {
+                                  int64_t n_embd, int64_t n_ff, int n, int64_t T = 1,
+                                  bool fused_sum = false) {
     ggml_tensor * as[EXPERT_NPARTS];
     as[EXPERT_GATE] = ggml_new_tensor_3d(c, tv.type[EXPERT_GATE], n_embd, n_ff, tv.n_slots);
     as[EXPERT_UP]   = ggml_new_tensor_3d(c, tv.type[EXPERT_UP],   n_embd, n_ff, tv.n_slots);
@@ -402,8 +453,17 @@ static ggml_tensor * moe_id_graph(ggml_context * c, const tier_view & tv,
     ggml_tensor * x    = ggml_view_3d(c, x_in, n_embd, 1, T, x_in->nb[1], x_in->nb[1], 0);
     ggml_tensor * gate = ggml_mul_mat_id(c, as[EXPERT_GATE], x, ids);          // [n_ff, n, T]
     ggml_tensor * up   = ggml_mul_mat_id(c, as[EXPERT_UP],   x, ids);
-    ggml_tensor * act  = ggml_mul(c, ggml_silu(c, gate), up);
+    ggml_tensor * act  = ggml_swiglu_split(c, gate, up);                        // silu(gate) * up, one op; fused with the matmuls on CUDA
     ggml_tensor * down = ggml_mul_mat_id(c, as[EXPERT_DOWN], act, ids);        // [n_embd, n, T]
+    if (fused_sum && T == 1) {
+        // The weighted sum of the n expert rows as one matmul over the transposed
+        // rows: two kernels instead of a multiply and n-1 adds. A different
+        // summation order, so only the GPU graphs ask for it; the CPU path keeps
+        // the sequential sum it is validated with.
+        ggml_tensor * dt = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, down, 1, 0, 2, 3)), n, n_embd);   // [n, n_embd]
+        ggml_tensor * wv = ggml_reshape_2d(c, ggml_cont(c, w), n, 1);                                       // [n, 1]
+        return ggml_mul_mat(c, dt, wv);                                                                       // [n_embd, 1]
+    }
     ggml_tensor * wd   = ggml_mul(c, down, w);
     // Sum the n expert rows of each token, in order.
     ggml_tensor * acc  = ggml_cont(c, ggml_view_2d(c, wd, n_embd, T, wd->nb[2], 0));
@@ -1115,6 +1175,28 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     auto moe_in_graph = [&](uint32_t il) {
         return decode && moe_in_graph_ && ec_.gpu_tier(il).n_slots > 0;
     };
+    // In-place graph outputs. Give the node that produces an output the persistent
+    // tensor's memory (at dst_off bytes) instead of copying into it afterwards:
+    // gallocr leaves a node that already has data alone, views derive theirs from
+    // it, and the backend computes straight into it. Every read of the same
+    // persistent tensor in this graph -- the fold of the previous layer's partials
+    // and activation -- precedes the write in dependency order. One token only,
+    // contiguous, same type, and the node must be the view root (offset 0).
+    auto place = [&](ggml_tensor * t, ggml_tensor * dst, size_t dst_off) -> bool {
+        static const bool no_place = getenv("QWFN_NO_INPLACE") != nullptr;
+        if (no_place || T != 1 || !dst || !dst->data || !dst->buffer) return false;
+        ggml_tensor * root = t; size_t off = 0;
+        while (root->view_src) { off += root->view_offs; root = root->view_src; }
+        if (off != 0 || root->data || root->type != dst->type || !ggml_is_contiguous(root)) return false;
+        if (ggml_nbytes(root) + dst_off > ggml_nbytes(dst)) return false;
+        root->data   = (char *) dst->data + dst_off;
+        root->buffer = dst->buffer;
+        // An output: the allocator must never hand its memory to a child (a
+        // single-child op that can run in place would otherwise write over it),
+        // and it must be computed even when nothing else in the graph reads it.
+        ggml_set_output(root);
+        return true;
+    };
     auto upload_vtable = [&](uint32_t il) {
         if (!decode || !moe_in_graph_ || il >= hp_.n_layer) return;
         if (ec_.gpu_tier(il).n_slots == 0 || ec_.vram_version(il) == vslot_ver_[il]) return;
@@ -1141,7 +1223,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         if (!moe_in_graph(prev) || n_late_ <= 0) return pg;
         ggml_tensor * ids = ggml_view_2d(c, t_gids_, n_late_, 1, t_gids_->nb[1], 0);
         ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, n_late_, 1, t_gw_->nb[1], t_gw_->nb[2], 0);
-        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, 1));
+        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, 1, /*fused_sum=*/true));
     };
 
     int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1],
@@ -1298,6 +1380,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // sparse-attention layers reshape with n_kv every token.
         const bool replayable = cfg_.reuse_graphs && decode && (!hp_.is_attn_layer(il) || use_qd);
         // An attention graph is shaped by its block bucket; a new bucket means a new graph.
+        // Readback pack (t_pack_): decode, one token, the GPU MoE in the graph so
+        // nothing on the device needs t_sel_/t_w_ afterwards. Decided here so the
+        // build and the readback of a cached graph agree.
+        const bool pack_ok = t_pack_ && decode && T == 1 && moe_in_graph(il) && !legacy_moe && !check_moe;
         // A graph that speculatively runs an attention successor's block is shaped by the bucket too.
         const bool spec_attn_next = cfg_.spec_block && decode && use_qd && il + 1 < hp_.n_layer
                                     && hp_.is_attn_layer(il + 1) && spec_block_mask_[il + 1];
@@ -1322,6 +1408,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             const auto ta0 = std::chrono::steady_clock::now();
             ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
             graph_builder gb(c, &hp_, &w_); gb.bind(&st_, g, n_past);
+            gb.set_gpu_fusion(w_.on_gpu() && !getenv("QWFN_NO_FUSE"), t_hcmean_);
 
             ggml_tensor * r = vres(c, cur_res);
             if (pending) {
@@ -1358,8 +1445,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_tensor * slot = ggml_reshape_2d(c, ggml_get_rows(c, t_vslot_[il], sl1), U, 1);      // [U, 1]
                 ggml_tensor * mask = ggml_reshape_3d(c, ggml_get_rows(c, t_vmask_[il], sl1), 1, U, 1);   // [1, U, 1]
                 ggml_tensor * w    = ggml_mul(c, ggml_reshape_3d(c, wtc, 1, U, 1), mask);
-                pg_here = moe_id_graph(c, ec_.gpu_tier(il), slot, w, cur2, n_embd, hp_.n_ff_exp, (int) U, 1);
-                ggml_build_forward_expand(g, ggml_cpy(c, pg_here, v2(c, t_pg_)));
+                pg_here = moe_id_graph(c, ec_.gpu_tier(il), slot, w, cur2, n_embd, hp_.n_ff_exp, (int) U, 1, /*fused_sum=*/true);
+                if (place(pg_here, t_pg_, 0)) ggml_build_forward_expand(g, pg_here);
+                else ggml_build_forward_expand(g, ggml_cpy(c, pg_here, v2(c, t_pg_)));
             }
 
             // Speculate the next layer's routing from `r`, which is this layer's
@@ -1423,10 +1511,18 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 selnext = gb.moe_route_predict(rp, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores);
                 if (t_xdec_ && xpred)   // the head's input for layer il+1, kept for the decode dump
                     ggml_build_forward_expand(g, ggml_cpy(c, xpred, ggml_view_1d(c, t_xdec_, n_embd, (size_t) il * t_xdec_->nb[1])));
-                ggml_build_forward_expand(g, ggml_cpy(c, selnext,
-                        ggml_view_2d(c, t_selnext_, depth, T, t_selnext_->nb[1], 0)));
-                ggml_build_forward_expand(g, ggml_cpy(c, scores,
-                        ggml_view_2d(c, t_specscore_, depth, T, t_specscore_->nb[1], 0)));
+                if (pack_ok) {   // into the readback pack (I32 -> F32 for the ids), see t_pack_
+                    ggml_build_forward_expand(g, ggml_cpy(c, selnext,
+                            ggml_view_1d(c, t_pack_, depth, (size_t) (n_embd + 2 * U) * sizeof(float))));
+                    if (place(scores, t_cur_, (size_t) (n_embd + 2 * U + depth) * sizeof(float))) ggml_build_forward_expand(g, scores);
+                    else ggml_build_forward_expand(g, ggml_cpy(c, scores,
+                            ggml_view_1d(c, t_pack_, depth, (size_t) (n_embd + 2 * U + depth) * sizeof(float))));
+                } else {
+                    ggml_build_forward_expand(g, ggml_cpy(c, selnext,
+                            ggml_view_2d(c, t_selnext_, depth, T, t_selnext_->nb[1], 0)));
+                    ggml_build_forward_expand(g, ggml_cpy(c, scores,
+                            ggml_view_2d(c, t_specscore_, depth, T, t_specscore_->nb[1], 0)));
+                }
                 if (cfg_.speculate_ahead >= 2 && il + 2 < hp_.n_layer) {
                     ggml_tensor * selnext2 = gb.moe_route_predict(rp, (int) il + 2, depth, pred_w(il + 2), pred_b(il + 2));
                     ggml_build_forward_expand(g, ggml_cpy(c, selnext2,
@@ -1434,12 +1530,44 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 }
             }
 
-            ggml_build_forward_expand(g, ggml_cpy(c, r,      vres(c, 1 - cur_res)));
-            ggml_build_forward_expand(g, ggml_cpy(c, cur2,   v2(c, t_cur_)));
-            ggml_build_forward_expand(g, ggml_cpy(c, inject, v2(c, t_inject_)));
-            ggml_build_forward_expand(g, ggml_cpy(c, sl,     v2(c, t_sel_)));
-            ggml_build_forward_expand(g, ggml_cpy(c, wt,     v2(c, t_w_)));
-            ggml_build_forward_expand(g, ggml_cpy(c, sh,     v2(c, t_sh_)));
+            // Outputs in place where the shapes allow (one token): the node that
+            // produces an output gets the persistent tensor's memory, so the copy
+            // kernel goes. See `place` above.
+            ggml_build_forward_expand(g, place(r, res_[1 - cur_res], 0) ? r : ggml_cpy(c, r, vres(c, 1 - cur_res)));
+            ggml_build_forward_expand(g, place(cur2, t_cur_, 0) ? cur2 : ggml_cpy(c, cur2, v2(c, t_cur_)));   // row 0 of t_cur_ is the pack's head
+            ggml_build_forward_expand(g, place(inject, t_inject_, 0) ? inject : ggml_cpy(c, inject, v2(c, t_inject_)));
+            if (pack_ok) {
+                ggml_build_forward_expand(g, place(wt, t_cur_, (size_t) n_embd * sizeof(float)) ? wt
+                        : ggml_cpy(c, wt, ggml_view_1d(c, t_pack_, U, (size_t) n_embd * sizeof(float))));
+                ggml_build_forward_expand(g, ggml_cpy(c, sl, ggml_view_1d(c, t_pack_, U, (size_t) (n_embd + U) * sizeof(float))));   // I32 -> F32: a real conversion
+            } else {
+                ggml_build_forward_expand(g, ggml_cpy(c, sl,     v2(c, t_sel_)));
+                ggml_build_forward_expand(g, ggml_cpy(c, wt,     v2(c, t_w_)));
+            }
+            ggml_build_forward_expand(g, place(sh, t_sh_, 0) ? sh : ggml_cpy(c, sh, v2(c, t_sh_)));
+            gA_pack_[il] = pack_ok;
+            if (getenv("QWFN_GRAPH_STATS") && decode && il < 6) {   // op histogram of one recurrent and one attention graph
+                std::map<std::string, int> hist; int n_real = 0;
+                for (int ni = 0; ni < ggml_graph_n_nodes(g); ni++) {
+                    const ggml_tensor * nd = ggml_graph_node(g, ni);
+                    const ggml_op op = nd->op;
+                    if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_NONE) continue;
+                    std::string nm = op == GGML_OP_UNARY ? std::string("unary:") + ggml_unary_op_name(ggml_get_unary_op(nd))
+                                   : op == GGML_OP_GLU ? std::string("glu") : ggml_op_name(op);
+                    hist[nm]++; n_real++;
+                }
+                fprintf(stderr, "[graph-stats] layer %u (%s): %d nodes, %d kernels:", il, hp_.is_attn_layer(il) ? "attention" : "recurrent", ggml_graph_n_nodes(g), n_real);
+                for (auto & kv : hist) fprintf(stderr, " %s x%d", kv.first.c_str(), kv.second);
+                fprintf(stderr, "\n");
+                if (atoi(getenv("QWFN_GRAPH_STATS")) >= 2 && il == 1) {   // the op sequence, views included, to check fusion adjacency
+                    fprintf(stderr, "[graph-seq] layer %u:", il);
+                    for (int ni = 0; ni < ggml_graph_n_nodes(g); ni++) {
+                        const ggml_tensor * nd = ggml_graph_node(g, ni);
+                        fprintf(stderr, " %s", nd->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(nd)) : ggml_op_name(nd->op));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
             bool cached = false;
             if (replayable) {
                 // Keep the context alive and give the graph its own allocator, so
@@ -1486,8 +1614,20 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             pending = true;
         }
 
-        ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
-        ggml_backend_tensor_get(t_w_,   wgt_.data(), 0, (size_t) U * T * sizeof(float));
+        const bool packed = decode && gA_pack_[il];
+        if (packed) {
+            ggml_backend_tensor_get(t_pack_, pack_host_.data(), 0, (size_t) pack_n_ * sizeof(float));
+            const float * pk = pack_host_.data();
+            ggml_backend_tensor_set(h_cur_, pk, 0, (size_t) n_embd * sizeof(float));   // host tensor: a memcpy
+            for (int64_t e = 0; e < U; e++) { wgt_[e] = pk[n_embd + e]; sel_[e] = (int32_t) lrintf(pk[n_embd + U + e]); }
+            for (uint32_t k = 0; k < QWFN_SPEC_MAX; k++) {
+                pred_next_[k]   = (int32_t) lrintf(pk[n_embd + 2 * U + k]);
+                scores_next_[k] = pk[n_embd + 2 * U + QWFN_SPEC_MAX + k];
+            }
+        } else {
+            ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
+            ggml_backend_tensor_get(t_w_,   wgt_.data(), 0, (size_t) U * T * sizeof(float));
+        }
         if (t_xdec_ && decode) {   // this token's true routing of layer il; the record is complete at the last layer
             memcpy(tok_sel_.data() + (size_t) il * U, sel_.data(), (size_t) U * sizeof(int32_t));
             memcpy(tok_w_.data()   + (size_t) il * U, wgt_.data(), (size_t) U * sizeof(float));
@@ -1755,8 +1895,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 const uint32_t depth = std::min<uint32_t>(QWFN_SPEC_MAX, std::max<uint32_t>((uint32_t) U, cfg_.speculate_depth));
                 const uint32_t K = QWFN_SPEC_MAX;
                 pred_.resize(K); spec_scores_.resize(K); pred_margin_.resize(K);
-                ggml_backend_tensor_get(t_selnext_,   pred_.data(),        0, (size_t) K * sizeof(int32_t));
-                ggml_backend_tensor_get(t_specscore_, spec_scores_.data(), 0, (size_t) K * sizeof(float));
+                if (packed) {
+                    std::copy(pred_next_.begin(), pred_next_.begin() + K, pred_.begin());
+                    std::copy(scores_next_.begin(), scores_next_.begin() + K, spec_scores_.begin());
+                } else {
+                    ggml_backend_tensor_get(t_selnext_,   pred_.data(),        0, (size_t) K * sizeof(int32_t));
+                    ggml_backend_tensor_get(t_specscore_, spec_scores_.data(), 0, (size_t) K * sizeof(float));
+                }
                 // Margin to the routing cut-off (see engine_config::spec_margin).
                 const uint32_t Uu = (uint32_t) U;
                 for (uint32_t r = 0; r < K; r++)
@@ -1784,8 +1929,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             };
             if (!had_miss || prefetch_early) issue_prefetch();
 
-            ggml_backend_tensor_get(t_cur_, xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
-            ggml_backend_tensor_set(h_cur_, xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
+            if (!packed) {
+                ggml_backend_tensor_get(t_cur_, xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
+                ggml_backend_tensor_set(h_cur_, xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
+            }
 
             const size_t nfl = (size_t) n_embd * T;
             std::vector<float> acc(nfl, 0.0f);
@@ -1865,7 +2012,17 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     fprintf(stderr, "\n");
                 }
             }
-            ggml_backend_tensor_set(t_pc_, acc.data(), 0, nfl * sizeof(float));
+            // The CPU partial goes up asynchronously from pinned memory: the copy
+            // is queued on the compute stream ahead of the next layer's graph, and
+            // the staging is next written only after that graph has run
+            // synchronously, so the DMA has long completed. Pageable memory would
+            // make cudaMemcpyAsync block the caller anyway (see the promotions).
+            if (p_pc_ && T == 1) {
+                memcpy(p_pc_->data, acc.data(), nfl * sizeof(float));
+                ggml_backend_tensor_set_async(w_.backend(), t_pc_, p_pc_->data, 0, nfl * sizeof(float));
+            } else {
+                ggml_backend_tensor_set(t_pc_, acc.data(), 0, nfl * sizeof(float));
+            }
             upload_vtable(il + 1);                 // next layer's residency, after this layer's promotions
         } else if (cbatch) {
             // ---- short prompt: the union of its experts through the cache ----

@@ -43,10 +43,19 @@ ggml_tensor * graph_builder::hc_mix(ggml_tensor * x, int il, bool ffn, ggml_tens
     }
 
     // RMSNorm reduces over ne0 = n_embd, i.e. within one stream, but the learned
-    // gamma spans all hc*n_embd. The converter folded gamma to (1 + w).
-    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hp_->rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    // gamma spans all hc*n_embd. The converter folded gamma to (1 + w). The
+    // engine shapes the gamma [n_embd, hc] at load so the norm and the multiply
+    // are adjacent nodes, which ggml-cuda runs as one fused kernel; a gamma
+    // still shaped [hc*n_embd] (a tool without the engine) takes the old form.
+    ggml_tensor * xn;
+    if (w_norm->ne[0] == n_embd && w_norm->ne[1] == hc) {
+        xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hp_->rms_eps), w_norm);   // [n_embd, hc, T]
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    } else {
+        xn = ggml_rms_norm(ctx0, x, hp_->rms_eps);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        xn = ggml_mul(ctx0, xn, w_norm);
+    }
 
     ggml_tensor * lo = ggml_mul_mat(ctx0, w_down, xn);                 // [hc_lr, T]
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
@@ -56,15 +65,24 @@ ggml_tensor * graph_builder::hc_mix(ggml_tensor * x, int il, bool ffn, ggml_tens
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
     // Collapse the streams by their mean.
-    ggml_tensor * mixed = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, gated, n_embd, nt, ggml_row_size(gated->type, n_embd) * hc, 0));
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+    ggml_tensor * mixed;
+    if (gpu_fuse_ && hc_mean_ && nt == 1) {
+        // One matmul with the (1/hc) vector: two kernels instead of five. A
+        // different summation order from the adds below, so GPU graphs only.
+        ggml_tensor * gt = ggml_cont(ctx0, ggml_permute(ctx0, gated, 1, 0, 2, 3));   // [hc, n_embd, T]
+        gt = ggml_reshape_2d(ctx0, gt, hc, n_embd * nt);
+        mixed = ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, hc_mean_, gt), n_embd, nt);
+    } else {
+        mixed = ggml_cont(ctx0,
+                ggml_view_2d(ctx0, gated, n_embd, nt, ggml_row_size(gated->type, n_embd) * hc, 0));
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            mixed = ggml_add(ctx0, mixed, s);
+        }
+        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
 
     if (inject) {
         *inject = ggml_mul_mat(ctx0, w_inject, xn);                    // [hc, T]
@@ -78,14 +96,14 @@ ggml_tensor * graph_builder::hc_combine(ggml_tensor * residual, ggml_tensor * bl
     const int64_t n_embd = hp_->n_embd;
     const int64_t nt     = residual->ne[2];
 
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
-    w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+    ggml_tensor * w = ggml_sigmoid(ctx0, hp_->hc_inject_prescaled ? inject : ggml_scale(ctx0, inject, 1.0f / (float) hc));
+    w = ggml_scale(ctx0, w, 2.0f);                                       // [hc, T]
 
-    ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
-    b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
-
-    return ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+    // block_out[i] * w[c] for every stream is an outer product per token: one op
+    // instead of a repeat and a multiply, and exact (a single product per element).
+    ggml_tensor * b3 = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+    ggml_tensor * w3 = ggml_reshape_3d(ctx0, w, hc, 1, nt);
+    return ggml_add(ctx0, residual, ggml_out_prod(ctx0, b3, w3));       // [n_embd, hc, T]
 }
 
 
@@ -103,7 +121,7 @@ ggml_tensor * graph_builder::conv_with_history(ggml_tensor * state_row, ggml_ten
     // Keep the trailing `hist` positions for the next ubatch.
     ggml_tensor * tail = ggml_view_2d(ctx0, padded, hist, channels,
             padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist));
-    if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, ggml_cont(ctx0, tail), state_row));
+    if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, tail, state_row));   // cpy handles the strided source
 
     return padded;
 }
@@ -165,7 +183,15 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
             ggml_row_size(result->type, head_v * head_v),
             ggml_row_size(result->type, head_v * head_v * n_v_heads),
             ggml_row_size(result->type, head_v * n_v_heads * T));
-    if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s1, st_->rs_state(il)));
+    if (persist_) {
+        // The destination as a [D, 1, 1] view: ggml-cuda recognises this copy of
+        // the kernel's state snapshot and has the gated-delta-net kernel write the
+        // state itself, skipping a 3 MB copy per layer. Same bytes either way.
+        const int64_t D = head_v * head_v * n_v_heads;
+        ggml_tensor * dst = ggml_view_3d(ctx0, st_->rs_state(il), D, 1, 1,
+                                         ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D), 0);
+        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s1, dst));
+    }
 
     // Gated RMSNorm; sigmoid gate here, unlike Qwen3.5's GDN which uses silu.
     ggml_tensor * zg = ggml_reshape_4d(ctx0, z, head_v, n_v_heads, T, 1);
@@ -505,9 +531,9 @@ ggml_tensor * graph_builder::moe(ggml_tensor * cur, int il) {
 
     ggml_tensor * x = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, T);
 
-    ggml_tensor * up   = ggml_mul_mat_id(ctx0, Wl(il, "ffn_up_exps.weight"),   x, selected);
     ggml_tensor * gate = ggml_mul_mat_id(ctx0, Wl(il, "ffn_gate_exps.weight"), x, selected);
-    ggml_tensor * act  = ggml_mul(ctx0, ggml_silu(ctx0, gate), up);
+    ggml_tensor * up   = ggml_mul_mat_id(ctx0, Wl(il, "ffn_up_exps.weight"),   x, selected);
+    ggml_tensor * act  = ggml_swiglu_split(ctx0, gate, up);
     ggml_tensor * down = ggml_mul_mat_id(ctx0, Wl(il, "ffn_down_exps.weight"), act, selected);
 
     down = ggml_mul(ctx0, down, weights_);
@@ -525,8 +551,7 @@ ggml_tensor * graph_builder::moe(ggml_tensor * cur, int il) {
     // One always-on shared expert, with its own scalar sigmoid gate per token.
     ggml_tensor * sg = ggml_mul_mat(ctx0, Wl(il, "ffn_gate_shexp.weight"), cur);
     ggml_tensor * su = ggml_mul_mat(ctx0, Wl(il, "ffn_up_shexp.weight"),   cur);
-    ggml_tensor * sh = ggml_mul_mat(ctx0, Wl(il, "ffn_down_shexp.weight"),
-                                    ggml_mul(ctx0, ggml_silu(ctx0, sg), su));
+    ggml_tensor * sh = ggml_mul_mat(ctx0, Wl(il, "ffn_down_shexp.weight"), ggml_swiglu_split(ctx0, sg, su));
     ggml_tensor * shared_gate = ggml_sigmoid(ctx0,
             ggml_mul_mat(ctx0, Wl(il, "ffn_gate_inp_shexp.weight"), cur));           // [1, T]
     sh = ggml_mul(ctx0, sh, shared_gate);
@@ -547,6 +572,7 @@ ggml_tensor * graph_builder::ple(ggml_tensor * emb, ggml_tensor * hidden, int il
     auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
         t = ggml_reshape_3d(ctx0, t, n_embd, hc, T);
         t = ggml_rms_norm(ctx0, t, hp_->rms_eps);
+        if (w->ne[0] == n_embd && w->ne[1] == hc) return ggml_mul(ctx0, t, w);   // adjacent norm+mul, fused on CUDA
         t = ggml_reshape_2d(ctx0, t, hc_dim, T);
         t = ggml_mul(ctx0, t, w);
         return ggml_reshape_3d(ctx0, t, n_embd, hc, T);
@@ -602,17 +628,26 @@ void graph_builder::moe_route(ggml_tensor * cur, int il, ggml_tensor ** sel, ggm
     const int64_t n_expert_used = hp_->n_expert_used;
     const int64_t T             = cur->ne[1];
 
-    ggml_tensor * logits = ggml_mul_mat(ctx0, Wl(il, "ffn_gate_inp.weight"), cur);
+    ggml_tensor * logits = ggml_mul_mat(ctx0, Wl(il, "ffn_gate_inp.weight"), cur);   // [n_expert, T]
     ggml_tensor * probs  = ggml_soft_max(ctx0, logits);
 
-    ggml_tensor * selected = ggml_top_k(ctx0, probs, n_expert_used);
-    ggml_tensor * weights_ = ggml_get_rows(ctx0,
-            ggml_reshape_3d(ctx0, probs, 1, n_expert, T), selected);
+    // llama.cpp's own node sequence -- argsort_top_k on the probabilities, the
+    // probabilities reshaped for the gather, the gathered weights normalised by a
+    // clamped sum -- is what ggml-cuda recognises and runs as ONE fused kernel
+    // (softmax, sort, gather, normalise). The clamp is part of the pattern and a
+    // no-op here: ten softmax probabilities of 512 sum far above 6e-5. Expanding
+    // from the weights pins that order in the graph whatever is built next.
+    ggml_tensor * selected = ggml_argsort_top_k(ctx0, probs, n_expert_used);            // [U, T], a view
+    ggml_tensor * probs3   = ggml_reshape_3d(ctx0, probs, 1, n_expert, T);
+    ggml_tensor * weights_ = ggml_get_rows(ctx0, probs3, selected);                      // [1, U, T]
     weights_ = ggml_reshape_2d(ctx0, weights_, n_expert_used, T);
-    weights_ = ggml_div(ctx0, weights_, ggml_sum_rows(ctx0, weights_));
+    ggml_tensor * denom = ggml_clamp(ctx0, ggml_sum_rows(ctx0, weights_), 6.103515625e-5f, INFINITY);
+    weights_ = ggml_div(ctx0, weights_, denom);
+    weights_ = ggml_reshape_3d(ctx0, weights_, 1, n_expert_used, T);
+    if (gf_) ggml_build_forward_expand(gf_, weights_);
 
     *sel = selected;
-    *w   = weights_;
+    *w   = weights_;   // [1, U, T]
 }
 
 ggml_tensor * graph_builder::moe_route_predict(ggml_tensor * res_hc, int il_next, int k,
@@ -647,7 +682,7 @@ ggml_tensor * graph_builder::moe_apply(ggml_tensor * cur, int il,
     for (int e = 0; e < n_used; e++) {
         ggml_tensor * g = ggml_mul_mat(ctx0, gate[e], cur);
         ggml_tensor * u = ggml_mul_mat(ctx0, up[e],   cur);
-        ggml_tensor * y = ggml_mul_mat(ctx0, down[e], ggml_mul(ctx0, ggml_silu(ctx0, g), u));
+        ggml_tensor * y = ggml_mul_mat(ctx0, down[e], ggml_swiglu_split(ctx0, g, u));
 
         y = ggml_scale(ctx0, y, w[e]);
         acc = acc ? ggml_add(ctx0, acc, y) : y;
@@ -659,8 +694,7 @@ ggml_tensor * graph_builder::moe_apply(ggml_tensor * cur, int il,
 ggml_tensor * graph_builder::shared_expert(ggml_tensor * cur, int il) {
     ggml_tensor * sg = ggml_mul_mat(ctx0, Wl(il, "ffn_gate_shexp.weight"), cur);
     ggml_tensor * su = ggml_mul_mat(ctx0, Wl(il, "ffn_up_shexp.weight"),   cur);
-    ggml_tensor * sh = ggml_mul_mat(ctx0, Wl(il, "ffn_down_shexp.weight"),
-                                    ggml_mul(ctx0, ggml_silu(ctx0, sg), su));
+    ggml_tensor * sh = ggml_mul_mat(ctx0, Wl(il, "ffn_down_shexp.weight"), ggml_swiglu_split(ctx0, sg, su));
     // One scalar sigmoid gate per token, distinct from the routed gates.
     ggml_tensor * g = ggml_sigmoid(ctx0,
             ggml_mul_mat(ctx0, Wl(il, "ffn_gate_inp_shexp.weight"), cur));
@@ -690,7 +724,7 @@ ggml_tensor * graph_builder::moe_apply_batched(ggml_tensor * cur, int il,
                                        xp->nb[1], g.off * xp->nb[1]);
         ggml_tensor * a = ggml_mul_mat(ctx0, g.gate, x);
         ggml_tensor * b = ggml_mul_mat(ctx0, g.up,   x);
-        ggml_tensor * y = ggml_mul_mat(ctx0, g.down, ggml_mul(ctx0, ggml_silu(ctx0, a), b));
+        ggml_tensor * y = ggml_mul_mat(ctx0, g.down, ggml_swiglu_split(ctx0, a, b));
         ggml_tensor * dst = ggml_view_2d(ctx0, yp, yp->ne[0], g.cnt,
                                          yp->nb[1], (size_t) g.off * yp->nb[1]);
         ggml_build_forward_expand(gf_, ggml_cpy(ctx0, y, dst));

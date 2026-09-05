@@ -136,6 +136,12 @@ public:
     // predict that layer's routing; the exact pass that follows does the writes.
     void set_persist(bool p) { persist_ = p; }
 
+    // GPU-only fusions that change the summation order (so the CPU path, which
+    // is kept bit-exact against llama.cpp, does not take them): the mean over
+    // the hc streams in hc_mix as one matmul with `hc_mean` (F32 [hc], every
+    // entry 1/hc). Only applied to single-token graphs.
+    void set_gpu_fusion(bool on, ggml_tensor * hc_mean) { gpu_fuse_ = on; hc_mean_ = hc_mean; }
+
     // MoE with the selected experts supplied explicitly, one mul_mat each,
     // pointing straight at cached blocks. Decode path: with a single token the
     // per-layer selection is exactly n_expert_used experts, so no gather or
@@ -211,6 +217,8 @@ private:
     ggml_cgraph *   gf_ = nullptr;
     int64_t         n_past_ = 0;
     bool            persist_ = true;
+    bool            gpu_fuse_ = false;
+    ggml_tensor *   hc_mean_ = nullptr;
 };
 
 } // namespace qwfn

@@ -7,7 +7,8 @@
 #
 #   SCENARIO=short   a framed one-line question, thinking on (default)
 #   SCENARIO=doc     the engineering log and the roadmap attached (~40K tokens), then a question
-#   MODEL, CTX (131072), GEN (200), RAM (12), VRAM (12) override the defaults.
+#   MODEL, CTX (131072), GEN (200), RAM (12), VRAM (12) override the defaults; GEN_BIN points
+#   the replay run at another qwfn-gen binary for a binary-vs-binary A/B.
 #
 # The first call for a scenario builds its inputs: the prompt through the model's
 # tokenizer (qwfn-tok) and, with one greedy generation at the default settings,
@@ -17,6 +18,7 @@ set -u
 cd "$(dirname "$0")/.."
 MODEL=${MODEL:-$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/5d16c055a7c5cb276e721ee154f9c22420dde2a1/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}
 SCEN=${SCENARIO:-short}; GEN=${GEN:-200}; CTX=${CTX:-131072}; RAM=${RAM:-12}; VRAM=${VRAM:-12}
+GEN_BIN=${GEN_BIN:-./build/qwfn-gen}   # an older binary for an A/B (e.g. build/qwfn-gen.pre-pack)
 DIR=bench/replay; mkdir -p "$DIR"
 PROMPT=$DIR/$SCEN.prompt; REPLAY=$DIR/$SCEN.replay
 COMMON=(--ram "$RAM" --vram "$VRAM" --ctx "$CTX" --kv q4_0 --batch 4096 --gen "$GEN")
@@ -43,7 +45,7 @@ if [ ! -s "$REPLAY" ]; then
 fi
 
 log=$DIR/$SCEN.$name.log
-./build/qwfn-gen "$MODEL" --prompt-file "$PROMPT" --replay-file "$REPLAY" --ppl "${COMMON[@]}" "$@" 2>&1 | grep -v "$FILTER" > "$log"
+"$GEN_BIN" "$MODEL" --prompt-file "$PROMPT" --replay-file "$REPLAY" --ppl "${COMMON[@]}" "$@" 2>&1 | grep -v "$FILTER" > "$log"
 
 python3 - "$log" "$SCEN" "$name" "$*" <<'PY'
 import re, sys, os
