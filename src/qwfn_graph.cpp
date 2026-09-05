@@ -21,11 +21,6 @@ ggml_tensor * graph_builder::Wl(int il, const char * suffix) const {
 }
 
 ggml_tensor * graph_builder::hc_mix(ggml_tensor * x, int il, bool ffn, ggml_tensor ** inject) {
-    const int64_t hc      = hp_->hc_count;
-    const int64_t n_embd  = hp_->n_embd;
-    const int64_t hc_dim  = hc * n_embd;
-    const int64_t nt      = x->ne[2];
-
     ggml_tensor * w_norm;
     ggml_tensor * w_down;
     ggml_tensor * w_up;
@@ -41,6 +36,15 @@ ggml_tensor * graph_builder::hc_mix(ggml_tensor * x, int il, bool ffn, ggml_tens
         w_up     = Wl(il, (std::string(p) + "_up.weight").c_str());
         w_inject = Wl(il, (std::string(p) + "_inject.weight").c_str());
     }
+    return hc_mix_w(x, w_norm, w_down, w_up, w_inject, inject);
+}
+
+ggml_tensor * graph_builder::hc_mix_w(ggml_tensor * x, ggml_tensor * w_norm, ggml_tensor * w_down,
+                                      ggml_tensor * w_up, ggml_tensor * w_inject, ggml_tensor ** inject) {
+    const int64_t hc      = hp_->hc_count;
+    const int64_t n_embd  = hp_->n_embd;
+    const int64_t hc_dim  = hc * n_embd;
+    const int64_t nt      = x->ne[2];
 
     // RMSNorm reduces over ne0 = n_embd, i.e. within one stream, but the learned
     // gamma spans all hc*n_embd. The converter folded gamma to (1 + w). The
@@ -673,6 +677,45 @@ ggml_tensor * graph_builder::moe_route_predict(ggml_tensor * res_hc, int il_next
         *scores_out = ggml_reshape_2d(ctx0, s, k, T);
     }
     return ids;
+}
+
+ggml_tensor * graph_builder::mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos,
+                                      ggml_tensor * kq_mask, const int sections[4], int il) {
+    const int64_t hc = hp_->hc_count, n_embd = hp_->n_embd, hc_dim = hc * n_embd;
+    const int64_t T  = emb->ne[1];
+
+    // Grouped RMSNorm of the wide residual with the head's gamma over all hc*n_embd,
+    // as the trunk's mixers do (gamma [n_embd, hc] when the engine reshaped it).
+    ggml_tensor * hnorm = Wl(il, "nextn.hnorm.weight");
+    ggml_tensor * hn;
+    if (hnorm->ne[0] == n_embd && hnorm->ne[1] == hc) {
+        hn = ggml_mul(ctx0, ggml_rms_norm(ctx0, h, hp_->rms_eps), hnorm);
+    } else {
+        hn = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, hp_->rms_eps), hc_dim, T);
+        hn = ggml_reshape_3d(ctx0, ggml_mul(ctx0, hn, hnorm), n_embd, hc, T);
+    }
+    // The next token's embedding, normed, shared across the streams.
+    ggml_tensor * en = rms(emb, Wl(il, "nextn.enorm.weight"));                              // [n_embd, T]
+    en = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, en, n_embd, 1, T), n_embd, hc, T, 1);
+    // eh_proj holds fc_embedding and fc_hidden side by side: one matmul over the
+    // per-stream concatenation is fc_embedding @ e + fc_hidden @ h for each stream.
+    ggml_tensor * cat = ggml_concat(ctx0, en, hn, 0);                                          // [2*n_embd, hc, T]
+    ggml_tensor * res = ggml_mul_mat(ctx0, Wl(il, "nextn.eh_proj.weight"),
+                                     ggml_reshape_2d(ctx0, cat, 2 * n_embd, hc * T));        // [n_embd, hc*T]
+    res = ggml_reshape_3d(ctx0, res, n_embd, hc, T);
+
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = hc_mix(res, il, /*ffn=*/false, &inject);
+    cur = sparse_attn(cur, inp_pos, kq_mask, sections, il, nullptr);                        // dense, as the reference
+    res = hc_combine(res, cur, inject);
+    cur = hc_mix(res, il, /*ffn=*/true, &inject);
+    cur = moe(cur, il);                                                                       // the head's 512 experts, resident
+    res = hc_combine(res, cur, inject);
+
+    // The head's own mixer collapses the streams and doubles as the output norm.
+    ggml_tensor * o = hc_mix_w(res, Wl(il, "nextn.hc_head_norm.weight"), Wl(il, "nextn.hc_head_down.weight"),
+                               Wl(il, "nextn.hc_head_up.weight"), nullptr, nullptr);
+    return ggml_mul_mat(ctx0, W("output.weight"), o);                                        // the trunk's LM head, via alt
 }
 
 ggml_tensor * graph_builder::moe_apply(ggml_tensor * cur, int il,

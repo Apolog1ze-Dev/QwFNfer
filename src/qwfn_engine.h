@@ -105,6 +105,12 @@ struct engine_config {
     bool      spec_block = false;
     // Which predicted layers get the block: "" = all, else "1,2,5-9,47".
     std::string spec_block_layers;
+    // MTP draft head, experiment stage: the nextn GGUF (the checkpoint ships one
+    // block, MTP/mtp-...gguf). Loaded whole on the GPU, run after every decoded
+    // token on the trunk's last residual and the sampled token, and its draft
+    // scored against the token that actually followed. Nothing is verified or
+    // rolled back yet: this measures the acceptance rate the rest depends on.
+    std::string mtp_path;
     // Decode without waiting for expert misses: the token is computed from the
     // experts that are resident (gates renormalised), the misses' reads still
     // go out and land for next time. An approximation -- measure its NLL.
@@ -223,6 +229,10 @@ public:
     uint64_t margin_hits[SPEC_MARGIN_BUCKETS] = {}, margin_total[SPEC_MARGIN_BUCKETS] = {};
     std::vector<uint64_t> pred_hits_layer, pred_total_layer;
     uint64_t pf_gated = 0;   // predicted candidates the margin gate declined to read
+    // MTP experiment: drafts scored against the next token (decode), and against
+    // the prompt's own tokens when the prompt went through in one batch.
+    uint64_t mtp_n = 0, mtp_acc = 0, mtp_top3 = 0, mtp_prompt_n = 0, mtp_prompt_acc = 0;
+    double   t_mtp = 0;
     static int   margin_bucket(float m);
     static float margin_edge(int b);   // lower edge of bucket b
     uint64_t check_moe_gpu_calls = 0, check_moe_cpu_calls = 0;   // QWFN_CHECK_MOE bookkeeping
@@ -419,6 +429,20 @@ private:
     std::vector<uint8_t> gA_pack_;            // per layer: the cached graph writes the pack
     ggml_tensor *        p_pc_ = nullptr;     // pinned staging for the CPU partial's async upload
     ggml_tensor *        t_hcmean_ = nullptr; // F32 [hc]: 1/hc each, for the fused stream mean (GPU graphs)
+    // MTP draft head (experiment).
+    model_index   mi_mtp_;
+    weights       wm_;                        // the nextn block, experts included, resident
+    state         st_mtp_;                    // its KV: one attention layer at n_ctx
+    hparams       hpm_;                       // the MTP file's hparams, the block typed as attention
+    bool          mtp_on_ = false, mtp_have_h_ = false, mtp_kv_valid_ = true;
+    ggml_tensor * t_hlast_ = nullptr;         // F32 [n_embd, hc, Bd]: the wide residual after the last layer, per position of the last eval
+    ggml_tensor * t_mtp_pos_ = nullptr;       // I32 [4*Bd]: the draft's positions
+    int64_t       mtp_h_rows_ = 0;            // rows of t_hlast_ the last eval filled
+    int32_t       mtp_draft_ = -1, mtp_draft_top_[3] = { -1, -1, -1 };
+    // Run the head for n positions starting at `pos`, reading rows h_row.. of
+    // t_hlast_ and e_row.. of t_emb_; `actual` (may be null) are the tokens at
+    // positions pos+2.. for scoring, n_actual of them.
+    bool mtp_draft(int64_t pos, int64_t n, int64_t h_row, int64_t e_row, const int32_t * actual, int64_t n_actual, std::string & err);
     ggml_tensor * t_sh_ = nullptr, * t_pg_ = nullptr, * t_pc_ = nullptr, * t_ple_ = nullptr;
     ggml_tensor * inp_tok_ = nullptr, * inp_pos_ = nullptr, * inp_ple_ = nullptr;
     // persistent, host side

@@ -192,6 +192,20 @@ public:
     // il >= 0 selects blk.<il>.hc_{attn,ffn}_*; il < 0 selects the model-level
     // hc_head_* mixer. `ffn` picks which of the two per-layer modules to use.
     ggml_tensor * hc_mix(ggml_tensor * x, int il, bool ffn, ggml_tensor ** inject);
+    // The same mixer with its tensors given explicitly (the MTP head's own mixer).
+    ggml_tensor * hc_mix_w(ggml_tensor * x, ggml_tensor * w_norm, ggml_tensor * w_down, ggml_tensor * w_up,
+                           ggml_tensor * w_inject, ggml_tensor ** inject);
+
+    // The nextn/MTP draft head, wired as llama.cpp's graph_mtp: the trunk's wide
+    // residual of token p (`h`, [n_embd, hc, T]) and the embedding of token p+1
+    // (`emb`, [n_embd, T]), each normed with the head's gamma, concatenated per
+    // stream and projected by eh_proj into a new wide residual; then one
+    // trunk-style block at position p (attention over the head's own KV, dense
+    // as in the reference; the head's MoE), the head's mixer, the trunk's LM
+    // head. Returns logits [n_vocab, T] for token p+2. `il` is the block's
+    // index in the MTP file; its tensors come from `w`, the LM head through `alt`.
+    ggml_tensor * mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos,
+                           ggml_tensor * kq_mask, const int sections[4], int il);
 
     // residual + broadcast(block_out) * 2*sigmoid(inject/hc).
     // The 2*sigmoid centres the scatter weights on 1, so a zero injection leaves

@@ -78,6 +78,24 @@ bool engine::init(const model_index * hot, const model_index * cold,
     if (!w_.commit(err)) return false;
 
     if (!wh_.init(hot, /*prefer_gpu=*/false, backend_dir, err)) return false;
+
+    // ---- MTP draft head (experiment): the nextn block, resident ---------------
+    if (!cfg.mtp_path.empty() && cfg.use_gpu) {
+        if (!mi_mtp_.load(cfg.mtp_path, err)) return false;
+        if (!wm_.init(&mi_mtp_, /*prefer_gpu=*/true, backend_dir, err)) return false;
+        for (const auto & kv : mi_mtp_.tensors())
+            if (!wm_.declare(kv.first)) { err = "mtp: failed to declare " + kv.first; return false; }
+        if (!wm_.commit(err)) return false;
+        hpm_ = mi_mtp_.hp();
+        hpm_.full_attention_interval = hpm_.n_layer;   // in this index only the last block, the nextn block, is attention
+        hpm_.ssm_dt_rank = 1;                           // the index's 48 trunk slots carry no state here; keep theirs tiny
+        hpm_.hc_inject_prescaled = false;               // its inject weights are Q8_0 and are not folded
+        state_config scm; scm.n_ctx = cfg.n_ctx; scm.type_k = cfg.type_k; scm.type_v = cfg.type_v;
+        if (!st_mtp_.init(&hpm_, scm, w_.buft(), err)) return false;
+        mtp_on_ = true;
+        fprintf(stderr, "[qwfn] mtp: nextn block %u of %s, %.2f GB resident on %s; drafts are scored, not verified (experiment)\n",
+                hpm_.n_layer - 1, cfg.mtp_path.c_str(), wm_.bytes() / 1e9, wm_.dev_name());
+    }
     if (!wh_.map_shards(err)) return false;
     if (!wh_.declare_mapped("per_layer_token_embd.weight")) {
         err = "per_layer_token_embd.weight missing"; return false;
@@ -132,18 +150,28 @@ bool engine::init(const model_index * hot, const model_index * cold,
     t_selnext2_= ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, QWFN_SPEC_MAX, Bd);
     t_specscore_= ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, QWFN_SPEC_MAX, Bd);
     t_hcmean_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, hc, 1);   // (1/hc, ...): the stream mean as a matmul
+    if (mtp_on_) {
+        t_hlast_   = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, n_embd, hc, Bd);
+        t_mtp_pos_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, 4 * Bd);
+    }
     // Shape the hyper-connection and PLE norm gammas [hc*n_embd] as [n_embd, hc]
     // -- metadata only, same bytes -- so hc_mix and ple can multiply right after
     // the RMSNorm without a reshape node between them: ggml-cuda fuses
     // (rms_norm, mul) only when the two are adjacent.
     {
-        auto reshape_gamma = [&](const std::string & name) {
-            ggml_tensor * t = w_.get(name);
+        auto reshape_gamma_in = [&](weights & wt, const std::string & name) {
+            ggml_tensor * t = wt.get(name);
             if (!t || ggml_nelements(t) != (int64_t) hc * n_embd || t->ne[1] == (int64_t) hc) return;
             if (ggml_blck_size(t->type) != 1) return;
             t->ne[0] = n_embd; t->ne[1] = hc; t->ne[2] = 1; t->ne[3] = 1;
             t->nb[1] = t->nb[0] * n_embd; t->nb[2] = t->nb[1] * hc; t->nb[3] = t->nb[2];
         };
+        auto reshape_gamma = [&](const std::string & name) { reshape_gamma_in(w_, name); };
+        if (mtp_on_) {
+            const std::string b = "blk." + std::to_string(hpm_.n_layer - 1) + ".";
+            for (const char * n : { "hc_attn_norm", "hc_ffn_norm", "nextn.hnorm", "nextn.hc_head_norm" })
+                reshape_gamma_in(wm_, b + n + ".weight");
+        }
         reshape_gamma("output_hc_norm.weight");
         for (uint32_t l = 0; l < hp_.n_layer; l++) {
             const std::string b = "blk." + std::to_string(l) + ".";
@@ -515,6 +543,7 @@ void engine::set_embeddings(int32_t pos, const float * emb, int32_t n) {
 }
 
 void engine::reset() {
+    mtp_have_h_ = false; mtp_kv_valid_ = true; mtp_draft_ = -1;
     st_.reset(); n_past_ = 0;
     pool_dirty_ = true;
     if (qbuf_) {
@@ -642,6 +671,7 @@ const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, 
     // keeps the per-ubatch sweep for comparison.
     static const bool legacy_prefill = getenv("QWFN_LEGACY_PREFILL") != nullptr;
     const bool streamed = n_new > 1 && !as_decode;
+    if (streamed && mtp_on_) mtp_kv_valid_ = false;   // the head has no rows for a streamed prefill (not yet built)
     if (streamed && !prefill_enter(err)) return nullptr;
     bool ok = true;
     if (streamed && !legacy_prefill) {
@@ -2369,6 +2399,23 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     if (!decode) ec_.settle_promotions();   // warm-up promotions landed
 
     if (deferred_wait_) { if (!ec_.fetch_end()) { err = "expert read failed"; return false; } deferred_wait_ = false; }
+
+    // ---- MTP experiment, decode: score the previous draft against this token,
+    // then draft the token after this one from (h of the previous token, this
+    // token's embedding) at the previous token's position. Before the head:
+    // it overwrites t_hlast_. ----------------------------------------------
+    if (mtp_on_ && T == 1) {
+        const int32_t tok = hist[n_hist - 1];
+        if (mtp_draft_ >= 0) {
+            mtp_n++;
+            if (tok == mtp_draft_) mtp_acc++;
+            for (int k = 0; k < 3; k++) if (tok == mtp_draft_top_[k]) { mtp_top3++; break; }
+        }
+        mtp_draft_ = -1;
+        if (mtp_have_h_ && mtp_kv_valid_ && n_past >= 1) {
+            if (!mtp_draft(n_past - 1, 1, mtp_h_rows_ - 1, 0, nullptr, 0, err)) return false;
+        }
+    }
     // ---- head --------------------------------------------------------------
     {
         ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
@@ -2381,6 +2428,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 : ggml_add(c, ggml_add(c, v2(c, t_sh_), pg), v2(c, t_pc_));
             r = gb.hc_combine(r, tot, v2(c, t_inject_));
         }
+        if (mtp_on_)   // the wide residual of every position, for the draft head
+            ggml_build_forward_expand(g, ggml_cpy(c, r, ggml_view_3d(c, t_hlast_, n_embd, hc, T, t_hlast_->nb[1], t_hlast_->nb[2], 0)));
         // Only the final position produces logits.
         r = ggml_view_3d(c, r, n_embd, hc, 1, r->nb[1], r->nb[2], (size_t) (T - 1) * r->nb[2]);
         ggml_tensor * o = gb.hc_mix(r, -1, false, nullptr);
@@ -2392,12 +2441,75 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         ggml_free(c);
     }
 
+    if (mtp_on_) {
+        mtp_have_h_ = true; mtp_h_rows_ = T;
+        if (T > 1) {
+            // A batch is the head's prompt only at the start of the sequence: its
+            // rows 0..T-2 pair with embeddings 1..T-1 at positions 0..T-2, and the
+            // drafts for positions whose target is inside the prompt are scored.
+            if (n_past == 0) {
+                if (!mtp_draft(0, T - 1, 0, 1, hist + (n_hist - T) + 2, T - 2, err)) return false;
+            } else {
+                mtp_kv_valid_ = false;   // a mid-sequence batch: the head's KV would have a gap
+            }
+        }
+    }
     if (ibuf) ggml_backend_buffer_free(ibuf);
     if (ictx) ggml_free(ictx);
     n_past_ += T;
 
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (decode) { t_decode += dt; n_decode += T; } else { t_prefill += dt; n_prefill += T; }
+    return true;
+}
+
+bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, int64_t e_row,
+                       const int32_t * actual, int64_t n_actual, std::string & err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count;
+    attn_inputs ai;
+    if (!build_attn_inputs(pos, n, ai, err)) return false;
+    {
+        std::vector<int32_t> p((size_t) 4 * n, 0);
+        for (int64_t i = 0; i < n; i++) p[i] = p[n + i] = p[2 * n + i] = (int32_t) (pos + i);
+        ggml_backend_tensor_set(t_mtp_pos_, p.data(), 0, p.size() * sizeof(int32_t));
+    }
+    ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false); ip.no_alloc = true;
+    ggml_context * c = ggml_init(ip);
+    ggml_cgraph *  g = ggml_new_graph_custom(c, 16384, false);
+    graph_builder gb(c, &hpm_, &wm_, &w_); gb.bind(&st_mtp_, g, pos);
+    ggml_tensor * h = ggml_view_3d(c, t_hlast_, n_embd, hc, n, t_hlast_->nb[1], t_hlast_->nb[2], (size_t) h_row * t_hlast_->nb[2]);
+    ggml_tensor * e = ggml_view_2d(c, t_emb_, n_embd, n, t_emb_->nb[1], (size_t) e_row * t_emb_->nb[1]);
+    ggml_tensor * pv = ggml_view_1d(c, t_mtp_pos_, 4 * n, 0);
+    int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1], hp_.mrope_sections[2], hp_.mrope_sections[3] };
+    ggml_tensor * logits = gb.mtp_head(h, e, pv, ai.kq_mask, sections, (int) hpm_.n_layer - 1);
+    ggml_set_output(logits);
+    ggml_build_forward_expand(g, logits);
+    run_on(g, true);
+    const int64_t nv = logits->ne[0];
+    std::vector<float> lg((size_t) nv * n);
+    ggml_backend_tensor_get(logits, lg.data(), 0, lg.size() * sizeof(float));
+    for (int64_t j = 0; j < n; j++) {
+        const float * col = lg.data() + j * nv;
+        int32_t top[3] = { -1, -1, -1 }; float tv[3] = { -INFINITY, -INFINITY, -INFINITY };
+        for (int64_t v = 0; v < nv; v++) {
+            const float x = col[v];
+            if (x > tv[2]) {
+                if (x > tv[0])      { tv[2] = tv[1]; top[2] = top[1]; tv[1] = tv[0]; top[1] = top[0]; tv[0] = x; top[0] = (int32_t) v; }
+                else if (x > tv[1]) { tv[2] = tv[1]; top[2] = top[1]; tv[1] = x; top[1] = (int32_t) v; }
+                else                { tv[2] = x; top[2] = (int32_t) v; }
+            }
+        }
+        if (actual) {
+            if (j < n_actual) { mtp_prompt_n++; if (actual[j] == top[0]) mtp_prompt_acc++; }
+        } else {
+            mtp_draft_ = top[0];
+            for (int k = 0; k < 3; k++) mtp_draft_top_[k] = top[k];
+        }
+    }
+    ai.release();
+    ggml_free(c);
+    t_mtp += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 

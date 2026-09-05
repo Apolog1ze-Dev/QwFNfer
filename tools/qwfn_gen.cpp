@@ -60,6 +60,7 @@ int main(int argc, char ** argv) {
         if (a == "--spec-gate-inflight" && i + 1 < argc) { cfg.spec_gate_inflight = (uint32_t) atoi(next()); continue; }
         if (a == "--spec-block") { cfg.spec_block = true; continue; }
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
+        if (a == "--mtp" && i + 1 < argc) { cfg.mtp_path = next(); continue; }
         if (a == "--ram-frac" && i + 1 < argc) { cfg.ram_frac = atof(next()); continue; }
         // 0 forces the batched prefill path at every size. Reference runs want
         // this: token-by-token prefill is a different (equally valid) summation
@@ -200,6 +201,11 @@ int main(int argc, char ** argv) {
            (unsigned long long) s.pf_issued, (unsigned long long) s.pf_used,
            s.pf_issued ? 100.0 * s.pf_used / s.pf_issued : 0.0,
            (unsigned long long) s.pf_wasted);
+    if (eng.mtp_n || eng.mtp_prompt_n)
+        printf("mtp draft: %llu decode drafts scored, %llu accepted (%.1f%%), top-3 %.1f%% | prompt: %llu scored, %.1f%% accepted | %.2f s in the head\n",
+               (unsigned long long) eng.mtp_n, (unsigned long long) eng.mtp_acc,
+               eng.mtp_n ? 100.0 * eng.mtp_acc / eng.mtp_n : 0.0, eng.mtp_n ? 100.0 * eng.mtp_top3 / eng.mtp_n : 0.0,
+               (unsigned long long) eng.mtp_prompt_n, eng.mtp_prompt_n ? 100.0 * eng.mtp_prompt_acc / eng.mtp_prompt_n : 0.0, eng.t_mtp);
     if (eng.pf_gated)
         printf("prefetch gate: %llu predicted candidates not read (margin < %.2f%s)\n",
                (unsigned long long) eng.pf_gated, cfg.spec_margin,
