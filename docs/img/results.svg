@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1040" viewBox="0 0 1400 1040" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <rect width="1400" height="1040" fill="#0f1216"/>
+  <text x="40" y="52" fill="#e6e9ee" font-size="28" font-weight="600">Qwen3.8-Flash-Next UD-Q4_K_XL (111 GB, 56B MoE) on one 16 GB GPU + 30 GB RAM + NVMe</text>
+  <text x="40" y="82" fill="#8b95a3" font-size="16">qwfnfer engine · RTX 4080 SUPER 16 GB · 30 GB RAM · one NVMe · 163,840-token context, KV q4_0 · measured 2026-09-05 · UD-Q3_K_XL (90 GB) shown for comparison</text>
+  <text x="40" y="104" fill="#8b95a3" font-size="13">llama.cpp rows: the same machine and files; Q4 through Unsloth Studio's bundled llama-server (build 10715) at its defaults: 126K context, KV q4_0, --fit on, 4 slots, unified KV, speculative on</text>
+
+  <text x="40" y="146" fill="#e6e9ee" font-size="18" font-weight="600">Decode, tokens/s</text>
+  <g font-size="14">
+    <text x="40" y="176" fill="#e6e9ee" font-size="15" font-weight="600">UD-Q4_K_XL (111 GB)</text><text x="40" y="210" fill="#e6e9ee">qwfnfer · short chat</text><rect x="400" y="194" width="201" height="22" rx="3" fill="#6ee7b7" opacity="1.0"/><text x="611" y="210" fill="#c9d1db" font-size="14">11.8</text><text x="40" y="246" fill="#e6e9ee">qwfnfer · 155K-token document, grounded answer</text><rect x="400" y="230" width="158" height="22" rx="3" fill="#6ee7b7" opacity="1.0"/><text x="568" y="246" fill="#c9d1db" font-size="14">9.3</text><text x="40" y="282" fill="#e6e9ee">qwfnfer · one 14,000-token answer at 160K context</text><rect x="400" y="266" width="199" height="22" rx="3" fill="#6ee7b7" opacity="1.0"/><text x="609" y="282" fill="#c9d1db" font-size="14">11.7 sustained</text><text x="40" y="318" fill="#e6e9ee">llama.cpp via Unsloth Studio · short chat</text><rect x="400" y="302" width="32" height="22" rx="3" fill="#f87171" opacity="0.85"/><text x="442" y="318" fill="#c9d1db" font-size="14">1.4–2.2  (three runs: 2.15, 1.99, 1.41)</text><text x="40" y="354" fill="#e6e9ee">llama.cpp via Unsloth Studio · 4K-token document</text><rect x="400" y="338" width="45" height="22" rx="3" fill="#f87171" opacity="0.85"/><text x="455" y="354" fill="#c9d1db" font-size="14">2.6</text><text x="40" y="404" fill="#e6e9ee" font-size="15" font-weight="600">UD-Q3_K_XL (90 GB)</text><text x="40" y="438" fill="#e6e9ee">qwfnfer · short chat</text><rect x="400" y="422" width="306" height="22" rx="3" fill="#6ee7b7" opacity="0.6"/><text x="716" y="438" fill="#c9d1db" font-size="14">16.8–19.1</text><text x="40" y="474" fill="#e6e9ee">qwfnfer · 155K-token document, grounded answer</text><rect x="400" y="458" width="246" height="22" rx="3" fill="#6ee7b7" opacity="0.6"/><text x="656" y="474" fill="#c9d1db" font-size="14">14.5</text><text x="40" y="510" fill="#e6e9ee">llama.cpp · long context (mmap paging)</text><rect x="400" y="494" width="94" height="22" rx="3" fill="#f87171" opacity="0.6"/><text x="504" y="510" fill="#c9d1db" font-size="14">4.6–6.3</text>
+  </g>
+
+  <text x="820" y="146" fill="#e6e9ee" font-size="18" font-weight="600">Prefill of a long document, tokens/s</text>
+  <g font-size="14">
+    <text x="820" y="176" fill="#e6e9ee" font-size="15" font-weight="600">UD-Q4_K_XL</text><text x="820" y="210" fill="#e6e9ee">qwfnfer · 155,221 tokens</text><rect x="1080" y="194" width="194" height="22" rx="3" fill="#6ee7b7" opacity="1.0"/><text x="1284" y="210" fill="#c9d1db" font-size="14">228  (11 min)</text><text x="820" y="246" fill="#e6e9ee">llama.cpp (Unsloth) · 117,138 tokens</text><rect x="1080" y="230" width="3" height="22" rx="3" fill="#f87171" opacity="0.85"/><text x="1093" y="246" fill="#c9d1db" font-size="14">3.0  (stopped at 4,096 tokens; 117K ≈ 11 h)</text><text x="820" y="296" fill="#e6e9ee" font-size="15" font-weight="600">UD-Q3_K_XL</text><text x="820" y="330" fill="#e6e9ee">qwfnfer · 155,221 tokens</text><rect x="1080" y="314" width="232" height="22" rx="3" fill="#6ee7b7" opacity="0.6"/><text x="1322" y="330" fill="#c9d1db" font-size="14">273</text><text x="820" y="366" fill="#e6e9ee">this engine's first version (mmap)</text><rect x="1080" y="350" width="2" height="22" rx="3" fill="#6ee7b7" opacity="0.3"/><text x="1092" y="366" fill="#c9d1db" font-size="14">2.6</text>
+  </g>
+
+  <text x="820" y="416" fill="#e6e9ee" font-size="18" font-weight="600">What the machine looks like while it serves (Q4)</text>
+  <g font-size="14" fill="#c9d1db">
+    <text x="820" y="448">RAM in use, whole system: <tspan fill="#e6e9ee" font-weight="600">22.4 of 31 GB</tspan>  (engine 14.8 GB)</text>
+    <text x="820" y="476">VRAM in use: <tspan fill="#e6e9ee" font-weight="600">13.3 of 16 GB</tspan>  (1 GB kept in reserve for the desktop)</text>
+    <text x="820" y="504">GPU busy: <tspan fill="#e6e9ee" font-weight="600">70%</tspan> during decode · CPU: <tspan fill="#e6e9ee" font-weight="600">3.1 of 16 threads</tspan> (system 34% busy)</text>
+  </g>
+  <rect x="820" y="524" width="540" height="96" rx="10" fill="rgba(110,231,183,.07)" stroke="rgba(110,231,183,.35)"/>
+  <text x="836" y="548" fill="#6ee7b7" font-size="14" font-weight="600">The desktop stays usable while it serves</text>
+  <text x="836" y="570" fill="#c9d1db" font-size="13">8 GB of RAM, 13 of 16 CPU threads and the GPU's reserve are left over:</text>
+  <text x="836" y="589" fill="#c9d1db" font-size="13">a browser with a video, a Discord or Teams call and the usual desktop</text>
+  <text x="836" y="608" fill="#c9d1db" font-size="13">run alongside it without touching the token rate.</text>
+
+  <text x="40" y="660" fill="#e6e9ee" font-size="18" font-weight="600">How</text>
+  <g font-size="14" fill="#c9d1db">
+    <text x="40" y="692">1. Expert slices read at their natural 0.6–1.2 MB size over io_uring/O_DIRECT — 23× the bandwidth of 4 KiB demand paging on the same NVMe.</text>
+    <text x="40" y="720">2. Three-tier expert cache: VRAM (6.3 GB, ~2,021 experts), 12 GB pinned RAM, NVMe — 95% of lookups hit, 82% served from VRAM.</text>
+    <text x="40" y="748">3. VRAM-resident experts computed inside each layer's replayed CUDA graph; residency looked up on the device, no host round trip.</text>
+    <text x="40" y="776">4. Next-layer routing predicted from the residual and prefetched while the current layer computes; only the reads a token needs are waited for.</text>
+    <text x="40" y="804">5. Decode attention flat at any context: sparse attention over pooled block keys — the same 0.55 ms per layer at 4K and at 160K.</text>
+    <text x="40" y="832">6. Layer-major prefill streams each layer's experts in 16 MB chunks into VRAM and sweeps the whole batch; the tier lends it the memory and takes it back.</text>
+    <text x="40" y="860">7. OpenAI-compatible server (streaming, tool calling, thinking budget, live stats) and a console with hardware-aware settings from a fitted cost model.</text>
+  </g>
+  <text x="40" y="932" fill="#8b95a3" font-size="13">Q3_K_XL is faster because its expert blocks are 42% smaller: every gigabyte of VRAM holds 30% more experts and every miss reads less. Q4_K_XL is the quality choice.</text>
+  <text x="40" y="954" fill="#8b95a3" font-size="13">llama.cpp Q4 rows: Unsloth Studio's llama-server as the Studio launches it, same prompts, its own timings. Its prefill is page-fault bound (158 MB/s off the NVMe, GPU 15–30% busy), so the</text>
+  <text x="40" y="976" fill="#8b95a3" font-size="13">117K document was stopped after 4,096 tokens and its grounded decode was measured over a 4K-token document instead. The llama.cpp Q3 figure is from an earlier session (mmap, long context).</text>
+  <text x="40" y="998" fill="#8b95a3" font-size="13">Built on ggml (quantized kernels, CUDA backend) and llama.cpp's tokenizer; the graph, memory hierarchy, cache, prefill, server and console are the engine's own. Forward pass validated bit-exact against llama.cpp.</text>
+  <text x="40" y="1020" fill="#8b95a3" font-size="13">GPU decode is nondeterministic run to run; numbers are single measured runs on the same machine, same checkpoints, same settings.</text>
+</svg>

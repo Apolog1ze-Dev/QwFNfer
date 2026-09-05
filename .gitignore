@@ -1,0 +1,40 @@
+# Working notes that stay local (the README is the public face)
+ROADMAP.md
+docs/ENGINEERING.md
+
+# Build output (any build dir: build, build2, build-*, cmake-build-*)
+build*/
+cmake-build-*/
+compile_commands.json
+*.o
+*.a
+*.so
+
+# Test artifacts and generated pages
+pagoda_qwen3.8.html
+*.log
+*.out
+*.err
+
+# Predictor training / routing dumps (large binaries; they live under ~/.cache)
+*.pred
+*.bin
+*.npy
+*.npz
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Agent scratch
+.claude/

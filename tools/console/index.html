@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwfn console</title>
+<style>
+  :root { --bg:#0f1216; --panel:#171b21; --line:#262c35; --fg:#e6e9ee; --dim:#8b95a3; --acc:#6ee7b7; --warn:#f6c453; --bad:#f87171; --ok:#6ee7b7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 22px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+  header h1 { font-size:17px; margin:0 12px 0 0; font-weight:600 }
+  .pill { display:inline-flex; align-items:center; gap:8px; padding:5px 10px; border:1px solid var(--line); border-radius:999px; color:var(--dim); font-size:12.5px }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim) }
+  .dot.ready { background:var(--ok) } .dot.busy { background:var(--warn); box-shadow:0 0 0 3px rgba(246,196,83,.18) } .dot.loading { background:var(--warn) } .dot.exited { background:var(--bad) }
+  nav { display:flex; gap:4px; margin-left:auto }
+  nav button { background:transparent; color:var(--dim); border:1px solid transparent; border-radius:9px; padding:7px 14px; font:inherit; font-weight:600; cursor:pointer }
+  nav button.on { color:var(--fg); border-color:var(--line); background:var(--panel) }
+  main { max-width:1400px; margin:0 auto; padding:18px 22px }
+  .tab { display:none } .tab.on { display:block }
+  .grid2 { display:grid; grid-template-columns: 1.1fr 1fr; gap:18px }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:18px }
+  h2 { font-size:12.5px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); margin:0 0 12px }
+  .banner { border:1px solid rgba(110,231,183,.35); background:rgba(110,231,183,.06); border-radius:12px; padding:12px 16px; margin-bottom:18px; display:flex; gap:18px; align-items:center; flex-wrap:wrap }
+  .banner.off { border-color:var(--line); background:transparent; color:var(--dim) }
+  .banner b { font-size:15px } .banner .flags { font-family:var(--mono); font-size:12.5px; color:var(--dim) } .banner .flags span { display:inline-block; margin-right:10px; color:var(--fg) }
+  .model { display:grid; grid-template-columns: 22px 1fr auto; gap:10px; align-items:center; padding:11px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
+  .model.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
+  .model .name { font-weight:600 } .model .note { color:var(--dim); font-size:12.5px; margin-top:2px }
+  .tag { font-size:11px; padding:2px 7px; border-radius:6px; border:1px solid var(--line); color:var(--dim) }
+  .tag.recommended { color:var(--ok); border-color:rgba(110,231,183,.4) } .tag.slower { color:var(--warn); border-color:rgba(246,196,83,.4) } .tag.cold { color:var(--bad); border-color:rgba(248,113,113,.4) }
+  .kv { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:10px }
+  .kv div { border:1px solid var(--line); border-radius:10px; padding:10px 12px } .kv b { display:block; font-size:19px; font-weight:600; margin-top:2px } .kv span { color:var(--dim); font-size:12px } .kv small { display:block; color:var(--dim); font-size:11.5px; margin-top:3px }
+  form { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px 14px }
+  label { display:flex; flex-direction:column; gap:4px; color:var(--dim); font-size:12px }
+  input, select, textarea { background:#0f1216; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc) }
+  .locked { opacity:.45; pointer-events:none }
+  .hint { color:var(--warn); font-size:12.5px; margin:6px 0 0 }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px }
+  button { background:var(--acc); color:#0b0f12; border:0; border-radius:9px; padding:9px 14px; font:inherit; font-weight:600; cursor:pointer }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line) } button.danger { background:var(--bad); color:#fff } button:disabled { opacity:.45; cursor:default }
+  .notes { color:var(--dim); font-size:12.5px; margin-top:10px } .notes li { margin:3px 0 }
+  .est { display:flex; gap:14px; flex-wrap:wrap; color:var(--dim); font-size:12.5px; margin-top:10px } .est b { color:var(--fg) }
+  #options { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px }
+  #options th { text-align:left; color:var(--dim); font-weight:500; padding:4px 6px; border-bottom:1px solid var(--line) }
+  #options td { padding:5px 6px; border-bottom:1px solid var(--line); cursor:pointer } #options tr.sel td { background:rgba(110,231,183,.08) } #options tr:hover td { background:rgba(255,255,255,.03) }
+  .endpoint { font-family:var(--mono); font-size:13px; background:#0f1216; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; gap:10px }
+  canvas { width:100%; height:80px; display:block; margin-top:10px }
+  pre { background:#0b0e12; border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px; line-height:1.4; max-height:560px; overflow:auto; margin:0; white-space:pre-wrap; color:#b7c0cc }
+  .muted { color:var(--dim) } .err { color:var(--bad) }
+  .chat { display:grid; grid-template-columns: 1fr 260px; gap:18px }
+  .msgs { min-height:420px; max-height:62vh; overflow:auto; display:flex; flex-direction:column; gap:12px; padding:4px 2px }
+  .msg { border:1px solid var(--line); border-radius:12px; padding:10px 14px; max-width:92% } .msg.user { align-self:flex-end; background:rgba(110,231,183,.07); border-color:rgba(110,231,183,.3) } .msg.assistant { align-self:flex-start }
+  .msg .who { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px; margin-bottom:4px }
+  .msg .text { white-space:pre-wrap; word-break:break-word }
+  details { margin:4px 0 8px } summary { cursor:pointer; color:var(--dim); font-size:12.5px } .think { color:var(--dim); font-size:12.5px; white-space:pre-wrap; border-left:2px solid var(--line); padding-left:10px; margin-top:6px; max-height:260px; overflow:auto }
+  .meta { color:var(--dim); font-size:11.5px; margin-top:6px }
+  .compose { display:flex; gap:10px; margin-top:12px } .compose textarea { flex:1; min-height:64px; resize:vertical }
+  @media (max-width: 980px) { .grid2, .chat { grid-template-columns: 1fr } form { grid-template-columns: repeat(2, 1fr) } }
+</style>
+</head>
+<body>
+<header>
+  <h1>qwfn console</h1>
+  <span class="pill"><span id="dot" class="dot"></span><span id="state">connecting…</span></span>
+  <span class="pill" id="uptime"></span>
+  <nav>
+    <button data-tab="serve" class="on">Serve</button>
+    <button data-tab="chat">Chat</button>
+    <button data-tab="stats">Stats</button>
+    <button data-tab="log">Log</button>
+  </nav>
+</header>
+<main>
+  <div class="banner off" id="banner"><span>No model is being served.</span></div>
+
+  <div class="tab on" id="tab-serve">
+    <div class="grid2">
+      <section>
+        <h2>Models downloaded</h2>
+        <div id="models" class="muted">scanning…</div>
+        <div class="muted" id="hfdir" style="font-size:12px;margin-top:6px"></div>
+        <h2 style="margin-top:18px">This machine</h2>
+        <div class="kv" id="hw"></div>
+      </section>
+      <section>
+        <h2>Settings <span class="muted" style="text-transform:none;letter-spacing:0">— for the selected model on this machine; edit anything</span></h2>
+        <div id="settingsbox">
+          <div class="row" style="margin:0 0 10px">
+            <span class="muted" style="font-size:12.5px">priority</span>
+            <select id="priority"><option value="fastest">fastest chat (32K context)</option><option value="balanced" selected>balanced (largest context within 10% of the best decode)</option><option value="context">longest context</option></select>
+          </div>
+          <form id="form" onsubmit="return false">
+            <label>Context (tokens)<select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
+            <label>KV cache<select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
+            <label>RAM tier (GB)<input id="ram" type="number" min="2" max="64"></label>
+            <label>Batch<select id="batch"><option>2048</option><option>4096</option></select></label>
+            <label>VRAM reserve (MB)<input id="reserve" type="number" min="256" max="4096" step="128"></label>
+            <label>Port<input id="port" type="number" min="1024" max="65535"></label>
+            <label>Thinking<select id="think"><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
+            <label>Thinking budget (tokens, 0 = none)<input id="think_budget" type="number" min="0" step="500"></label>
+            <label>Skip missed experts<select id="skip_miss"><option value="false">off (exact)</option><option value="true">on (+16-29% decode, small NLL cost)</option></select></label>
+            <label>Vision (image input)<select id="vision"><option value="true">on (loads the projector onto the GPU, --mmproj)</option><option value="false">off (text only)</option></select></label>
+          </form>
+          <div class="est" id="est"></div>
+          <table id="options"></table>
+          <ul class="notes" id="notes"></ul>
+        </div>
+        <p class="hint" id="lockhint" hidden>A server is running with the settings shown in the banner. Stop it to change the model or the settings.</p>
+        <div class="row">
+          <button id="start">Start server</button>
+          <button id="stop" class="danger" disabled>Stop server</button>
+          <button id="reco" class="secondary">Reset to recommended</button>
+          <span id="msg" class="muted"></span>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-chat">
+    <div class="chat">
+      <section>
+        <h2>Chat <span class="muted" style="text-transform:none;letter-spacing:0">— talks to the served endpoint directly, streamed; the history is kept here and replayed each turn</span></h2>
+        <div class="msgs" id="msgs"><div class="muted" id="chatempty">No model is being served. Start one on the Serve tab.</div></div>
+        <div class="compose">
+          <textarea id="prompt" placeholder="Message… (Enter to send, Shift+Enter for a newline)"></textarea>
+          <div style="display:flex;flex-direction:column;gap:8px"><button id="send">Send</button><button id="abort" class="danger" disabled>Stop</button><button id="clear" class="secondary">Clear</button></div>
+        </div>
+      </section>
+      <section>
+        <h2>Request settings</h2>
+        <form onsubmit="return false" style="grid-template-columns:1fr">
+          <label>Thinking<select id="c_think"><option value="">server default</option><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
+          <label>Temperature<input id="c_temp" type="number" step="0.05" min="0" max="2" placeholder="preset"></label>
+          <label>Max tokens<input id="c_max" type="number" min="1" step="100" value="2000"></label>
+          <label>Thinking budget<input id="c_budget" type="number" min="0" step="500" placeholder="server default"></label>
+          <label>System prompt<textarea id="c_system" rows="3" placeholder="optional"></textarea></label>
+        </form>
+        <h2 style="margin-top:16px">Last reply</h2>
+        <div class="kv" style="grid-template-columns:1fr 1fr">
+          <div><span>generation</span><b id="c_tps">—</b><span>tok/s</span></div>
+          <div><span>prefill</span><b id="c_ptps">—</b><span>tok/s</span></div>
+          <div><span>tokens</span><b id="c_tok">—</b><span id="c_toknote">reply</span></div>
+          <div><span>time</span><b id="c_time">—</b><span>s of generation</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="tab" id="tab-stats">
+    <section>
+      <h2>Live <span class="muted" style="text-transform:none;letter-spacing:0">— polled every 5 s; peaks and averages are for this server's lifetime as seen by the console</span></h2>
+      <div class="endpoint"><span>endpoint <b id="endpoint">—</b> <span class="muted" id="modelid"></span></span><button class="secondary" id="copy">copy</button></div>
+      <div class="kv" style="margin-top:12px">
+        <div><span>generation now</span><b id="tps">—</b><span id="tpsnote">tok/s</span><small id="tps2"></small></div>
+        <div><span>prefill</span><b id="ptps">—</b><span>tok/s, last request</span><small id="ptps2"></small></div>
+        <div><span>tokens served</span><b id="served">—</b><span id="servednote"></span></div>
+        <div><span>requests</span><b id="reqs">—</b><span id="reqsnote">since start</span></div>
+        <div><span>context in use</span><b id="ctxuse">—</b><span id="ctxnote"></span><small id="ctx2"></small></div>
+        <div><span>expert cache</span><b id="hit">—</b><span>hit · from VRAM</span><small id="hit2"></small></div>
+        <div><span>current request</span><b id="cur">—</b><span id="curnote"></span></div>
+        <div><span>last request</span><b id="last">—</b><span id="lastnote"></span></div>
+      </div>
+      <canvas id="chart" width="1200" height="80"></canvas>
+      <div class="muted" style="font-size:12px;margin-top:4px">generation tok/s, last 5 minutes · <span id="chartnote"></span></div>
+    </section>
+  </div>
+
+  <div class="tab" id="tab-log">
+    <section>
+      <h2>Server log <span class="muted" style="text-transform:none;letter-spacing:0">— last lines, follows while you stay at the bottom</span></h2>
+      <pre id="log">—</pre>
+    </section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let models = [], selected = 0, reco = null, hist = [], peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }, lastStatus = null;
+const fmt = (n, d=1) => (n === undefined || n === null || isNaN(n)) ? '—' : Number(n).toFixed(d);
+const big = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n);
+async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + b.dataset.tab));
+  try { localStorage.setItem('qwfn.tab', b.dataset.tab); } catch (e) {}
+});
+try { const t = (location.hash || '').replace('#', '') || localStorage.getItem('qwfn.tab'); if (t) { const b = document.querySelector('nav button[data-tab="' + t + '"]'); if (b) b.click(); } } catch (e) {}
+// ?ask=<text>: send one message on load (for a headless screenshot). The page's load
+// event is held back by an image the console answers only when this page reports the
+// reply complete, so a headless browser captures the finished exchange.
+const askParam = new URLSearchParams(location.search).get('ask'), holdParam = new URLSearchParams(location.search).get('hold');
+let holdToken = null;
+if (askParam || holdParam) { holdToken = String(Date.now()); const img = new Image(); img.src = '/api/hold?token=' + holdToken; document.body.appendChild(img); img.style.display = 'none'; }
+
+async function loadModels() {
+  const d = await api('/api/models'); models = d.models; $('hfdir').textContent = 'from ' + d.hf;
+  const rec = models.findIndex(m => m.tag === 'recommended'); if (rec >= 0) selected = rec;
+  renderModels();
+}
+function renderModels() {
+  const el = $('models'); el.innerHTML = '';
+  if (!models.length) { el.textContent = 'no Qwen3.8-Flash-Next GGUF found in the Hugging Face cache'; return; }
+  models.forEach(m => {
+    const div = document.createElement('div'); div.className = 'model' + (m.id === selected ? ' sel' : '');
+    div.innerHTML = `<input type="radio" ${m.id === selected ? 'checked' : ''}><div><div class="name">${m.name} <span class="muted">${m.size_gb} GB</span></div><div class="note">${m.note}</div></div><span class="tag ${m.tag === 'cold only' ? 'cold' : m.tag}">${m.tag}</span>`;
+    div.onclick = () => { selected = m.id; visionChoice = null; renderModels(); loadReco(); };
+    el.appendChild(div);
+  });
+}
+async function loadHw() {
+  const hw = await api('/api/hardware');
+  $('hw').innerHTML = `
+    <div><span>GPU</span><b style="font-size:14px">${hw.gpu || 'none'}</b><span>${(hw.vram_total_mb/1024).toFixed(1)} GB VRAM, ${(hw.vram_used_mb/1024).toFixed(1)} used</span></div>
+    <div><span>RAM</span><b>${hw.ram_total_gb} GB</b><span>${hw.ram_available_gb} GB available</span></div>
+    <div><span>CPU threads</span><b>${hw.cpu_threads}</b><span></span></div>
+    <div><span>desktop on GPU</span><b>${hw.desktop_gpu ? 'yes' : 'no'}</b><span>${hw.other_gpu_apps || 0} other GPU apps</span></div>`;
+}
+function applyOption(o) {
+  $('ctx').value = o.ctx; $('kv').value = o.kv;
+  $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb} GB</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>KV + state <b>${o.state_gb} GB</b></span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b></span>` : ''}<span>predicted decode <b>${o.tok_s_short}</b> tok/s in chat, <b>${o.tok_s_long_doc}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
+  document.querySelectorAll('#options tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.ctx === o.ctx));
+}
+let visionChoice = null;   // null: the model's default (on when an mmproj file is there)
+async function loadReco() {
+  const r = await api('/api/recommend?model=' + selected + '&priority=' + $('priority').value + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0'))); reco = r;
+  ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
+  $('skip_miss').value = String(r.skip_miss);
+  const von = $('vision').options[0];
+  von.disabled = !r.mmproj; von.textContent = r.mmproj ? `on (${r.mmproj.split('/').pop()}, ${r.mmproj_gb} GB of VRAM, --mmproj)` : 'unavailable (no mmproj-*.gguf next to this model)';
+  $('vision').value = String(r.vision);
+  const tb = $('options');
+  tb.innerHTML = '<tr><th>context</th><th>KV</th><th>VRAM tier</th><th>experts in VRAM</th><th>from VRAM</th><th>decode, chat</th><th>decode, long document</th></tr>' +
+    r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${(o.ctx/1024).toFixed(0)}K</td><td>${o.kv}</td><td>${o.tier_gb} GB</td><td>${o.blocks}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${o.tok_s_short} tok/s</td><td>${o.tok_s_long_doc} tok/s</td></tr>`).join('');
+  tb.querySelectorAll('tr[data-ctx]').forEach(tr => tr.onclick = () => applyOption(r.options.find(o => o.ctx === +tr.dataset.ctx)));
+  applyOption(r.options.find(o => o.ctx === r.ctx) || r.options[r.options.length - 1]);
+  $('notes').innerHTML = r.notes.map(n => `<li>${n}</li>`).join('');
+}
+$('priority').onchange = loadReco;
+$('vision').onchange = () => { visionChoice = $('vision').value === 'true'; loadReco(); };
+function settings() {
+  return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, batch: +$('batch').value, reserve: +$('reserve').value,
+           port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
+           vision: $('vision').value === 'true' };
+}
+$('start').onclick = async () => {
+  $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true;
+  const r = await api('/api/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ model: selected, settings: settings() }) });
+  if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; $('start').disabled = false; }
+  else { $('msg').textContent = 'started, loading the model…'; hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }; }
+  poll();
+};
+$('stop').onclick = async () => { $('msg').textContent = 'stopping…'; $('msg').className = 'muted'; await api('/api/stop', { method: 'POST' }); poll(); };
+$('reco').onclick = () => { visionChoice = null; loadReco(); };
+$('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('endpoint').textContent);
+
+function setLocked(s) {
+  const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
+  $('settingsbox').classList.toggle('locked', running); $('models').classList.toggle('locked', running);
+  $('lockhint').hidden = !running;
+  $('start').disabled = running; $('stop').disabled = !s.console_started;
+  if (!running && $('msg').textContent === 'started, loading the model…') $('msg').textContent = '';
+  const b = $('banner');
+  if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
+  const st = s.settings || {}, p = s.props || {};
+  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
+                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.vision ? 'vision' : ''].filter(Boolean);
+  b.className = 'banner';
+  b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}</span></span>
+    <span class="flags">${flags.map(f => `<span>${f}</span>`).join('')}</span>
+    <span class="muted" style="margin-left:auto;font-family:var(--mono);font-size:12.5px">${s.endpoint}</span>`;
+}
+
+function drawChart() {
+  const c = $('chart'), g = c.getContext('2d'); g.clearRect(0,0,c.width,c.height);
+  if (hist.length < 2) return;
+  const max = Math.max(5, ...hist, peak.tps), w = c.width / 59, h = c.height - 8;
+  g.strokeStyle = '#2b3340'; g.beginPath(); g.moveTo(0, 4 + h - (peak.tps / max) * h); g.lineTo(c.width, 4 + h - (peak.tps / max) * h); g.stroke();
+  g.strokeStyle = '#6ee7b7'; g.lineWidth = 2; g.beginPath();
+  hist.forEach((v, i) => { const x = c.width - (hist.length - 1 - i) * w, y = 4 + h - (v / max) * h; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.stroke(); g.fillStyle = '#8b95a3'; g.font = '12px system-ui'; g.fillText(max.toFixed(0) + ' tok/s', 6, 14);
+}
+async function poll() {
+  let s; try { s = await api('/api/status'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
+  lastStatus = s;
+  $('dot').className = 'dot ' + s.state; $('state').textContent = s.state + (s.external ? ' (external)' : '');
+  $('uptime').textContent = s.uptime_s ? 'up ' + (s.uptime_s >= 3600 ? Math.floor(s.uptime_s/3600) + ' h ' : '') + Math.floor((s.uptime_s % 3600)/60) + ' min' : '';
+  $('endpoint').textContent = s.endpoint; $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : '';
+  setLocked(s);
+  // While a server runs, the cards and the settings show what is being served.
+  const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
+  if (running && s.model && models.length) {
+    const i = models.findIndex(m => m.name === s.model);
+    if (i >= 0 && i !== selected) { selected = i; renderModels(); await loadReco(); }
+    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('vision').value = String(!!s.settings.vision); }
+  }
+  const chatable = s.state === 'ready' || s.state === 'busy';
+  $('send').disabled = !chatable || chatting; const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
+  const st = s.stats;
+  if (st) {
+    const g = st.generation, p = st.prompt, t = st.totals, c = st.expert_cache;
+    const now = st.busy ? g.tokens_per_second : 0;
+    if (g.tokens_per_second > peak.tps) peak.tps = g.tokens_per_second;
+    if (p.tokens_per_second > peak.ptps) peak.ptps = p.tokens_per_second;
+    if (st.context.n_past > peak.ctx) peak.ctx = st.context.n_past;
+    if (c.hit_rate > peak.hit) peak.hit = c.hit_rate;
+    $('tps').textContent = st.busy ? fmt(g.tokens_per_second) : (g.n ? fmt(g.tokens_per_second) : '—'); $('tpsnote').textContent = st.busy ? 'tok/s, generating now' : 'tok/s, last request';
+    $('tps2').textContent = `peak ${fmt(peak.tps)} · session avg ${fmt(t.generated_tokens_per_second)}`;
+    $('ptps').textContent = fmt(p.tokens_per_second, 0); $('ptps2').textContent = `peak ${fmt(peak.ptps, 0)} · session avg ${fmt(t.prompt_tokens_per_second, 0)}`;
+    $('served').textContent = big(t.generated_tokens + t.prompt_tokens); $('servednote').textContent = big(t.generated_tokens) + ' generated · ' + big(t.prompt_tokens) + ' prompt';
+    $('reqs').textContent = t.requests; $('reqsnote').textContent = t.requests ? 'avg ' + big(Math.round(t.generated_tokens / t.requests)) + ' generated per request' : 'since start';
+    $('ctxuse').textContent = big(st.context.n_past); $('ctxnote').textContent = 'of ' + big(st.context.n_ctx); $('ctx2').textContent = 'highest reached ' + big(peak.ctx);
+    $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'best hit ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' GB read from NVMe';
+    $('cur').textContent = st.busy ? big(g.n) + ' tok' : '—'; $('curnote').textContent = st.busy ? 'so far, ' + fmt(g.ms/1000, 0) + ' s' : 'idle';
+    $('last').textContent = g.n && !st.busy ? big(g.n) + ' tok' : (g.n ? '…' : '—'); $('lastnote').textContent = g.n && !st.busy ? 'in ' + fmt(g.ms/1000, 1) + ' s after a ' + big(p.n) + '-token prompt' : '';
+    hist.push(now); if (hist.length > 60) hist.shift(); drawChart(); $('chartnote').textContent = 'grey line: peak ' + fmt(peak.tps) + ' tok/s';
+  }
+  const lg = $('log'); const atBottom = lg.scrollHeight - lg.scrollTop - lg.clientHeight < 40;
+  lg.textContent = (s.log || []).join('\n') || '—'; if (atBottom) lg.scrollTop = lg.scrollHeight;
+}
+
+let chatHistory = [], chatting = false, aborter = null;
+function addMsg(role, text) {
+  const d = document.createElement('div'); d.className = 'msg ' + role;
+  d.innerHTML = `<div class="who">${role}</div>${role === 'assistant' ? '<details hidden><summary>thinking</summary><div class="think"></div></details>' : ''}<div class="text"></div><div class="meta"></div>`;
+  d.querySelector('.text').textContent = text || ''; $('msgs').appendChild(d); $('msgs').scrollTop = $('msgs').scrollHeight; return d;
+}
+async function send() {
+  const text = $('prompt').value.trim(); if (!text || chatting || !lastStatus) return;
+  const endpoint = lastStatus.endpoint; $('prompt').value = '';
+  chatHistory.push({ role: 'user', content: text }); addMsg('user', text); const ce = $('chatempty'); if (ce) ce.hidden = true;
+  const el = addMsg('assistant', ''); const think = el.querySelector('.think'), det = el.querySelector('details'), textEl = el.querySelector('.text'), meta = el.querySelector('.meta');
+  const body = { messages: ($('c_system').value.trim() ? [{ role: 'system', content: $('c_system').value.trim() }] : []).concat(chatHistory), stream: true, timings_per_token: true };
+  if ($('c_think').value) body.reasoning_effort = $('c_think').value;
+  if ($('c_temp').value !== '') body.temperature = +$('c_temp').value;
+  if ($('c_max').value) body.max_tokens = +$('c_max').value;
+  if ($('c_budget').value !== '') body.reasoning_budget = +$('c_budget').value;
+  chatting = true; $('send').disabled = true; $('abort').disabled = false; aborter = new AbortController();
+  let reasoning = '', content = '', timings = null, t0 = performance.now(), tFirst = 0;
+  try {
+    const r = await fetch(endpoint + '/chat/completions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body), signal: aborter.signal });
+    if (!r.ok) { textEl.textContent = 'HTTP ' + r.status + ': ' + (await r.text()).slice(0, 400); textEl.classList.add('err'); throw new Error('http'); }
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i; while ((i = buf.indexOf('\n\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        let j; try { j = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        if (j.error) { textEl.textContent += '\n[error] ' + j.error.message; textEl.classList.add('err'); continue; }
+        const ch = j.choices && j.choices[0]; if (!ch) continue;
+        if (!tFirst) tFirst = performance.now();
+        if (ch.delta.reasoning_content) { reasoning += ch.delta.reasoning_content; det.hidden = false; det.open = !content; think.textContent = reasoning; think.scrollTop = think.scrollHeight; }
+        if (ch.delta.content) { content += ch.delta.content; textEl.textContent = content; det.open = false; }
+        if (ch.delta.tool_calls) { content += '\n[tool call] ' + JSON.stringify(ch.delta.tool_calls); textEl.textContent = content; }
+        if (j.timings) { timings = j.timings; meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens`; }
+        $('msgs').scrollTop = $('msgs').scrollHeight;
+      }
+    }
+    chatHistory.push({ role: 'assistant', content: content || '' });
+    if (timings) {
+      $('c_tps').textContent = fmt(timings.predicted_per_second); $('c_ptps').textContent = fmt(timings.prompt_per_second, 0);
+      $('c_tok').textContent = timings.predicted_n; $('c_toknote').textContent = `reply (${timings.prompt_n} prompt)`; $('c_time').textContent = fmt(timings.predicted_ms/1000, 1);
+      meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens · prefill ${fmt(timings.prompt_per_second, 0)} tok/s · first token after ${fmt((tFirst - t0)/1000, 1)} s`;
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') { meta.textContent = 'stopped'; chatHistory.push({ role: 'assistant', content: content || '' }); }
+    else if (e.message !== 'http') { textEl.textContent = 'request failed: ' + e; textEl.classList.add('err'); }
+  }
+  chatting = false; $('abort').disabled = true; $('send').disabled = false; poll();
+}
+$('send').onclick = send;
+$('prompt').addEventListener('keydown', e => { if ((e.key === 'Enter' || e.keyCode === 13) && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$('abort').onclick = () => aborter && aborter.abort();
+$('clear').onclick = () => { chatHistory = []; $('msgs').innerHTML = '<div class="muted" id="chatempty" hidden></div>'; };
+
+(async () => { await loadModels(); await loadHw(); await loadReco(); await poll(); setInterval(poll, 5000);
+  if (askParam) { $('prompt').value = askParam; await send(); await poll(); }
+  if (holdToken) { await new Promise(r => setTimeout(r, 300)); fetch('/api/release?token=' + holdToken); } })();
+</script>
+</body>
+</html>
