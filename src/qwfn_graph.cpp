@@ -103,7 +103,7 @@ ggml_tensor * graph_builder::conv_with_history(ggml_tensor * state_row, ggml_ten
     // Keep the trailing `hist` positions for the next ubatch.
     ggml_tensor * tail = ggml_view_2d(ctx0, padded, hist, channels,
             padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist));
-    ggml_build_forward_expand(gf_, ggml_cpy(ctx0, ggml_cont(ctx0, tail), state_row));
+    if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, ggml_cont(ctx0, tail), state_row));
 
     return padded;
 }
@@ -165,7 +165,7 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
             ggml_row_size(result->type, head_v * head_v),
             ggml_row_size(result->type, head_v * head_v * n_v_heads),
             ggml_row_size(result->type, head_v * n_v_heads * T));
-    ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s1, st_->rs_state(il)));
+    if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s1, st_->rs_state(il)));
 
     // Gated RMSNorm; sigmoid gate here, unlike Qwen3.5's GDN which uses silu.
     ggml_tensor * zg = ggml_reshape_4d(ctx0, z, head_v, n_v_heads, T, 1);
@@ -616,7 +616,8 @@ void graph_builder::moe_route(ggml_tensor * cur, int il, ggml_tensor ** sel, ggm
 }
 
 ggml_tensor * graph_builder::moe_route_predict(ggml_tensor * res_hc, int il_next, int k,
-                                               ggml_tensor * head_w, ggml_tensor * head_b, ggml_tensor ** x_out) {
+                                               ggml_tensor * head_w, ggml_tensor * head_b, ggml_tensor ** x_out,
+                                               ggml_tensor ** scores_out) {
     ggml_tensor * cur = hc_mix(res_hc, il_next, /*ffn=*/true, nullptr);
     if (x_out) *x_out = cur;
     // A learned head (trained with qwfn-train-predictor; measured no better) replaces the
@@ -627,7 +628,16 @@ ggml_tensor * graph_builder::moe_route_predict(ggml_tensor * res_hc, int il_next
     // Only the ranking matters, so the softmax and the renormalisation are
     // skipped. argsort rather than top_k because the result must be ordered:
     // the first n_expert_used entries are scored against the true routing.
-    return ggml_argsort_top_k(ctx0, logits, k);
+    ggml_tensor * ids = ggml_argsort_top_k(ctx0, logits, k);
+    if (scores_out) {
+        // The candidates' own logits, in the same order. Differences between
+        // them are softmax-invariant, which is what the confidence gate uses.
+        const int64_t n_expert = logits->ne[0], T = logits->ne[1];
+        ggml_tensor * idc = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx0, ids);
+        ggml_tensor * s = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, n_expert, T), idc);   // [1, k, T]
+        *scores_out = ggml_reshape_2d(ctx0, s, k, T);
+    }
+    return ids;
 }
 
 ggml_tensor * graph_builder::moe_apply(ggml_tensor * cur, int il,

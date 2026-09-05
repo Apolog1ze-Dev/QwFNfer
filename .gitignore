@@ -38,3 +38,4 @@ venv/
 
 # Agent scratch
 .claude/
+bench/

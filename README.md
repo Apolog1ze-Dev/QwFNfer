@@ -4,7 +4,7 @@
 </div>
 
 <p align="center">
-| <a href="#getting-started"><b>Getting Started</b></a> | <a href="#results"><b>Results</b></a> | <a href="#how-it-works"><b>How it works</b></a> | <a href="https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF"><b>Model (Unsloth GGUF)</b></a> |
+| <a href="#getting-started"><b>Getting Started</b></a> | <a href="#results"><b>Results</b></a> | <a href="#how-it-works"><b>How it works</b></a> | <a href="#built-around-the-qwen4-architecture"><b>Qwen4</b></a> | <a href="https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF"><b>Model (Unsloth GGUF)</b></a> |
 </p>
 
 Run a frontier-size open-weight MoE on the gaming PC you already own, at interactive speed: 12 tok/s in chat, 9 tok/s answering questions about a 155K-token document it read at 228 tok/s — with the desktop still usable next to it.
@@ -34,6 +34,8 @@ Reference machine: RTX 4080 SUPER 16 GB, 30 GB RAM, one NVMe. 163,840-token cont
 | 155K-token document: decode, grounded answer | 9.3 tok/s | 14.5 tok/s |
 | one 14,000-token answer at 160K context, sustained | 11.7 tok/s | — |
 | llama.cpp on the same machine and file | 1.4–2.2 tok/s chat, 3 tok/s prefill (Unsloth Studio's defaults) | 4.6–6.3 tok/s at long context |
+
+The table was measured before the speculative next-layer block became the default: on the same file and settings, replayed sequences decode 10-12% faster with it (12.1 → 13.5 tok/s in short chat, 9.3 → 10.1 tok/s at 44K context of a real document), the expert cache's prediction of the next layer's experts goes from 76-80% to 95-96%, and the output is unchanged.
 
 While it serves Q4: 22 of 31 GB of RAM in use system-wide, 13.3 of 16 GB of VRAM, the GPU 70% busy, the engine on 3 of 16 threads. A browser with a video and a Discord or Teams call run alongside it without touching the token rate.
 
@@ -78,10 +80,22 @@ Per decoded token the model touches about 1.1 GB of expert weights (48 layers ×
 1. **Expert slices are read whole**, 0.6–1.2 MB at a time over io_uring/O_DIRECT, instead of being demand-paged 4 KiB at a time through mmap.
 2. **Three tiers with one policy**: a VRAM tier of ~2,000–3,700 experts, a 12 GB pinned RAM arena and the NVMe; 95% of lookups hit, 82–85% are served from VRAM.
 3. **In-graph MoE**: VRAM-resident experts are computed inside each layer's replayed CUDA graph, with residency looked up on the device; experts fetched late are folded into the next graph.
-4. **Speculative prefetch**: the next layer's routing is predicted from the current residual (84% correct) and its experts are fetched while the current layer computes; only the reads a token actually needs are waited for.
+4. **Speculative prefetch**: the next layer's routing is predicted by running that layer's own DeltaNet or attention block on the current residual inside the current layer's graph, state writes suppressed, and its experts are fetched while the current layer computes; the prediction is right for 95-96% of the next layer's experts (80% with the router alone), only the reads a token actually needs are waited for, and the output is exact.
 5. **Flat decode at any context**: sparse attention over pooled block keys, F16 keys, q4_0 KV — the same per-layer cost at 4K and at 160K.
 6. **Layer-major prefill**: each layer's experts stream through VRAM in 16 MB chunks and sweep the whole batch; the tier lends the memory and takes it back.
 7. **Measured against the reference**: bit-exact forward pass, in-process numeric checks, real chat workloads and replay files; GPU decode is nondeterministic, so nothing is judged on a single token diff.
+
+## Built around the Qwen4 architecture
+
+Qwen3.8-Flash-Next ships the Qwen4-generation design, `qwen4exp` in the GGUF, and the engine is shaped by what that checkpoint actually contains rather than by its parameter count:
+
+- **48 layers, 36 Gated DeltaNet + 12 sparse attention** (every fourth layer), a residual of 4 hyper-connected streams, 512 routed experts with top-10 routing plus one shared expert, a lightning indexer (4 × 128, top-2048) with 4-way pooled keys, and a 51B-parameter per-layer n-gram embedding table (PLE) — 28.8 GB on its own.
+- **Placement follows the shape.** The dense core (about 5 GB) is resident in VRAM. The routed experts are the only weights that need bandwidth, so they get the three-tier cache. The PLE table stays on the NVMe: a token reads 16 rows of 90 bytes from it (181 µs), so the largest tensor in the file costs no RAM at all — a decision you can only make by reading the architecture.
+- **The hybrid layer mix is what makes decode flat.** DeltaNet layers carry a fixed recurrent state and no KV, so their decode graphs reference nothing that changes with position and replay as CUDA graphs; the 12 attention layers select over pooled block keys, so their cost does not grow with context up to the trained 262K.
+- **The MoE's routing skew is what makes a small GPU enough.** With 512 fine-grained experts and 10 active, routing is far from uniform, so a VRAM tier of ~2,000 experts serves 82–85% of lookups, and the next layer's routing can be computed a layer early by running its block on the residual stream and prefetched while the current layer runs.
+- **The model card is followed** for the thinking template, the tool-call format, mrope for images and the sampling presets; the forward pass is checked node by node against llama.cpp's `qwen4exp`, which matters because this architecture is unusually sensitive to accumulation order.
+
+**What this means for the next Qwen releases.** Every hyper-parameter the engine uses is read from the GGUF metadata — layer count and interval, expert count and top-k, indexer geometry, DeltaNet sizes, PLE geometry, context and rope — nothing is hard-coded to this checkpoint. A future checkpoint built from the same blocks at a different size (more experts, more layers, a bigger PLE, a longer context) is a metadata change; a new block is a graph change, validated against the reference the same way. What the engine needs from the hardware is set by the *active* path per token and by the tiers you can afford, not by the file size: the dense core and the KV/indexer state must fit in VRAM, and everything else streams through cache tiers sized to the GPU and RAM present — the console's cost model does that sizing for whatever machine it finds. Two things are still on the list: the checkpoint's multi-token-prediction head is not used yet, and the tiers have only been measured on the 16 GB / 30 GB reference machine.
 
 ## Acknowledgment
 

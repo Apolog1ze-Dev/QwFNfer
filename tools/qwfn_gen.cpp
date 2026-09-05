@@ -25,7 +25,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::vector<int32_t> prompt, replay;
-    std::string cold_path;
+    std::string cold_path, save_replay;   // --save-replay FILE: the generated ids, one per line, for a later --replay-file
     bool want_ppl = false;   // with --replay-file: mean NLL of the replayed tokens (a quality number)
     int n_gen = 16;
     engine_config cfg;
@@ -56,6 +56,10 @@ int main(int argc, char ** argv) {
             if (cfg.speculate_depth == 0) cfg.speculate = false; continue; }
         if (a == "--spec-ahead" && i + 1 < argc) { cfg.speculate_ahead = (uint32_t) atoi(next()); continue; }
         if (a == "--spec-depth2" && i + 1 < argc) { cfg.speculate_depth2 = (uint32_t) atoi(next()); continue; }
+        if (a == "--spec-margin" && i + 1 < argc) { cfg.spec_margin = (float) atof(next()); continue; }
+        if (a == "--spec-gate-inflight" && i + 1 < argc) { cfg.spec_gate_inflight = (uint32_t) atoi(next()); continue; }
+        if (a == "--spec-block") { cfg.spec_block = true; continue; }
+        if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
         if (a == "--ram-frac" && i + 1 < argc) { cfg.ram_frac = atof(next()); continue; }
         // 0 forces the batched prefill path at every size. Reference runs want
         // this: token-by-token prefill is a different (equally valid) summation
@@ -63,6 +67,7 @@ int main(int argc, char ** argv) {
         if (a == "--prefill-decode-max" && i + 1 < argc) { cfg.prefill_decode_max = (uint32_t) atoi(next()); continue; }
         if (a == "--vram-reserve" && i + 1 < argc) { cfg.vram_reserve = (size_t)(atof(next()) * 1e6); continue; }
         if (a == "--no-prefill-overlap") { cfg.prefill_overlap = false; continue; }
+        if (a == "--save-replay" && i + 1 < argc) { save_replay = next(); continue; }
         if (a == "--replay-file" && i + 1 < argc) {
             // Feed these ids as the "generated" tokens instead of sampling, so
             // every configuration sees identical routing. GPU decode is
@@ -161,6 +166,12 @@ int main(int argc, char ** argv) {
     }
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("\n\ndecode: %d tokens in %.2f s  (%.2f tok/s), n_past=%d\n", n_gen, dt, n_gen / dt, eng.n_past());
+    if (!save_replay.empty()) {
+        FILE * f = fopen(save_replay.c_str(), "wb");
+        if (f) { for (size_t i = hist.size() - n_gen; i < hist.size(); i++) fprintf(f, "%d\n", hist[i]); fclose(f);
+                 printf("saved %d generated ids to %s\n", n_gen, save_replay.c_str()); }
+        else fprintf(stderr, "cannot write %s\n", save_replay.c_str());
+    }
     if (nll_n) printf("replay NLL: %.4f per token (ppl %.2f) over %d tokens\n", nll_sum / nll_n, std::exp(nll_sum / nll_n), nll_n);
     if (eng.n_exp_skipped) printf("skipped experts: %llu (misses computed without)\n", (unsigned long long) eng.n_exp_skipped);
 
@@ -189,6 +200,31 @@ int main(int argc, char ** argv) {
            (unsigned long long) s.pf_issued, (unsigned long long) s.pf_used,
            s.pf_issued ? 100.0 * s.pf_used / s.pf_issued : 0.0,
            (unsigned long long) s.pf_wasted);
+    if (eng.pf_gated)
+        printf("prefetch gate: %llu predicted candidates not read (margin < %.2f%s)\n",
+               (unsigned long long) eng.pf_gated, cfg.spec_margin,
+               cfg.spec_gate_inflight ? ", only with reads in flight" : "");
+    {   // precision by predicted rank, then by confidence margin, then recall by layer
+        printf("prediction by rank, precision %%:");
+        for (int k = 0; k < (int) QWFN_SPEC_MAX; k++)
+            if (eng.rank_total[k]) printf(" r%d %.0f", k + 1, 100.0 * eng.rank_hits[k] / eng.rank_total[k]);
+        printf("\n");
+        unsigned long long mt = 0; for (int b = 0; b < engine::SPEC_MARGIN_BUCKETS; b++) mt += eng.margin_total[b];
+        printf("prediction by margin [edge+) P(correct)%% / share%%:");
+        for (int b = 0; b < engine::SPEC_MARGIN_BUCKETS; b++)
+            if (eng.margin_total[b])
+                printf(" [%.2g) %.0f/%.1f", engine::margin_edge(b), 100.0 * eng.margin_hits[b] / eng.margin_total[b],
+                       mt ? 100.0 * eng.margin_total[b] / mt : 0.0);
+        printf("\n");
+        std::vector<std::pair<double, int>> acc;
+        for (size_t l = 0; l < eng.pred_total_layer.size(); l++)
+            if (eng.pred_total_layer[l]) acc.push_back({ 100.0 * eng.pred_hits_layer[l] / eng.pred_total_layer[l], (int) l });
+        std::sort(acc.begin(), acc.end());
+        printf("prediction by layer, worst 10:");
+        for (size_t i = 0; i < acc.size() && i < 10; i++) printf(" L%d %.0f", acc[i].second, acc[i].first);
+        if (acc.size() > 10) printf("  | best: L%d %.0f", acc.back().second, acc.back().first);
+        printf("\n");
+    }
     printf("io breakdown: submit %.2f s, promote %.2f s, wait %.2f s | %llu bursts, %llu reads, "
            "%.1f reads/burst, %.0f KiB/read\n",
            s.t_submit, s.t_promote, s.t_wait,

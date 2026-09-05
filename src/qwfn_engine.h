@@ -85,6 +85,26 @@ struct engine_config {
     // Learned routing predictor file (scripts/train_predictor.py); empty = the
     // next layer's own router on the current residual.
     std::string predictor_path;
+    // Confidence gate on the speculative reads. A predicted candidate's margin
+    // is its distance in router logits from the routing cut-off: for a rank
+    // inside the predicted top-n_expert_used, its logit minus the first
+    // excluded one; for a rank past it, the last included logit minus its own.
+    // A candidate whose margin is below spec_margin is not read. Changes only
+    // which reads are issued, never what is computed. 0 = off.
+    float     spec_margin = 0.0f;
+    // Apply the gate only while at least this many speculative reads are in
+    // flight, i.e. when the disk is the constraint; with an idle disk every
+    // prediction is worth reading (measured). 0 = always.
+    uint32_t  spec_gate_inflight = 0;
+    // Predict layer L+1's routing by running L+1's own token mixer (PLE
+    // injection, attention mixer, DeltaNet or decode sparse attention, combine)
+    // on the approximate residual inside layer L's graph, with every state
+    // write suppressed, and applying the router to what that produces. The
+    // block is the term the residual-only predictor cannot see. Costs one
+    // extra block per layer of graph A, synchronous.
+    bool      spec_block = false;
+    // Which predicted layers get the block: "" = all, else "1,2,5-9,47".
+    std::string spec_block_layers;
     // Decode without waiting for expert misses: the token is computed from the
     // experts that are resident (gates renormalised), the misses' reads still
     // go out and land for next time. An approximation -- measure its NLL.
@@ -196,6 +216,15 @@ public:
     uint64_t n_exp_gpu = 0, n_exp_cpu = 0, n_exp_skipped = 0;
     uint64_t pred_hits = 0, pred_total = 0;   // predicted-vs-actual expert overlap
     uint64_t pred2_hits = 0, pred2_total = 0; // same, for the two-ahead prediction
+    // Prediction quality by rank and by confidence margin -- the gate's
+    // calibration data, collected on every decode run -- and per predicted layer.
+    static constexpr int SPEC_MARGIN_BUCKETS = 12;
+    uint64_t rank_hits[QWFN_SPEC_MAX] = {}, rank_total[QWFN_SPEC_MAX] = {};
+    uint64_t margin_hits[SPEC_MARGIN_BUCKETS] = {}, margin_total[SPEC_MARGIN_BUCKETS] = {};
+    std::vector<uint64_t> pred_hits_layer, pred_total_layer;
+    uint64_t pf_gated = 0;   // predicted candidates the margin gate declined to read
+    static int   margin_bucket(float m);
+    static float margin_edge(int b);   // lower edge of bucket b
     uint64_t check_moe_gpu_calls = 0, check_moe_cpu_calls = 0;   // QWFN_CHECK_MOE bookkeeping
     int64_t n_prefill = 0, n_decode = 0;
 
@@ -376,6 +405,7 @@ private:
     ggml_tensor * t_cur_ = nullptr, * t_inject_ = nullptr, * t_sel_ = nullptr, * t_w_ = nullptr;
     ggml_tensor * t_emb_ = nullptr;   // token embeddings, before the hc repeat
     ggml_tensor * t_selnext_ = nullptr, * t_selnext2_ = nullptr;
+    ggml_tensor * t_specscore_ = nullptr;   // logits of the predicted candidates, best first
     ggml_tensor * t_sh_ = nullptr, * t_pg_ = nullptr, * t_pc_ = nullptr, * t_ple_ = nullptr;
     ggml_tensor * inp_tok_ = nullptr, * inp_pos_ = nullptr, * inp_ple_ = nullptr;
     // persistent, host side
@@ -389,6 +419,8 @@ private:
     std::vector<int32_t> sel_, ids_;
     std::vector<float>   wgt_;
     std::vector<int32_t> pred_;   // last layer's prediction for this one
+    std::vector<float>   spec_scores_, pred_margin_;   // their logits and margins to the cut-off
+    std::vector<uint8_t> spec_block_mask_;             // by predicted layer
     // Two-ahead predictions in flight: pred2_a_ was made two layers back (and is
     // scored against this layer), pred2_b_ one layer back.
     std::vector<int32_t> pred2_a_, pred2_b_;

@@ -101,6 +101,7 @@
             <label>Thinking<select id="think"><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
             <label>Thinking budget (tokens, 0 = none)<input id="think_budget" type="number" min="0" step="500"></label>
             <label>Skip missed experts<select id="skip_miss"><option value="false">off (exact)</option><option value="true">on (+16-29% decode, small NLL cost)</option></select></label>
+            <label>Speculative block<select id="spec_block"><option value="true">on (predict the next layer's experts through its own block: 80% → 96%, exact)</option><option value="false">off (router on the residual)</option></select></label>
             <label>Vision (image input)<select id="vision"><option value="true">on (loads the projector onto the GPU, --mmproj)</option><option value="false">off (text only)</option></select></label>
           </form>
           <div class="est" id="est"></div>
@@ -227,6 +228,7 @@ async function loadReco() {
   const r = await api('/api/recommend?model=' + selected + '&priority=' + $('priority').value + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0'))); reco = r;
   ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
   $('skip_miss').value = String(r.skip_miss);
+  if (r.spec_block !== undefined) $('spec_block').value = String(r.spec_block);
   const von = $('vision').options[0];
   von.disabled = !r.mmproj; von.textContent = r.mmproj ? `on (${r.mmproj.split('/').pop()}, ${r.mmproj_gb} GB of VRAM, --mmproj)` : 'unavailable (no mmproj-*.gguf next to this model)';
   $('vision').value = String(r.vision);
@@ -242,7 +244,7 @@ $('vision').onchange = () => { visionChoice = $('vision').value === 'true'; load
 function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
-           vision: $('vision').value === 'true' };
+           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true' };
 }
 $('start').onclick = async () => {
   $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true;
@@ -264,8 +266,8 @@ function setLocked(s) {
   const b = $('banner');
   if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
   const st = s.settings || {}, p = s.props || {};
-  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
-                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.vision ? 'vision' : ''].filter(Boolean);
+  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
+                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.vision ? 'vision' : ''].filter(Boolean);
   b.className = 'banner';
   b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}</span></span>
     <span class="flags">${flags.map(f => `<span>${f}</span>`).join('')}</span>
@@ -293,7 +295,7 @@ async function poll() {
   if (running && s.model && models.length) {
     const i = models.findIndex(m => m.name === s.model);
     if (i >= 0 && i !== selected) { selected = i; renderModels(); await loadReco(); }
-    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('vision').value = String(!!s.settings.vision); }
+    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); }
   }
   const chatable = s.state === 'ready' || s.state === 'busy';
   $('send').disabled = !chatable || chatting; const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;

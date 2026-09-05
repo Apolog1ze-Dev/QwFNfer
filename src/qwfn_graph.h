@@ -127,7 +127,14 @@ public:
     // them costs bandwidth the decode loop is not using. Sorted, best first.
     ggml_tensor * moe_route_predict(ggml_tensor * res_hc, int il_next, int k,
                                     ggml_tensor * head_w = nullptr, ggml_tensor * head_b = nullptr,
-                                    ggml_tensor ** x_out = nullptr);   // the head's input, for the dump
+                                    ggml_tensor ** x_out = nullptr,        // the head's input, for the dump
+                                    ggml_tensor ** scores_out = nullptr);  // the k logits, best first: F32 [k, T]
+
+    // When false, the layer builders leave the persistent state alone: no
+    // recurrent-state, conv-history or PLE-conv write-back. The engine uses it
+    // to run a layer's block speculatively on an approximate residual, purely to
+    // predict that layer's routing; the exact pass that follows does the writes.
+    void set_persist(bool p) { persist_ = p; }
 
     // MoE with the selected experts supplied explicitly, one mul_mat each,
     // pointing straight at cached blocks. Decode path: with a single token the
@@ -203,6 +210,7 @@ private:
     const state *   st_  = nullptr;
     ggml_cgraph *   gf_ = nullptr;
     int64_t         n_past_ = 0;
+    bool            persist_ = true;
 };
 
 } // namespace qwfn

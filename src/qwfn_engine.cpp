@@ -129,6 +129,27 @@ bool engine::init(const model_index * hot, const model_index * cold,
     t_sel_    = ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, U, Bd);
     t_selnext_= ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, QWFN_SPEC_MAX, Bd);
     t_selnext2_= ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, QWFN_SPEC_MAX, Bd);
+    t_specscore_= ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, QWFN_SPEC_MAX, Bd);
+    // Speculative-block mask by predicted layer, and the per-layer counters.
+    spec_block_mask_.assign(hp_.n_layer, cfg.spec_block_layers.empty() ? 1 : 0);
+    if (!cfg.spec_block_layers.empty()) {
+        const std::string & sl = cfg.spec_block_layers; size_t p = 0;
+        while (p < sl.size()) {
+            size_t cpos = sl.find(',', p); if (cpos == std::string::npos) cpos = sl.size();
+            const std::string tok = sl.substr(p, cpos - p); p = cpos + 1;
+            if (tok.empty()) continue;
+            const size_t d = tok.find('-');
+            const int a = atoi(tok.c_str()), b = d == std::string::npos ? a : atoi(tok.c_str() + d + 1);
+            for (int l = std::max(a, 0); l <= b && l < (int) hp_.n_layer; l++) spec_block_mask_[l] = 1;
+        }
+    }
+    pred_hits_layer.assign(hp_.n_layer, 0); pred_total_layer.assign(hp_.n_layer, 0);
+    if (cfg.spec_block || cfg.spec_margin > 0.0f) {
+        int nb = 0; for (uint32_t l = 1; l < hp_.n_layer; l++) nb += cfg.spec_block ? spec_block_mask_[l] : 0;
+        fprintf(stderr, "[qwfn] prefetch: speculative block %s (%d of %u predicted layers), margin gate %s\n",
+                cfg.spec_block ? "on" : "off", nb, hp_.n_layer - 1,
+                cfg.spec_margin > 0.0f ? (std::to_string(cfg.spec_margin) + (cfg.spec_gate_inflight ? " when >= " + std::to_string(cfg.spec_gate_inflight) + " reads in flight" : "")).c_str() : "off");
+    }
     t_w_      = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, U, Bd);
     t_gids_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, U, 1);
     t_gw_     = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, 1, U, 1);
@@ -1277,7 +1298,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // sparse-attention layers reshape with n_kv every token.
         const bool replayable = cfg_.reuse_graphs && decode && (!hp_.is_attn_layer(il) || use_qd);
         // An attention graph is shaped by its block bucket; a new bucket means a new graph.
-        if (replayable && hp_.is_attn_layer(il) && gA_[il].gf && gA_bucket_[il] != qd_.n_bucket) {
+        // A graph that speculatively runs an attention successor's block is shaped by the bucket too.
+        const bool spec_attn_next = cfg_.spec_block && decode && use_qd && il + 1 < hp_.n_layer
+                                    && hp_.is_attn_layer(il + 1) && spec_block_mask_[il + 1];
+        if (replayable && (hp_.is_attn_layer(il) || spec_attn_next) && gA_[il].gf && gA_bucket_[il] != qd_.n_bucket) {
             if (gA_[il].ga)  ggml_gallocr_free(gA_[il].ga);
             if (gA_[il].ctx) ggml_free(gA_[il].ctx);
             gA_[il] = layer_graph{};
@@ -1364,13 +1388,45 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_tensor * rp = r;
                 if (pg_here && !predict_plain) rp = gb.hc_combine(r, ggml_add(c, sh, pg_here), inject);
                 else if (predict_shared)        rp = gb.hc_combine(r, sh, inject);
-                const int depth = (int) std::min<uint32_t>(QWFN_SPEC_MAX, std::max<uint32_t>((uint32_t) U, cfg_.speculate_depth));
-                ggml_tensor * xpred = nullptr;
-                selnext = gb.moe_route_predict(rp, (int) il + 1, depth, pred_w(il + 1), pred_b(il + 1), &xpred);
+                // Speculative block (cfg spec_block): the residual predictor's
+                // remaining error is layer L+1's own block, which it cannot see.
+                // Run that block here, on this residual -- L+1's PLE injection if
+                // it has one, its attention mixer, its DeltaNet or decode sparse
+                // attention, its combine -- with every state write suppressed, and
+                // predict from the residual it produces. The exact graph of L+1
+                // recomputes the block on the exact residual and does the writes;
+                // an attention block's cache rows written here are rewritten at the
+                // same position there before anything else reads them.
+                const uint32_t iln = il + 1;
+                const bool spec_blk = cfg_.spec_block && spec_block_mask_[iln] && (!hp_.is_attn_layer(iln) || use_qd);
+                if (spec_blk) {
+                    gb.set_persist(false);
+                    const bool ple_next = std::find(hp_.ple_layers.begin(), hp_.ple_layers.end(), (int32_t) iln) != hp_.ple_layers.end();
+                    if (ple_next) rp = gb.ple(v2(c, t_ple_), rp, (int) iln);
+                    ggml_tensor * inj2 = nullptr;
+                    ggml_tensor * c1 = gb.hc_mix(rp, (int) iln, /*ffn=*/false, &inj2);
+                    ggml_tensor * blk = nullptr;
+                    if (!hp_.is_attn_layer(iln)) {
+                        blk = gb.deltanet(c1, (int) iln);
+                    } else {
+                        qd_.pool_cache = pool_cache_[iln];
+                        blk = gb.sparse_attn_decode(c1, vpos(c), sections, (int) iln, qd_);
+                    }
+                    gb.set_persist(true);
+                    rp = gb.hc_combine(rp, blk, inj2);
+                }
+                // Every candidate up to QWFN_SPEC_MAX comes back with its logit;
+                // how many are read is decided on the host (speculate_depth, then
+                // the margin gate).
+                const int depth = (int) QWFN_SPEC_MAX;
+                ggml_tensor * xpred = nullptr, * scores = nullptr;
+                selnext = gb.moe_route_predict(rp, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores);
                 if (t_xdec_ && xpred)   // the head's input for layer il+1, kept for the decode dump
                     ggml_build_forward_expand(g, ggml_cpy(c, xpred, ggml_view_1d(c, t_xdec_, n_embd, (size_t) il * t_xdec_->nb[1])));
                 ggml_build_forward_expand(g, ggml_cpy(c, selnext,
                         ggml_view_2d(c, t_selnext_, depth, T, t_selnext_->nb[1], 0)));
+                ggml_build_forward_expand(g, ggml_cpy(c, scores,
+                        ggml_view_2d(c, t_specscore_, depth, T, t_specscore_->nb[1], 0)));
                 if (cfg_.speculate_ahead >= 2 && il + 2 < hp_.n_layer) {
                     ggml_tensor * selnext2 = gb.moe_route_predict(rp, (int) il + 2, depth, pred_w(il + 2), pred_b(il + 2));
                     ggml_build_forward_expand(g, ggml_cpy(c, selnext2,
@@ -1439,11 +1495,24 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         }
 
         // Score the prediction made one layer ago against what actually happened.
-        if (cfg_.speculate && decode && !pred_.empty()) {
+        // Only where one exists: at layer 0, pred_ still holds the prediction made
+        // at layer n-2 for layer n-1, already scored; counting it against layer 0's
+        // routing added ten near-certain misses per token to the reported rate.
+        if (cfg_.speculate && decode && il > 0 && !pred_.empty()) {
             for (int64_t e = 0; e < U; e++) {
-                pred_total++;
+                pred_total++; pred_total_layer[il]++;
                 for (int64_t k = 0; k < U; k++)
-                    if (pred_[k] == sel_[e]) { pred_hits++; break; }
+                    if (pred_[k] == sel_[e]) { pred_hits++; pred_hits_layer[il]++; break; }
+            }
+            // Precision by rank and by confidence margin: the gate's calibration data.
+            for (size_t k = 0; k < pred_.size() && k < QWFN_SPEC_MAX; k++) {
+                bool ok = false;
+                for (int64_t e = 0; e < U; e++) if (pred_[k] == sel_[e]) { ok = true; break; }
+                rank_total[k]++; if (ok) rank_hits[k]++;
+                if (k < pred_margin_.size()) {
+                    const int b = margin_bucket(pred_margin_[k]);
+                    margin_total[b]++; if (ok) margin_hits[b]++;
+                }
             }
         }
         // And the one made two layers ago, if the two-ahead path is on.
@@ -1684,14 +1753,24 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 if (prefetched || !cfg_.speculate || il + 1 >= hp_.n_layer) return;
                 prefetched = true;
                 const uint32_t depth = std::min<uint32_t>(QWFN_SPEC_MAX, std::max<uint32_t>((uint32_t) U, cfg_.speculate_depth));
-                pred_.resize(depth);
-                ggml_backend_tensor_get(t_selnext_, pred_.data(), 0, (size_t) depth * sizeof(int32_t));
-                std::vector<uint32_t> pf1(depth), pf2;
-                for (uint32_t e = 0; e < depth; e++) pf1[e] = (uint32_t) pred_[e];
+                const uint32_t K = QWFN_SPEC_MAX;
+                pred_.resize(K); spec_scores_.resize(K); pred_margin_.resize(K);
+                ggml_backend_tensor_get(t_selnext_,   pred_.data(),        0, (size_t) K * sizeof(int32_t));
+                ggml_backend_tensor_get(t_specscore_, spec_scores_.data(), 0, (size_t) K * sizeof(float));
+                // Margin to the routing cut-off (see engine_config::spec_margin).
+                const uint32_t Uu = (uint32_t) U;
+                for (uint32_t r = 0; r < K; r++)
+                    pred_margin_[r] = Uu < K ? (r < Uu ? spec_scores_[r] - spec_scores_[Uu] : spec_scores_[Uu - 1] - spec_scores_[r]) : 1e9f;
+                const bool gate = cfg_.spec_margin > 0.0f && ec_.pf_outstanding() >= cfg_.spec_gate_inflight;
+                std::vector<uint32_t> pf1, pf2; pf1.reserve(depth);
+                for (uint32_t e = 0; e < depth; e++) {
+                    if (gate && pred_margin_[e] < cfg_.spec_margin) { pf_gated++; continue; }
+                    pf1.push_back((uint32_t) pred_[e]);
+                }
 
                 pred2_a_.swap(pred2_b_);
                 pred2_b_.clear();
-                expert_cache::pf_set sets[2] = { { il + 1, pf1.data(), depth }, {} };
+                expert_cache::pf_set sets[2] = { { il + 1, pf1.data(), (uint32_t) pf1.size() }, {} };
                 uint32_t n_sets = 1;
                 if (cfg_.speculate_ahead >= 2 && il + 2 < hp_.n_layer) {
                     pred2_b_.resize(depth);
@@ -2164,5 +2243,16 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     if (decode) { t_decode += dt; n_decode += T; } else { t_prefill += dt; n_prefill += T; }
     return true;
 }
+
+// Confidence-margin buckets for the prediction statistics: router logit
+// differences, finer near zero where the routing cut-off lives.
+static const float kMarginEdges[engine::SPEC_MARGIN_BUCKETS - 1] =
+    { 0.05f, 0.1f, 0.2f, 0.3f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f, 3.0f, 5.0f };
+int engine::margin_bucket(float m) {
+    int b = 0;
+    while (b < SPEC_MARGIN_BUCKETS - 1 && m >= kMarginEdges[b]) b++;
+    return b;
+}
+float engine::margin_edge(int b) { return b <= 0 ? 0.0f : kMarginEdges[b - 1]; }
 
 } // namespace qwfn

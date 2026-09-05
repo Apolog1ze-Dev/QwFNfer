@@ -112,6 +112,11 @@ target_include_directories(qwfn-chat PRIVATE "${LLAMA_CPP_ROOT}/include")
 target_link_libraries(qwfn-chat PRIVATE qwfn_core llama_ref)
 target_compile_options(qwfn-chat PRIVATE -O3 -march=native)
 
+add_executable(qwfn-tok tools/qwfn_tok.cpp src/qwfn_vocab.cpp)
+target_include_directories(qwfn-tok PRIVATE "${LLAMA_CPP_ROOT}/include")
+target_link_libraries(qwfn-tok PRIVATE qwfn_core llama_ref)
+target_compile_options(qwfn-tok PRIVATE -O2)
+
 add_executable(qwfn-gen tools/qwfn_gen.cpp)
 target_link_libraries(qwfn-gen PRIVATE qwfn_core)
 target_compile_options(qwfn-gen PRIVATE -O3 -march=native)

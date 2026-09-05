@@ -159,7 +159,7 @@ def recommend(model, hw, priority="balanced", vision=None):
     notes.append("Thinking: xhigh by default; --think-budget 6000 keeps a hard think under ~8 min at Q4 speed, ~6 at Q3. Harnesses with no thinking toggle can end a message with /no_think.")
     return {
         "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": ram, "batch": batch, "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
-        "skip_miss": False, "port": STATE["port"], "priority": priority,
+        "skip_miss": False, "spec_block": True, "port": STATE["port"], "priority": priority,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "estimates": {"vram_tier_gb": chosen["tier_gb"], "vram_tier_blocks": chosen["blocks"], "state_gb": chosen["state_gb"], "dense_core_gb": core,
                       "mmproj_gb": round(mm_gb, 2),
@@ -201,6 +201,7 @@ def start_server(model, s):
                 "--kv", s["kv"], "--reserve", str(int(s["reserve"])), "--think", s["think"], "--think-budget", str(int(s["think_budget"])),
                 "--port", str(int(s["port"]))]
         if s.get("skip_miss"): argv.append("--skip-miss")
+        if s.get("spec_block", True): argv.append("--spec-block")
         if s.get("cold_path"): argv += ["--cold", s["cold_path"]]
         if s.get("vision"):
             if not model.get("mmproj"):

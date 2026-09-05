@@ -200,6 +200,7 @@ public:
     // What the cache is blocked on right now, for a stall watchdog: 0 nothing,
     // 1 demand reads (fetch_end), 2 speculative reads (settle). Racy by design.
     int    wait_state() const { return wait_state_; }
+    size_t pf_outstanding() const { return pf_reads_outstanding_; }   // speculative reads in flight
     size_t wait_count() const { return wait_state_ == 1 ? inflight_reqs_ + inflight_cold_reqs_ : wait_state_ == 2 ? pf_reads_outstanding_ : 0; }
 
     // Wait for the asynchronous promotion copies queued since the last call and

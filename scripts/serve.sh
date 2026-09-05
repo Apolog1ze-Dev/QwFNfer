@@ -4,6 +4,9 @@
 #
 #   scripts/serve.sh                 menu, then start
 #   scripts/serve.sh --fast          same, with --skip-miss (+16-29% decode, small NLL cost)
+#   scripts/serve.sh --no-spec-block without the speculative next-layer block (on by default: the
+#                                    next layer's experts are predicted through its own block,
+#                                    80% -> 96% correct, exact output)
 #   scripts/serve.sh --list          just list the models
 #   scripts/serve.sh --dry-run       print the command instead of running it
 #   scripts/serve.sh --no-vision     leave the vision projector out (images are accepted by
@@ -23,7 +26,7 @@ RAM=${QWFN_RAM:-12}; CTX=${QWFN_CTX:-163840}; BATCH=${QWFN_BATCH:-4096}; KV=${QW
 
 # A model number is only recognised as the FIRST argument; anything else passes
 # through to qwfn-server (so `--reserve 1024` keeps its value).
-pick=""; dry=0; list=0; vision=1; extra=()
+pick=""; dry=0; list=0; vision=1; specblk=1; extra=()
 if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then pick=$1; shift; fi
 for a in "$@"; do
     case "$a" in
@@ -31,6 +34,7 @@ for a in "$@"; do
         --dry-run) dry=1 ;;
         --list)    list=1 ;;
         --no-vision) vision=0 ;;
+        --no-spec-block) specblk=0 ;;
         *)         extra+=("$a") ;;
     esac
 done
@@ -84,6 +88,7 @@ if [ $vision -eq 1 ]; then
     done
     [ -n "$mm" ] && extra+=(--mmproj "$mm")
 fi
+[ $specblk -eq 1 ] && extra+=(--spec-block)
 cmd=(./build/qwfn-server "$model" --ram "$RAM" --ctx "$CTX" --batch "$BATCH" --kv "$KV" "${extra[@]}")
 echo "starting: ${cmd[*]}" | sed "s|$HF/||"
 [ $dry -eq 1 ] && exit 0

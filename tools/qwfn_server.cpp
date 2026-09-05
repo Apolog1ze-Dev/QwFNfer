@@ -654,6 +654,10 @@ int main(int argc, char ** argv) {
             if (cfg.speculate_depth == 0) cfg.speculate = false; continue; }
         if (a == "--spec-ahead" && i + 1 < argc) { cfg.speculate_ahead = (uint32_t) atoi(argv[++i]); continue; }
         if (a == "--spec-depth2" && i + 1 < argc) { cfg.speculate_depth2 = (uint32_t) atoi(argv[++i]); continue; }
+        if (a == "--spec-margin" && i + 1 < argc) { cfg.spec_margin = (float) atof(next()); continue; }
+        if (a == "--spec-gate-inflight" && i + 1 < argc) { cfg.spec_gate_inflight = (uint32_t) atoi(next()); continue; }
+        if (a == "--spec-block") { cfg.spec_block = true; continue; }
+        if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
         if (a == "--kv" && i + 1 < argc) {
             std::string v = next();
             cfg.type_k = cfg.type_v = (v == "q8_0") ? GGML_TYPE_Q8_0 :
@@ -1059,7 +1063,7 @@ int main(int argc, char ** argv) {
                 {"reasoning_effort", S.def_effort}, {"max_tokens", S.def_max_tokens},
                 {"reasoning_budget", S.def_reasoning_budget},
                 {"thinking", S.preset_think.to_json()}, {"non_thinking", S.preset_nothink.to_json()}}},
-            {"skip_miss", cfg.skip_miss}, {"model_file", S.model_file},
+            {"skip_miss", cfg.skip_miss}, {"spec_block", cfg.spec_block}, {"model_file", S.model_file},
             {"vision", S.vis.loaded()},
             {"total_slots", 1}};
     };
