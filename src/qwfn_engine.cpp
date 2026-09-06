@@ -1249,8 +1249,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     upload_vtable(0);
     // The late fold of layer `prev`: its promoted experts, by slot, from
     // t_gids_/t_gw_ (zeros when there were none: slot 0 with weight 0).
+    // Decode only: the batched paths compute every expert of a layer themselves
+    // and leave t_gids_/t_gw_ holding the last decode step's values.
     auto late_fold = [&](ggml_context * c, uint32_t prev, ggml_tensor * pg) {
-        if (!moe_in_graph(prev) || n_late_ <= 0) return pg;
+        if (!decode || !moe_in_graph(prev) || n_late_ <= 0) return pg;
         ggml_tensor * ids = ggml_view_2d(c, t_gids_, n_late_, 1, t_gids_->nb[1], 0);
         ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, n_late_, 1, t_gw_->nb[1], t_gw_->nb[2], 0);
         return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, 1, /*fused_sum=*/true));
@@ -1422,7 +1424,16 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             if (gA_[il].ctx) ggml_free(gA_[il].ctx);
             gA_[il] = layer_graph{};
         }
+        // Whether the graph that runs for this layer writes the readback pack:
+        // the cached graph's own property when it is replayed, this build's
+        // otherwise. gA_pack_ describes the CACHED graph only. (It used to be
+        // overwritten by every build, including a later turn's prompt batch,
+        // whose graphs never pack; the next decode then replayed turn 1's
+        // packing graphs and read the routing from tensors they never write:
+        // stale expert ids in every layer, fast garbage, surviving reset.)
+        bool ran_packed = false;
         if (replayable && gA_[il].gf) {
+            ran_packed = gA_pack_[il] != 0;
             const auto ta0 = std::chrono::steady_clock::now();
             if (!ggml_gallocr_alloc_graph(gA_[il].ga, gA_[il].gf)) { err = "replay alloc failed"; return false; }
             if (ggml_backend_graph_compute(w_.backend(), gA_[il].gf) != GGML_STATUS_SUCCESS) {
@@ -1575,7 +1586,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_build_forward_expand(g, ggml_cpy(c, wt,     v2(c, t_w_)));
             }
             ggml_build_forward_expand(g, place(sh, t_sh_, 0) ? sh : ggml_cpy(c, sh, v2(c, t_sh_)));
-            gA_pack_[il] = pack_ok;
+            ran_packed = pack_ok;
             if (getenv("QWFN_GRAPH_STATS") && decode && il < 6) {   // op histogram of one recurrent and one attention graph
                 std::map<std::string, int> hist; int n_real = 0;
                 for (int ni = 0; ni < ggml_graph_n_nodes(g); ni++) {
@@ -1607,7 +1618,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_gallocr_t ga = ggml_gallocr_new(w_.buft());
                 if (ga && ggml_gallocr_alloc_graph(ga, g)) {
                     gA_[il].ctx = c; gA_[il].gf = g; gA_[il].ga = ga;
-                    gA_bucket_[il] = qd_.n_bucket;
+                    gA_bucket_[il] = qd_.n_bucket; gA_pack_[il] = pack_ok;
                     cached = true;
                     if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {
                         err = "compute failed"; return false;
@@ -1644,7 +1655,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             pending = true;
         }
 
-        const bool packed = decode && gA_pack_[il];
+        const bool packed = decode && ran_packed;
         if (packed) {
             ggml_backend_tensor_get(t_pack_, pack_host_.data(), 0, (size_t) pack_n_ * sizeof(float));
             const float * pk = pack_host_.data();
