@@ -47,7 +47,7 @@ uring=$(ldd build-portable/qwfn-server | awk '/liburing/ {print $3}'); cp -L "$u
 gomp=$(ldd "$GGML_LIBS/libggml-cpu-haswell.so" | awk '/libgomp/ {print $3}'); [ -n "$gomp" ] && cp -L "$gomp" "$OUT/bin/libgomp.so.1"
 cp tools/qwfn_console.py "$OUT/tools/"; cp tools/console/index.html "$OUT/tools/console/"
 cp scripts/qwfnfer "$OUT/qwfnfer"; chmod +x "$OUT/qwfnfer" "$OUT/bin/qwfn-server" "$OUT/bin/qwfn-tok"
-cp README.md "$OUT/"; echo "$VERSION" > "$OUT/VERSION"
+cp README.md LICENSE "$OUT/"; echo "$VERSION" > "$OUT/VERSION"
 cat > "$OUT/INSTALL.txt" <<EOF
 qwfnfer $VERSION -- Qwen3.8-Flash-Next on one 16 GB GPU (Linux x86_64, NVIDIA)
 

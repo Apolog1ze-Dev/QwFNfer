@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>qwfnfer</h1>
+  <img alt="QwFNfer: Qwen Four Inference Engine, big models running on small hardware" src="docs/img/header.jpg" width="100%">
   <p><b>Qwen3.8-Flash-Next, a 125B mixture-of-experts model with 512 experts, 111 GB on disk, at 160K context on one 16 GB GPU, 30 GB of RAM and an NVMe.</b></p>
 </div>
 
@@ -124,4 +124,4 @@ Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backe
 
 ## License
 
-To be added.
+[Apache License 2.0](LICENSE).
