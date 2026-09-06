@@ -80,12 +80,21 @@ bool engine::init(const model_index * hot, const model_index * cold,
     if (!wh_.init(hot, /*prefer_gpu=*/false, backend_dir, err)) return false;
 
     // ---- MTP draft head (experiment): the nextn block, resident ---------------
-    if (!cfg.mtp_path.empty() && cfg.use_gpu) {
+    if (!cfg.mtp_path.empty() && cfg.use_gpu && cfg.skip_miss)
+        fprintf(stderr, "[qwfn] mtp: draft head not loaded: a verified pair and --skip-miss do not combine (skip-miss "
+                        "computes a token without the experts still on disk, one token at a time); drafts off\n");
+    if (!cfg.mtp_path.empty() && cfg.use_gpu && !cfg.skip_miss) {
         if (!mi_mtp_.load(cfg.mtp_path, err)) return false;
         if (!wm_.init(&mi_mtp_, /*prefer_gpu=*/true, backend_dir, err)) return false;
-        for (const auto & kv : mi_mtp_.tensors())
-            if (!wm_.declare(kv.first)) { err = "mtp: failed to declare " + kv.first; return false; }
+        mtp_experts_host_ = getenv("QWFN_MTP_EXPERTS_VRAM") == nullptr;
+        if (mtp_experts_host_ && !wmh_.init(&mi_mtp_, /*prefer_gpu=*/false, backend_dir, err)) return false;
+        for (const auto & kv : mi_mtp_.tensors()) {
+            const bool exps = kv.first.find("_exps.weight") != std::string::npos;
+            weights & dst = (exps && mtp_experts_host_) ? wmh_ : wm_;
+            if (!dst.declare(kv.first)) { err = "mtp: failed to declare " + kv.first; return false; }
+        }
         if (!wm_.commit(err)) return false;
+        if (mtp_experts_host_ && !wmh_.commit(err)) return false;
         hpm_ = mi_mtp_.hp();
         hpm_.full_attention_interval = hpm_.n_layer;   // in this index only the last block, the nextn block, is attention
         hpm_.ssm_dt_rank = 1;                           // the index's 48 trunk slots carry no state here; keep theirs tiny
@@ -93,8 +102,9 @@ bool engine::init(const model_index * hot, const model_index * cold,
         state_config scm; scm.n_ctx = cfg.n_ctx; scm.type_k = cfg.type_k; scm.type_v = cfg.type_v;
         if (!st_mtp_.init(&hpm_, scm, w_.buft(), err)) return false;
         mtp_on_ = true;
-        fprintf(stderr, "[qwfn] mtp: nextn block %u of %s, %.2f GB resident on %s; drafts are scored, not verified (experiment)\n",
-                hpm_.n_layer - 1, cfg.mtp_path.c_str(), wm_.bytes() / 1e9, wm_.dev_name());
+        fprintf(stderr, "[qwfn] mtp: nextn block %u of %s: %.2f GB on %s%s\n",
+                hpm_.n_layer - 1, cfg.mtp_path.c_str(), wm_.bytes() / 1e9, wm_.dev_name(),
+                mtp_experts_host_ ? (", its " + std::to_string((long long) (wmh_.bytes() / 1e6)) + " MB of experts in host memory (computed on the CPU per draft)").c_str() : ", experts included");
     }
     if (!wh_.map_shards(err)) return false;
     if (!wh_.declare_mapped("per_layer_token_embd.weight")) {
@@ -123,6 +133,23 @@ bool engine::init(const model_index * hot, const model_index * cold,
     sc.type_k = cfg.type_k;
     sc.type_v = cfg.type_v;
     if (!st_.init(&hp_, sc, w_.buft(), err)) return false;
+    if (mtp_on_ || cfg.rollback_snapshots) {
+        // Rollback snapshots for the MTP verify: per DeltaNet layer the state and
+        // conv history after the FIRST token of a pair, and the PLE conv (117 MB).
+        ggml_init_params rp{}; rp.mem_size = ggml_tensor_overhead() * (2 * hp_.n_layer + 4); rp.no_alloc = true;
+        rbctx_ = ggml_init(rp);
+        rb_rs_.assign(hp_.n_layer, nullptr); rb_conv_.assign(hp_.n_layer, nullptr);
+        const int64_t hv = hp_.ssm_d_state, nvh = hp_.ssm_dt_rank;
+        const int64_t conv_dim = 2 * (int64_t) hp_.ssm_n_group * hp_.ssm_d_state + (int64_t) hp_.ssm_dt_rank * hp_.ssm_d_state;
+        for (uint32_t il = 0; il < hp_.n_layer; il++) {
+            if (hp_.is_attn_layer(il)) continue;
+            rb_rs_[il]   = ggml_new_tensor_3d(rbctx_, GGML_TYPE_F32, hv, hv, nvh);
+            rb_conv_[il] = ggml_new_tensor_2d(rbctx_, GGML_TYPE_F32, hp_.ssm_d_conv - 1, conv_dim);
+        }
+        rb_ple_conv_ = ggml_new_tensor_2d(rbctx_, GGML_TYPE_F32, (int64_t) (hp_.ple_conv_kernel - 1) * hp_.ple_ngram_size, (int64_t) hp_.hc_count * hp_.n_embd);
+        rbbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(rbctx_, w_.buft());
+        if (!rbbuf_) { err = "no device memory for the rollback snapshots"; return false; }
+    }
 
     // The persistent work buffers are sized by n_batch and are not optional, so
     // they go in before the VRAM expert tier -- same reasoning as the state
@@ -153,6 +180,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     if (mtp_on_) {
         t_hlast_   = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, n_embd, hc, Bd);
         t_mtp_pos_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, 4 * Bd);
+        t_mtp_emb_ = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, n_embd, Bd);
     }
     // Shape the hyper-connection and PLE norm gammas [hc*n_embd] as [n_embd, hc]
     // -- metadata only, same bytes -- so hc_mix and ple can multiply right after
@@ -200,12 +228,13 @@ bool engine::init(const model_index * hot, const model_index * cold,
             hp_.hc_inject_prescaled = true;
         }
     }
-    pack_n_ = n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX;
+    pack_n_ = 2 * (n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX);   // room for a two-token step
     if ((int64_t) Bd * n_embd >= pack_n_ && cfg.use_gpu && !getenv("QWFN_NO_PACK")) {
         t_pack_ = ggml_view_1d(wctx_, t_cur_, pack_n_, 0);
-        pack_host_.resize(pack_n_); pred_next_.resize(QWFN_SPEC_MAX); scores_next_.resize(QWFN_SPEC_MAX);
+        pack_host_.resize(pack_n_); pred_next_.resize(2 * QWFN_SPEC_MAX); scores_next_.resize(2 * QWFN_SPEC_MAX);
     }
     gA_pack_.assign(hp_.n_layer, 0);
+    gA_T_.assign(hp_.n_layer, 0);
     // Speculative-block mask by predicted layer, and the per-layer counters.
     spec_block_mask_.assign(hp_.n_layer, cfg.spec_block_layers.empty() ? 1 : 0);
     if (!cfg.spec_block_layers.empty()) {
@@ -227,20 +256,42 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 cfg.spec_margin > 0.0f ? (std::to_string(cfg.spec_margin) + (cfg.spec_gate_inflight ? " when >= " + std::to_string(cfg.spec_gate_inflight) + " reads in flight" : "")).c_str() : "off");
     }
     t_w_      = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, U, Bd);
-    t_gids_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, U, 1);
-    t_gw_     = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, 1, U, 1);
+    t_gids_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, U, 2);
+    t_gw_     = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, 1, U, 2);
     inp_tok_  = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, Bd);
     inp_pos_  = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, Bd * 4);
+    inp_pos_one_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, Bd * 4);
     inp_ple_  = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, PH * Bd);
     if (getenv("QWFN_ROUTE_DUMP_DECODE")) t_xdec_ = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, n_embd, hp_.n_layer);
     if (cfg.skip_miss) t_rscale_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_F32, 1);
     wbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(wctx_, w_.buft());
     { std::vector<float> m(hc, 1.0f / (float) hc); ggml_backend_tensor_set(t_hcmean_, m.data(), 0, m.size() * sizeof(float)); }
+    if (mtp_on_ && mtp_experts_host_) {
+        ggml_init_params mp{}; mp.mem_size = ggml_tensor_overhead() * 8; mp.no_alloc = true;
+        mctx_ = ggml_init(mp);
+        t_m_res_    = ggml_new_tensor_3d(mctx_, GGML_TYPE_F32, n_embd, hc, Bd);
+        t_m_cur_    = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, n_embd, Bd);
+        t_m_inject_ = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, hc, Bd);
+        t_m_sel_    = ggml_new_tensor_2d(mctx_, GGML_TYPE_I32, U, Bd);
+        t_m_w_      = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, U, Bd);
+        t_m_sh_     = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, n_embd, Bd);
+        t_m_pc_     = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, n_embd, Bd);
+        mbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(mctx_, w_.buft());
+        if (!mbuf_) { err = "no device memory for the head's work set"; return false; }
+        ggml_init_params hp2{}; hp2.mem_size = ggml_tensor_overhead() * 8; hp2.no_alloc = true;
+        mhctx_ = ggml_init(hp2);
+        h_m_cur_     = ggml_new_tensor_2d(mhctx_, GGML_TYPE_F32, n_embd, Bd);
+        h_m_ids_     = ggml_new_tensor_2d(mhctx_, GGML_TYPE_I32, U, Bd);
+        h_m_w_       = ggml_new_tensor_3d(mhctx_, GGML_TYPE_F32, 1, U, Bd);
+        h_m_partial_ = ggml_new_tensor_2d(mhctx_, GGML_TYPE_F32, n_embd, Bd);
+        mhbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(mhctx_, wh_.buft());
+        if (!mhbuf_) { err = "no host memory for the head's work set"; return false; }
+    }
     if (!wbuf_) { err = "failed to allocate engine work buffer"; return false; }
     if (t_rscale_) { const float one = 1.0f; ggml_backend_tensor_set(t_rscale_, &one, 0, 4); }
     save_work_set(dec_ws_);
 
-    ggml_init_params hpar{}; hpar.mem_size = ggml_tensor_overhead() * 32; hpar.no_alloc = true;
+    ggml_init_params hpar{}; hpar.mem_size = ggml_tensor_overhead() * 34; hpar.no_alloc = true;
     hctx_ = ggml_init(hpar);
     h_cur_     = ggml_new_tensor_2d(hctx_, GGML_TYPE_F32, n_embd, B);
     h_partial_ = ggml_new_tensor_2d(hctx_, GGML_TYPE_F32, n_embd, B);
@@ -248,6 +299,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     h_ple_idx_ = ggml_new_tensor_1d(hctx_, GGML_TYPE_I32, PH * B);
     h_tok_     = ggml_new_tensor_1d(hctx_, GGML_TYPE_I32, B);
     h_emb_     = ggml_new_tensor_2d(hctx_, GGML_TYPE_F32, n_embd, B);
+    if (mtp_on_) { h_mtp_tok_ = ggml_new_tensor_1d(hctx_, GGML_TYPE_I32, B); h_mtp_emb_ = ggml_new_tensor_2d(hctx_, GGML_TYPE_F32, n_embd, B); }
     hbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(hctx_, wh_.buft());
     if (!hbuf_) { err = "failed to allocate engine host buffer"; return false; }
 
@@ -258,11 +310,11 @@ bool engine::init(const model_index * hot, const model_index * cold,
         if (hb) {
             ggml_init_params pp{}; pp.mem_size = ggml_tensor_overhead() * 8; pp.no_alloc = true;
             pctx_    = ggml_init(pp);
-            p_gids_  = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, U);
-            p_gw_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, U);
+            p_gids_  = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, 2 * U);
+            p_gw_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, 2 * U);
             p_vslot_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, hp_.n_expert);
             p_vmask_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, hp_.n_expert);
-            p_pc_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, n_embd);
+            p_pc_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, 2 * n_embd);
             pbuf_    = ggml_backend_alloc_ctx_tensors_from_buft(pctx_, hb);
             if (!pbuf_ || ggml_backend_buffer_get_type(pbuf_) != hb) {
                 if (pbuf_) ggml_backend_buffer_free(pbuf_);
@@ -280,7 +332,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 { qsa_ratio_ = (uint32_t) hp_.compress_ratios[il]; break; }
     if (qsa_ratio_ && !getenv("QWFN_LEGACY_QSA_DECODE")) {
         const int64_t r = qsa_ratio_, NBmax = (cfg.n_ctx + r - 1) / r, idx_dim = hp_.idx_key_len;
-        ggml_init_params qp{}; qp.mem_size = ggml_tensor_overhead() * (hp_.n_layer + 16); qp.no_alloc = true;
+        ggml_init_params qp{}; qp.mem_size = ggml_tensor_overhead() * (hp_.n_layer + 32); qp.no_alloc = true;
         qctx_ = ggml_init(qp);
         pool_cache_.assign(hp_.n_layer, nullptr);
         for (uint32_t il = 0; il < hp_.n_layer; il++)
@@ -293,6 +345,15 @@ bool engine::init(const model_index * hot, const model_index * cold,
         qd_.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
         qd_.blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
         qd_.npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
+        // The second position of a two-token decode step: its own per-token
+        // inputs and bias; the block tables and pooled keys are shared.
+        qd2_ = qd_;
+        qd2_.bias       = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, NBmax);
+        qd2_.write_idx  = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
+        qd2_.member_idx = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, r);
+        qd2_.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
+        qd2_.blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
+        qd2_.npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
         qbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(qctx_, w_.buft());
         if (!qbuf_) {
             fprintf(stderr, "[qwfn] no device memory for the decode QSA state; decode attention scans the whole context\n");
@@ -307,8 +368,10 @@ bool engine::init(const model_index * hot, const model_index * cold,
             ggml_backend_tensor_set(qd_.cell_pos, cp.data(), 0, cp.size() * 4);
             std::vector<float> ninf(NBmax, -INFINITY);
             ggml_backend_tensor_set(qd_.bias, ninf.data(), 0, ninf.size() * 4);
+            ggml_backend_tensor_set(qd2_.bias, ninf.data(), 0, ninf.size() * 4);
             qd_.ratio    = qsa_ratio_;
             qd_.k_blocks = (int64_t) ((hp_.idx_top_k + r - 1) + r - 1) / r;   // ceil(width / r)
+            qd2_.ratio = qd_.ratio; qd2_.k_blocks = qd_.k_blocks;
             fprintf(stderr, "[qwfn] decode QSA state: %.1f MB (pooled block keys for %lld blocks, %lld kept)\n",
                     ggml_backend_buffer_get_size(qbuf_) / 1e6, (long long) NBmax, (long long) qd_.k_blocks);
         }
@@ -404,7 +467,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // Experts promoted to VRAM during a layer's fetch were not resident when
     // that layer's graph ran: the next graph computes them from the tier by
     // slot (at most max_promotions_per_layer of them), the "late fold".
-    n_late_ = moe_in_graph_ ? (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : 0;
+    n_late_ = moe_in_graph_ ? 2 * (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : 0;   // room for a pair's doubled budget
     // Before the tier sizes itself from the free VRAM: the heads' 123 MB must come out of the tier, not the decode reserve.
     if (!cfg.predictor_path.empty() && !load_predictor(cfg.predictor_path, err)) return false;
     if (!ec_.init(hot, cold, ec_cfg, err)) return false;
@@ -446,7 +509,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // The legacy per-ubatch prefill's device twins and the prefill MoE
     // allocator are created per prefill (prefill_enter) and freed after.
 
-    logits_.resize((size_t) n_vocab_);
+    logits_.resize((size_t) n_vocab_ * 2);   // both positions of a decoded pair
     xfer_.resize((size_t) n_embd * B);
     zeros_.assign((size_t) n_embd * B, 0.0f);
     sel_.resize((size_t) U * B);
@@ -483,14 +546,14 @@ static ggml_tensor * moe_id_graph(ggml_context * c, const tier_view & tv,
     ggml_tensor * up   = ggml_mul_mat_id(c, as[EXPERT_UP],   x, ids);
     ggml_tensor * act  = ggml_swiglu_split(c, gate, up);                        // silu(gate) * up, one op; fused with the matmuls on CUDA
     ggml_tensor * down = ggml_mul_mat_id(c, as[EXPERT_DOWN], act, ids);        // [n_embd, n, T]
-    if (fused_sum && T == 1) {
+    if (fused_sum && T <= 2) {
         // The weighted sum of the n expert rows as one matmul over the transposed
         // rows: two kernels instead of a multiply and n-1 adds. A different
         // summation order, so only the GPU graphs ask for it; the CPU path keeps
-        // the sequential sum it is validated with.
-        ggml_tensor * dt = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, down, 1, 0, 2, 3)), n, n_embd);   // [n, n_embd]
-        ggml_tensor * wv = ggml_reshape_2d(c, ggml_cont(c, w), n, 1);                                       // [n, 1]
-        return ggml_mul_mat(c, dt, wv);                                                                       // [n_embd, 1]
+        // the sequential sum it is validated with. Batched over the T positions.
+        ggml_tensor * dt = ggml_reshape_3d(c, ggml_cont(c, ggml_permute(c, down, 1, 0, 2, 3)), n, n_embd, T);   // [n, n_embd, T]
+        ggml_tensor * wv = ggml_reshape_3d(c, ggml_cont(c, w), n, 1, T);                                       // [n, 1, T]
+        return ggml_reshape_2d(c, ggml_mul_mat(c, dt, wv), n_embd, T);                                          // [n_embd, T]
     }
     ggml_tensor * wd   = ggml_mul(c, down, w);
     // Sum the n expert rows of each token, in order.
@@ -543,7 +606,7 @@ void engine::set_embeddings(int32_t pos, const float * emb, int32_t n) {
 }
 
 void engine::reset() {
-    mtp_have_h_ = false; mtp_kv_valid_ = true; mtp_draft_ = -1;
+    mtp_have_h_ = false; mtp_kv_valid_ = true; mtp_draft_ = -1; rb_valid_ = false;
     st_.reset(); n_past_ = 0;
     pool_dirty_ = true;
     if (qbuf_) {
@@ -1168,13 +1231,22 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
 }
 
 bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::string & err,
-                        bool cbatch) {
+                        bool cbatch, bool force_decode) {
     const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count, U = hp_.n_expert_used;
     const int64_t n_past = n_past_, n_kv = n_past + T, PH = hp_.ple_n_head();
     // Unit-test hook: the batched path must reduce exactly to the decode path
     // at T == 1, so forcing it there checks the permutation logic in isolation.
     static const bool force_batched = getenv("QWFN_FORCE_BATCHED") != nullptr;
-    const bool decode = (T == 1) && !force_batched;
+    const bool decode = (T == 1 || (force_decode && T == 2)) && !force_batched;   // a pair: the MTP verify step
+    if (mtp_on_ && T > 1 && !force_decode && n_past > 0 && mtp_kv_valid_) {
+        // A later turn: the head's row for the last decoded position pairs its
+        // wide residual (still in t_hlast_) with this batch's first token.
+        if (mtp_have_h_ && mtp_h_rows_ >= 1) {
+            if (!mtp_step(hist + (n_hist - T), 1, err)) return false;
+        } else {
+            mtp_kv_valid_ = false;
+        }
+    }
     cbatch = cbatch && !decode && T > 1 && scr_buf_ != nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     // Decode attention with per-token cost flat in the context; anything else
@@ -1214,7 +1286,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // contiguous, same type, and the node must be the view root (offset 0).
     auto place = [&](ggml_tensor * t, ggml_tensor * dst, size_t dst_off) -> bool {
         static const bool no_place = getenv("QWFN_NO_INPLACE") != nullptr;
-        if (no_place || T != 1 || !dst || !dst->data || !dst->buffer) return false;
+        if (no_place || T > 2 || !dst || !dst->data || !dst->buffer) return false;
         ggml_tensor * root = t; size_t off = 0;
         while (root->view_src) { off += root->view_offs; root = root->view_src; }
         if (off != 0 || root->data || root->type != dst->type || !ggml_is_contiguous(root)) return false;
@@ -1250,12 +1322,15 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // The late fold of layer `prev`: its promoted experts, by slot, from
     // t_gids_/t_gw_ (zeros when there were none: slot 0 with weight 0).
     // Decode only: the batched paths compute every expert of a layer themselves
-    // and leave t_gids_/t_gw_ holding the last decode step's values.
+    // and leave t_gids_/t_gw_ holding the last decode step's values, and the
+    // per-position view below is sized for a decode step's T of 1 or 2, not a
+    // prompt's (a 27-token batch read 1 KB past the two-column tensors: garbage
+    // ids and weights folded into every position, gibberish from the next turn on).
     auto late_fold = [&](ggml_context * c, uint32_t prev, ggml_tensor * pg) {
         if (!decode || !moe_in_graph(prev) || n_late_ <= 0) return pg;
-        ggml_tensor * ids = ggml_view_2d(c, t_gids_, n_late_, 1, t_gids_->nb[1], 0);
-        ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, n_late_, 1, t_gw_->nb[1], t_gw_->nb[2], 0);
-        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, 1, /*fused_sum=*/true));
+        ggml_tensor * ids = ggml_view_2d(c, t_gids_, n_late_, T, t_gids_->nb[1], 0);
+        ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, n_late_, T, t_gw_->nb[1], t_gw_->nb[2], 0);
+        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, T, /*fused_sum=*/true));
     };
 
     int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1],
@@ -1277,6 +1352,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     for (int64_t i = 0; i < T; i++)
         pos[i] = pos[T + i] = pos[2 * T + i] = (int32_t) (n_past + i);
     ggml_backend_tensor_set(inp_pos_, pos.data(), 0, pos.size() * 4);
+    if (inp_pos_one_ && T <= 2) {   // [p, p, p, 0] per position, for single-position attention calls
+        int32_t p1[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        for (int64_t i = 0; i < T; i++) p1[i * 4] = p1[i * 4 + 1] = p1[i * 4 + 2] = (int32_t) (n_past + i);
+        ggml_backend_tensor_set(inp_pos_one_, p1, 0, (size_t) T * 4 * sizeof(int32_t));
+    }
 
     // Shapes vary with n_kv, so the mask and the QSA inputs are built per call --
     // except on the decode QSA path, which needs neither.
@@ -1305,6 +1385,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     if (!use_qd && !ibuf) { ggml_free(ictx); err = "failed to allocate per-call inputs"; return false; }
 
     if (use_qd) qsa_decode_prepare((int32_t) n_past);
+
+    if (use_qd && T == 2) qsa_decode_prepare2((int32_t) n_past + 1);
     if (!use_qd) {
         std::vector<uint16_t> m((size_t) n_kv * T, f16_of(-INFINITY));
         for (int64_t i = 0; i < T; i++)
@@ -1392,7 +1474,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
     int cur_res = 0;
     bool pending = false;
-    std::vector<expert_handle> eh(U);
+    std::vector<expert_handle> eh(2 * U);   // a pair's union of experts
     pred_.clear();
     pred2_a_.clear();
     pred2_b_.clear();
@@ -1419,7 +1501,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // A graph that speculatively runs an attention successor's block is shaped by the bucket too.
         const bool spec_attn_next = cfg_.spec_block && decode && use_qd && il + 1 < hp_.n_layer
                                     && hp_.is_attn_layer(il + 1) && spec_block_mask_[il + 1];
-        if (replayable && (hp_.is_attn_layer(il) || spec_attn_next) && gA_[il].gf && gA_bucket_[il] != qd_.n_bucket) {
+        if (replayable && gA_[il].gf && (((hp_.is_attn_layer(il) || spec_attn_next) && gA_bucket_[il] != qd_.n_bucket) || gA_T_[il] != (uint8_t) T)) {
             if (gA_[il].ga)  ggml_gallocr_free(gA_[il].ga);
             if (gA_[il].ctx) ggml_free(gA_[il].ctx);
             gA_[il] = layer_graph{};
@@ -1450,6 +1532,20 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
             graph_builder gb(c, &hp_, &w_); gb.bind(&st_, g, n_past);
             gb.set_gpu_fusion(w_.on_gpu() && !getenv("QWFN_NO_FUSE"), t_hcmean_);
+            if (T == 2 && rbbuf_) { gb.set_rollback(rb_rs_[il], rb_conv_[il]); gb.set_rollback_ple(rb_ple_conv_); }
+            // Decode attention for the layer's T positions: one call, or for a
+            // pair two chained calls so the second reads through the first's writes.
+            auto attn_dec = [&](graph_builder & gbx, ggml_tensor * x, uint32_t l) -> ggml_tensor * {
+                qd_.pool_cache = pool_cache_[l];
+                if (T == 1) return gbx.sparse_attn_decode(x, vpos(c), sections, (int) l, qd_);
+                qd2_.pool_cache = pool_cache_[l];
+                graph_builder::qsa_chain ch;
+                ggml_tensor * x0 = ggml_view_2d(c, x, n_embd, 1, x->nb[1], 0);
+                ggml_tensor * x1 = ggml_view_2d(c, x, n_embd, 1, x->nb[1], x->nb[1]);
+                ggml_tensor * o0 = gbx.sparse_attn_decode(x0, ggml_view_1d(c, inp_pos_one_, 4, 0), sections, (int) l, qd_, &ch);
+                ggml_tensor * o1 = gbx.sparse_attn_decode(x1, ggml_view_1d(c, inp_pos_one_, 4, 4 * sizeof(int32_t)), sections, (int) l, qd2_, &ch);
+                return ggml_concat(c, o0, o1, 1);
+            };
 
             ggml_tensor * r = vres(c, cur_res);
             if (pending) {
@@ -1466,8 +1562,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             if (!hp_.is_attn_layer(il)) {
                 cur = gb.deltanet(cur, il);
             } else if (use_qd) {
-                qd_.pool_cache = pool_cache_[il];
-                cur = gb.sparse_attn_decode(cur, vpos(c), sections, il, qd_);
+                cur = attn_dec(gb, cur, il);
             } else {
                 cur = gb.sparse_attn(cur, vpos(c), kq_mask, sections, il, ratio ? &qsa : nullptr);
             }
@@ -1482,11 +1577,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             if (moe_in_graph(il)) {
                 ggml_tensor * slc = ggml_is_contiguous(sl) ? sl : ggml_cont(c, sl);
                 ggml_tensor * wtc = ggml_is_contiguous(wt) ? wt : ggml_cont(c, wt);
-                ggml_tensor * sl1  = ggml_reshape_1d(c, slc, U);
-                ggml_tensor * slot = ggml_reshape_2d(c, ggml_get_rows(c, t_vslot_[il], sl1), U, 1);      // [U, 1]
-                ggml_tensor * mask = ggml_reshape_3d(c, ggml_get_rows(c, t_vmask_[il], sl1), 1, U, 1);   // [1, U, 1]
-                ggml_tensor * w    = ggml_mul(c, ggml_reshape_3d(c, wtc, 1, U, 1), mask);
-                pg_here = moe_id_graph(c, ec_.gpu_tier(il), slot, w, cur2, n_embd, hp_.n_ff_exp, (int) U, 1, /*fused_sum=*/true);
+                ggml_tensor * sl1  = ggml_reshape_1d(c, slc, U * T);
+                ggml_tensor * slot = ggml_reshape_2d(c, ggml_get_rows(c, t_vslot_[il], sl1), U, T);      // [U, T]
+                ggml_tensor * mask = ggml_reshape_3d(c, ggml_get_rows(c, t_vmask_[il], sl1), 1, U, T);   // [1, U, T]
+                ggml_tensor * w    = ggml_mul(c, ggml_reshape_3d(c, wtc, 1, U, T), mask);
+                pg_here = moe_id_graph(c, ec_.gpu_tier(il), slot, w, cur2, n_embd, hp_.n_ff_exp, (int) U, T, /*fused_sum=*/true);
                 if (place(pg_here, t_pg_, 0)) ggml_build_forward_expand(g, pg_here);
                 else ggml_build_forward_expand(g, ggml_cpy(c, pg_here, v2(c, t_pg_)));
             }
@@ -1538,8 +1633,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     if (!hp_.is_attn_layer(iln)) {
                         blk = gb.deltanet(c1, (int) iln);
                     } else {
-                        qd_.pool_cache = pool_cache_[iln];
-                        blk = gb.sparse_attn_decode(c1, vpos(c), sections, (int) iln, qd_);
+                        blk = attn_dec(gb, c1, iln);
                     }
                     gb.set_persist(true);
                     rp = gb.hc_combine(rp, blk, inj2);
@@ -1554,10 +1648,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     ggml_build_forward_expand(g, ggml_cpy(c, xpred, ggml_view_1d(c, t_xdec_, n_embd, (size_t) il * t_xdec_->nb[1])));
                 if (pack_ok) {   // into the readback pack (I32 -> F32 for the ids), see t_pack_
                     ggml_build_forward_expand(g, ggml_cpy(c, selnext,
-                            ggml_view_1d(c, t_pack_, depth, (size_t) (n_embd + 2 * U) * sizeof(float))));
-                    if (place(scores, t_cur_, (size_t) (n_embd + 2 * U + depth) * sizeof(float))) ggml_build_forward_expand(g, scores);
+                            ggml_view_1d(c, t_pack_, depth * T, (size_t) (T * n_embd + 2 * U * T) * sizeof(float))));
+                    if (place(scores, t_cur_, (size_t) (T * n_embd + 2 * U * T + depth * T) * sizeof(float))) ggml_build_forward_expand(g, scores);
                     else ggml_build_forward_expand(g, ggml_cpy(c, scores,
-                            ggml_view_1d(c, t_pack_, depth, (size_t) (n_embd + 2 * U + depth) * sizeof(float))));
+                            ggml_view_1d(c, t_pack_, depth * T, (size_t) (T * n_embd + 2 * U * T + depth * T) * sizeof(float))));
                 } else {
                     ggml_build_forward_expand(g, ggml_cpy(c, selnext,
                             ggml_view_2d(c, t_selnext_, depth, T, t_selnext_->nb[1], 0)));
@@ -1578,9 +1672,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             ggml_build_forward_expand(g, place(cur2, t_cur_, 0) ? cur2 : ggml_cpy(c, cur2, v2(c, t_cur_)));   // row 0 of t_cur_ is the pack's head
             ggml_build_forward_expand(g, place(inject, t_inject_, 0) ? inject : ggml_cpy(c, inject, v2(c, t_inject_)));
             if (pack_ok) {
-                ggml_build_forward_expand(g, place(wt, t_cur_, (size_t) n_embd * sizeof(float)) ? wt
-                        : ggml_cpy(c, wt, ggml_view_1d(c, t_pack_, U, (size_t) n_embd * sizeof(float))));
-                ggml_build_forward_expand(g, ggml_cpy(c, sl, ggml_view_1d(c, t_pack_, U, (size_t) (n_embd + U) * sizeof(float))));   // I32 -> F32: a real conversion
+                ggml_build_forward_expand(g, place(wt, t_cur_, (size_t) T * n_embd * sizeof(float)) ? wt
+                        : ggml_cpy(c, wt, ggml_view_1d(c, t_pack_, U * T, (size_t) T * n_embd * sizeof(float))));
+                ggml_build_forward_expand(g, ggml_cpy(c, sl, ggml_view_1d(c, t_pack_, U * T, (size_t) (T * n_embd + U * T) * sizeof(float))));   // I32 -> F32: a real conversion
             } else {
                 ggml_build_forward_expand(g, ggml_cpy(c, sl,     v2(c, t_sel_)));
                 ggml_build_forward_expand(g, ggml_cpy(c, wt,     v2(c, t_w_)));
@@ -1618,7 +1712,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_gallocr_t ga = ggml_gallocr_new(w_.buft());
                 if (ga && ggml_gallocr_alloc_graph(ga, g)) {
                     gA_[il].ctx = c; gA_[il].gf = g; gA_[il].ga = ga;
-                    gA_bucket_[il] = qd_.n_bucket; gA_pack_[il] = pack_ok;
+                    gA_bucket_[il] = qd_.n_bucket; gA_T_[il] = (uint8_t) T; gA_pack_[il] = pack_ok;
                     cached = true;
                     if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {
                         err = "compute failed"; return false;
@@ -1657,19 +1751,18 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
         const bool packed = decode && ran_packed;
         if (packed) {
-            ggml_backend_tensor_get(t_pack_, pack_host_.data(), 0, (size_t) pack_n_ * sizeof(float));
+            const size_t pn = (size_t) T * (n_embd + 2 * U + 2 * QWFN_SPEC_MAX);
+            ggml_backend_tensor_get(t_pack_, pack_host_.data(), 0, pn * sizeof(float));
             const float * pk = pack_host_.data();
-            ggml_backend_tensor_set(h_cur_, pk, 0, (size_t) n_embd * sizeof(float));   // host tensor: a memcpy
-            for (int64_t e = 0; e < U; e++) { wgt_[e] = pk[n_embd + e]; sel_[e] = (int32_t) lrintf(pk[n_embd + U + e]); }
-            for (uint32_t k = 0; k < QWFN_SPEC_MAX; k++) {
-                pred_next_[k]   = (int32_t) lrintf(pk[n_embd + 2 * U + k]);
-                scores_next_[k] = pk[n_embd + 2 * U + QWFN_SPEC_MAX + k];
-            }
+            ggml_backend_tensor_set(h_cur_, pk, 0, (size_t) T * n_embd * sizeof(float));   // host tensor: a memcpy
+            const float * pw = pk + T * n_embd, * ps = pw + U * T, * pp = ps + U * T, * pc = pp + QWFN_SPEC_MAX * T;
+            for (int64_t k = 0; k < U * T; k++) { wgt_[k] = pw[k]; sel_[k] = (int32_t) lrintf(ps[k]); }
+            for (int64_t k = 0; k < (int64_t) QWFN_SPEC_MAX * T; k++) { pred_next_[k] = (int32_t) lrintf(pp[k]); scores_next_[k] = pc[k]; }
         } else {
             ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
             ggml_backend_tensor_get(t_w_,   wgt_.data(), 0, (size_t) U * T * sizeof(float));
         }
-        if (t_xdec_ && decode) {   // this token's true routing of layer il; the record is complete at the last layer
+        if (t_xdec_ && decode && T == 1) {   // this token's true routing of layer il; the record is complete at the last layer
             memcpy(tok_sel_.data() + (size_t) il * U, sel_.data(), (size_t) U * sizeof(int32_t));
             memcpy(tok_w_.data()   + (size_t) il * U, wgt_.data(), (size_t) U * sizeof(float));
             if (il + 1 == hp_.n_layer) dump_decode_token();
@@ -1680,18 +1773,19 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // at layer n-2 for layer n-1, already scored; counting it against layer 0's
         // routing added ten near-certain misses per token to the reported rate.
         if (cfg_.speculate && decode && il > 0 && !pred_.empty()) {
-            for (int64_t e = 0; e < U; e++) {
-                pred_total++; pred_total_layer[il]++;
-                for (int64_t k = 0; k < U; k++)
-                    if (pred_[k] == sel_[e]) { pred_hits++; pred_hits_layer[il]++; break; }
-            }
-            // Precision by rank and by confidence margin: the gate's calibration data.
-            for (size_t k = 0; k < pred_.size() && k < QWFN_SPEC_MAX; k++) {
-                bool ok = false;
-                for (int64_t e = 0; e < U; e++) if (pred_[k] == sel_[e]) { ok = true; break; }
-                rank_total[k]++; if (ok) rank_hits[k]++;
-                if (k < pred_margin_.size()) {
-                    const int b = margin_bucket(pred_margin_[k]);
+            for (int64_t j = 0; j < T; j++) {
+                const int32_t * pj = pred_.data() + j * QWFN_SPEC_MAX, * sj = sel_.data() + j * U;
+                for (int64_t e = 0; e < U; e++) {
+                    pred_total++; pred_total_layer[il]++;
+                    for (int64_t k = 0; k < U; k++)
+                        if (pj[k] == sj[e]) { pred_hits++; pred_hits_layer[il]++; break; }
+                }
+                // Precision by rank and by confidence margin: the gate's calibration data.
+                for (size_t k = 0; k < QWFN_SPEC_MAX; k++) {
+                    bool ok = false;
+                    for (int64_t e = 0; e < U; e++) if (pj[k] == sj[e]) { ok = true; break; }
+                    rank_total[k]++; if (ok) rank_hits[k]++;
+                    const int b = margin_bucket(pred_margin_[j * QWFN_SPEC_MAX + k]);
                     margin_total[b]++; if (ok) margin_hits[b]++;
                 }
             }
@@ -1707,14 +1801,26 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
         if (decode) {
             // ---- decode: cache-served, one matmul per expert ----------------
-            for (int64_t e = 0; e < U; e++) ids_[e] = (uint32_t) sel_[e];
-            std::vector<uint8_t> rdy(U, 0);
+            // The experts of all T positions, each once (a pair shares about a
+            // third of them); per position a weight of 0 where it does not route there.
+            int64_t n_u = 0;
+            for (int64_t k = 0; k < U * T; k++) {
+                const uint32_t e = (uint32_t) sel_[k]; bool dup = false;
+                for (int64_t q = 0; q < n_u; q++) if (ids_[q] == e) { dup = true; break; }
+                if (!dup) ids_[n_u++] = e;
+            }
+            auto w_tok = [&](int64_t e, int64_t j) -> float {
+                for (int64_t k = 0; k < U; k++) if ((uint32_t) sel_[j * U + k] == ids_[e]) return wgt_[j * U + k];
+                return 0.0f;
+            };
+            if (T > 1 && (!moe_by_id || check_moe)) { err = "a decoded pair needs the mul_mat_id MoE"; if (ibuf) ggml_backend_buffer_free(ibuf); if (ictx) ggml_free(ictx); return false; }
+            std::vector<uint8_t> rdy(n_u, 0);
             const auto ti = std::chrono::steady_clock::now();
             if (deferred_wait_) {   // the previous layer's skipped misses: their reads had a layer to land
                 if (!ec_.fetch_end()) { err = "expert read failed"; if (ibuf) ggml_backend_buffer_free(ibuf); if (ictx) ggml_free(ictx); return false; }
                 deferred_wait_ = false;
             }
-            if (!ec_.fetch_begin(il, (const uint32_t *) ids_.data(), (uint32_t) U,
+            if (!ec_.fetch_begin(il, (const uint32_t *) ids_.data(), (uint32_t) n_u,
                                  eh.data(), (bool *) rdy.data())) {
                 err = "expert fetch failed"; if (ibuf) ggml_backend_buffer_free(ibuf); if (ictx) ggml_free(ictx); return false;
             }
@@ -1734,7 +1840,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // backend dereferences a device pointer.
             static const bool overlap = getenv("QWFN_OVERLAP") != nullptr;
             std::vector<int> on_gpu, late_gpu, ready_cpu, late_cpu, all_cpu;
-            for (int64_t e = 0; e < U; e++) {
+            for (int64_t e = 0; e < n_u; e++) {
                 // `late` only matters to the in-graph path (its graph already ran);
                 // the host-driven paths compute promoted experts like any other.
                 if (eh[e].on_gpu) { (eh[e].late && moe_in_graph(il) ? late_gpu : on_gpu).push_back((int) e); continue; }
@@ -1784,15 +1890,16 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     const tier_view tv = ec_.ram_tier(il);
                     const int n = (int) which.size();
                     ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
-                    ggml_tensor * ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, n, 1);   ggml_set_input(ids);
-                    ggml_tensor * w   = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, n, 1); ggml_set_input(w);
-                    ggml_tensor * acc = moe_id_graph(c, tv, ids, w, in, n_embd, hp_.n_ff_exp, n);
+                    ggml_tensor * ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, n, T);   ggml_set_input(ids);
+                    ggml_tensor * w   = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, n, T); ggml_set_input(w);
+                    ggml_tensor * acc = moe_id_graph(c, tv, ids, w, in, n_embd, hp_.n_ff_exp, n, T);
                     ggml_build_forward_expand(g, ggml_cpy(c, acc, v2(c, out)));
                     if (!ggml_gallocr_alloc_graph(galloc_cpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
-                    std::vector<int32_t> sid(n); std::vector<float> sw(n);
-                    for (int k = 0; k < n; k++) { sid[k] = eh[which[k]].slot; sw[k] = wgt_[which[k]]; }
-                    ggml_backend_tensor_set(ids, sid.data(), 0, (size_t) n * sizeof(int32_t));
-                    ggml_backend_tensor_set(w,   sw.data(),  0, (size_t) n * sizeof(float));
+                    std::vector<int32_t> sid((size_t) n * T); std::vector<float> sw((size_t) n * T);
+                    for (int64_t j = 0; j < T; j++)
+                        for (int k = 0; k < n; k++) { sid[j * n + k] = eh[which[k]].slot; sw[j * n + k] = w_tok(which[k], j); }
+                    ggml_backend_tensor_set(ids, sid.data(), 0, sid.size() * sizeof(int32_t));
+                    ggml_backend_tensor_set(w,   sw.data(),  0, sw.size() * sizeof(float));
                     if (ggml_backend_graph_compute(wh_.backend(), g) != GGML_STATUS_SUCCESS) {
                         fprintf(stderr, "[qwfn] compute failed\n"); abort();
                     }
@@ -1839,16 +1946,17 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // through pinned staging on the compute stream -- after the
                     // promotion copies, before the graph that reads them.
                     if ((int) late_gpu.size() > n_late_) { fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), n_late_); abort(); }
-                    std::vector<int32_t> gids(U, 0); std::vector<float> gw(U, 0.0f);
-                    for (size_t k = 0; k < late_gpu.size(); k++) { gids[k] = eh[late_gpu[k]].slot; gw[k] = wgt_[late_gpu[k]]; }
+                    std::vector<int32_t> gids((size_t) U * T, 0); std::vector<float> gw((size_t) U * T, 0.0f);
+                    for (int64_t j = 0; j < T; j++)
+                        for (size_t k = 0; k < late_gpu.size(); k++) { gids[j * U + k] = eh[late_gpu[k]].slot; gw[j * U + k] = w_tok(late_gpu[k], j); }
                     if (p_gids_) {
-                        memcpy(p_gids_->data, gids.data(), (size_t) U * sizeof(int32_t));
-                        memcpy(p_gw_->data,   gw.data(),   (size_t) U * sizeof(float));
-                        ggml_backend_tensor_set_async(w_.backend(), t_gids_, p_gids_->data, 0, (size_t) U * sizeof(int32_t));
-                        ggml_backend_tensor_set_async(w_.backend(), t_gw_,   p_gw_->data,   0, (size_t) U * sizeof(float));
+                        memcpy(p_gids_->data, gids.data(), gids.size() * sizeof(int32_t));
+                        memcpy(p_gw_->data,   gw.data(),   gw.size() * sizeof(float));
+                        ggml_backend_tensor_set_async(w_.backend(), t_gids_, p_gids_->data, 0, gids.size() * sizeof(int32_t));
+                        ggml_backend_tensor_set_async(w_.backend(), t_gw_,   p_gw_->data,   0, gw.size() * sizeof(float));
                     } else {
-                        ggml_backend_tensor_set(t_gids_, gids.data(), 0, (size_t) U * sizeof(int32_t));
-                        ggml_backend_tensor_set(t_gw_,   gw.data(),   0, (size_t) U * sizeof(float));
+                        ggml_backend_tensor_set(t_gids_, gids.data(), 0, gids.size() * sizeof(int32_t));
+                        ggml_backend_tensor_set(t_gw_,   gw.data(),   0, gw.size() * sizeof(float));
                     }
                     n_exp_gpu += which.size() + late_gpu.size();
                     t_moe_gpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
@@ -1935,24 +2043,29 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 prefetched = true;
                 const uint32_t depth = std::min<uint32_t>(QWFN_SPEC_MAX, std::max<uint32_t>((uint32_t) U, cfg_.speculate_depth));
                 const uint32_t K = QWFN_SPEC_MAX;
-                pred_.resize(K); spec_scores_.resize(K); pred_margin_.resize(K);
+                pred_.resize(K * T); spec_scores_.resize(K * T); pred_margin_.resize(K * T);
                 if (packed) {
-                    std::copy(pred_next_.begin(), pred_next_.begin() + K, pred_.begin());
-                    std::copy(scores_next_.begin(), scores_next_.begin() + K, spec_scores_.begin());
+                    std::copy(pred_next_.begin(), pred_next_.begin() + K * T, pred_.begin());
+                    std::copy(scores_next_.begin(), scores_next_.begin() + K * T, spec_scores_.begin());
                 } else {
-                    ggml_backend_tensor_get(t_selnext_,   pred_.data(),        0, (size_t) K * sizeof(int32_t));
-                    ggml_backend_tensor_get(t_specscore_, spec_scores_.data(), 0, (size_t) K * sizeof(float));
+                    ggml_backend_tensor_get(t_selnext_,   pred_.data(),        0, (size_t) K * T * sizeof(int32_t));
+                    ggml_backend_tensor_get(t_specscore_, spec_scores_.data(), 0, (size_t) K * T * sizeof(float));
                 }
-                // Margin to the routing cut-off (see engine_config::spec_margin).
+                // Margin to the routing cut-off (see engine_config::spec_margin), per position.
                 const uint32_t Uu = (uint32_t) U;
-                for (uint32_t r = 0; r < K; r++)
-                    pred_margin_[r] = Uu < K ? (r < Uu ? spec_scores_[r] - spec_scores_[Uu] : spec_scores_[Uu - 1] - spec_scores_[r]) : 1e9f;
-                const bool gate = cfg_.spec_margin > 0.0f && ec_.pf_outstanding() >= cfg_.spec_gate_inflight;
-                std::vector<uint32_t> pf1, pf2; pf1.reserve(depth);
-                for (uint32_t e = 0; e < depth; e++) {
-                    if (gate && pred_margin_[e] < cfg_.spec_margin) { pf_gated++; continue; }
-                    pf1.push_back((uint32_t) pred_[e]);
+                for (int64_t j = 0; j < T; j++) {
+                    const float * sc = spec_scores_.data() + j * K;
+                    for (uint32_t r = 0; r < K; r++)
+                        pred_margin_[j * K + r] = Uu < K ? (r < Uu ? sc[r] - sc[Uu] : sc[Uu - 1] - sc[r]) : 1e9f;
                 }
+                const bool gate = cfg_.spec_margin > 0.0f && ec_.pf_outstanding() >= cfg_.spec_gate_inflight;
+                std::vector<uint32_t> pf1, pf2; pf1.reserve(depth * T);
+                for (int64_t j = 0; j < T; j++)
+                    for (uint32_t e = 0; e < depth; e++) {
+                        if (gate && pred_margin_[j * K + e] < cfg_.spec_margin) { pf_gated++; continue; }
+                        const uint32_t id = (uint32_t) pred_[j * K + e];
+                        if (std::find(pf1.begin(), pf1.end(), id) == pf1.end()) pf1.push_back(id);
+                    }
 
                 pred2_a_.swap(pred2_b_);
                 pred2_b_.clear();
@@ -2058,7 +2171,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // the staging is next written only after that graph has run
             // synchronously, so the DMA has long completed. Pageable memory would
             // make cudaMemcpyAsync block the caller anyway (see the promotions).
-            if (p_pc_ && T == 1) {
+            if (p_pc_ && nfl * sizeof(float) <= ggml_nbytes(p_pc_)) {
                 memcpy(p_pc_->data, acc.data(), nfl * sizeof(float));
                 ggml_backend_tensor_set_async(w_.backend(), t_pc_, p_pc_->data, 0, nfl * sizeof(float));
             } else {
@@ -2411,22 +2524,6 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
     if (deferred_wait_) { if (!ec_.fetch_end()) { err = "expert read failed"; return false; } deferred_wait_ = false; }
 
-    // ---- MTP experiment, decode: score the previous draft against this token,
-    // then draft the token after this one from (h of the previous token, this
-    // token's embedding) at the previous token's position. Before the head:
-    // it overwrites t_hlast_. ----------------------------------------------
-    if (mtp_on_ && T == 1) {
-        const int32_t tok = hist[n_hist - 1];
-        if (mtp_draft_ >= 0) {
-            mtp_n++;
-            if (tok == mtp_draft_) mtp_acc++;
-            for (int k = 0; k < 3; k++) if (tok == mtp_draft_top_[k]) { mtp_top3++; break; }
-        }
-        mtp_draft_ = -1;
-        if (mtp_have_h_ && mtp_kv_valid_ && n_past >= 1) {
-            if (!mtp_draft(n_past - 1, 1, mtp_h_rows_ - 1, 0, nullptr, 0, err)) return false;
-        }
-    }
     // ---- head --------------------------------------------------------------
     {
         ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
@@ -2441,30 +2538,30 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         }
         if (mtp_on_)   // the wide residual of every position, for the draft head
             ggml_build_forward_expand(g, ggml_cpy(c, r, ggml_view_3d(c, t_hlast_, n_embd, hc, T, t_hlast_->nb[1], t_hlast_->nb[2], 0)));
-        // Only the final position produces logits.
-        r = ggml_view_3d(c, r, n_embd, hc, 1, r->nb[1], r->nb[2], (size_t) (T - 1) * r->nb[2]);
+        // Logits for the final position -- or for both of a decoded pair.
+        const int64_t n_out = (decode && T <= 2) ? T : 1;
+        if (n_out == 1) r = ggml_view_3d(c, r, n_embd, hc, 1, r->nb[1], r->nb[2], (size_t) (T - 1) * r->nb[2]);
         ggml_tensor * o = gb.hc_mix(r, -1, false, nullptr);
         ggml_tensor * logits = ggml_mul_mat(c, w_.get("output.weight"), o);
         ggml_set_output(logits);
         ggml_build_forward_expand(g, logits);
         run_on(g, true);
-        ggml_backend_tensor_get(logits, logits_.data(), 0, logits_.size() * sizeof(float));
+        ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * n_out * sizeof(float));
         ggml_free(c);
     }
 
     if (mtp_on_) {
         mtp_have_h_ = true; mtp_h_rows_ = T;
-        if (T > 1) {
-            // A batch is the head's prompt only at the start of the sequence: its
-            // rows 0..T-2 pair with embeddings 1..T-1 at positions 0..T-2, and the
-            // drafts for positions whose target is inside the prompt are scored.
-            if (n_past == 0) {
-                if (!mtp_draft(0, T - 1, 0, 1, hist + (n_hist - T) + 2, T - 2, err)) return false;
-            } else {
-                mtp_kv_valid_ = false;   // a mid-sequence batch: the head's KV would have a gap
-            }
+        if (T > 1 && !force_decode && mtp_kv_valid_) {
+            // A batch is the head's prompt: its rows 0..T-2 pair with embeddings
+            // 1..T-1 at positions n_past..n_past+T-2, and the drafts for positions
+            // whose target is inside the prompt are scored. A later turn's batch
+            // needs the row before it as well (mtp_gap_ below, run before the
+            // trunk replaced the wide residual of the last decoded position).
+            if (!mtp_draft(n_past, T - 1, 0, t_emb_, 1, hist + (n_hist - T) + 2, T - 2, err)) return false;
         }
     }
+    rb_valid_ = force_decode && T == 2 && rbbuf_ != nullptr;
     if (ibuf) ggml_backend_buffer_free(ibuf);
     if (ictx) ggml_free(ictx);
     n_past_ += T;
@@ -2474,7 +2571,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     return true;
 }
 
-bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, int64_t e_row,
+bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_src, int64_t e_row,
                        const int32_t * actual, int64_t n_actual, std::string & err) {
     const auto t0 = std::chrono::steady_clock::now();
     const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count;
@@ -2490,13 +2587,64 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, int64_t e_row,
     ggml_cgraph *  g = ggml_new_graph_custom(c, 16384, false);
     graph_builder gb(c, &hpm_, &wm_, &w_); gb.bind(&st_mtp_, g, pos);
     ggml_tensor * h = ggml_view_3d(c, t_hlast_, n_embd, hc, n, t_hlast_->nb[1], t_hlast_->nb[2], (size_t) h_row * t_hlast_->nb[2]);
-    ggml_tensor * e = ggml_view_2d(c, t_emb_, n_embd, n, t_emb_->nb[1], (size_t) e_row * t_emb_->nb[1]);
+    ggml_tensor * e = ggml_view_2d(c, e_src, n_embd, n, e_src->nb[1], (size_t) e_row * e_src->nb[1]);
     ggml_tensor * pv = ggml_view_1d(c, t_mtp_pos_, 4 * n, 0);
     int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1], hp_.mrope_sections[2], hp_.mrope_sections[3] };
-    ggml_tensor * logits = gb.mtp_head(h, e, pv, ai.kq_mask, sections, (int) hpm_.n_layer - 1);
-    ggml_set_output(logits);
-    ggml_build_forward_expand(g, logits);
-    run_on(g, true);
+    const int il = (int) hpm_.n_layer - 1;
+    const int64_t U = hp_.n_expert_used;
+    ggml_tensor * logits = nullptr;
+    if (!mtp_experts_host_) {
+        logits = gb.mtp_head(h, e, pv, ai.kq_mask, sections, il);
+        ggml_set_output(logits);
+        ggml_build_forward_expand(g, logits);
+        run_on(g, true);
+    } else {
+        // First half on the GPU: up to the routing and the shared expert.
+        ggml_tensor * res = nullptr, * cur = nullptr, * inj = nullptr, * sl = nullptr, * wt = nullptr, * sh = nullptr;
+        gb.mtp_head_pre(h, e, pv, ai.kq_mask, sections, il, &res, &cur, &inj, &sl, &wt, &sh);
+        auto v = [&](ggml_tensor * t) { return ggml_view_2d(c, t, t->ne[0], n, t->nb[1], 0); };
+        ggml_build_forward_expand(g, ggml_cpy(c, res, ggml_view_3d(c, t_m_res_, n_embd, hc, n, t_m_res_->nb[1], t_m_res_->nb[2], 0)));
+        ggml_build_forward_expand(g, ggml_cpy(c, cur, v(t_m_cur_)));
+        ggml_build_forward_expand(g, ggml_cpy(c, inj, v(t_m_inject_)));
+        ggml_build_forward_expand(g, ggml_cpy(c, sl,  v(t_m_sel_)));
+        ggml_build_forward_expand(g, ggml_cpy(c, wt,  v(t_m_w_)));
+        ggml_build_forward_expand(g, ggml_cpy(c, sh,  v(t_m_sh_)));
+        run_on(g, true);
+        ggml_free(c);
+        // The routed experts on the CPU from host memory, the trunk's summation order.
+        std::vector<int32_t> ids((size_t) U * n); std::vector<float> ww((size_t) U * n);
+        ggml_backend_tensor_get(t_m_sel_, ids.data(), 0, ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_get(t_m_w_,   ww.data(),  0, ww.size() * sizeof(float));
+        ggml_backend_tensor_get(t_m_cur_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
+        ggml_backend_tensor_set(h_m_cur_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
+        ggml_backend_tensor_set(h_m_ids_, ids.data(), 0, ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(h_m_w_,   ww.data(),  0, ww.size() * sizeof(float));
+        {
+            ggml_init_params ip2{}; ip2.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false); ip2.no_alloc = true;
+            ggml_context * c2 = ggml_init(ip2);
+            ggml_cgraph *  g2 = ggml_new_graph_custom(c2, 64, false);
+            graph_builder gbh(c2, &hpm_, &wmh_);
+            ggml_tensor * o = gbh.moe_resident(ggml_view_2d(c2, h_m_cur_, n_embd, n, h_m_cur_->nb[1], 0),
+                                               ggml_view_2d(c2, h_m_ids_, U, n, h_m_ids_->nb[1], 0),
+                                               ggml_view_3d(c2, h_m_w_, 1, U, n, h_m_w_->nb[1], h_m_w_->nb[2], 0), il, &wmh_);
+            ggml_build_forward_expand(g2, ggml_cpy(c2, o, ggml_view_2d(c2, h_m_partial_, n_embd, n, h_m_partial_->nb[1], 0)));
+            run_on(g2, false);
+            ggml_free(c2);
+        }
+        ggml_backend_tensor_get(h_m_partial_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
+        ggml_backend_tensor_set(t_m_pc_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
+        // Second half on the GPU: fold the partial and the shared expert, mix, project.
+        ggml_init_params ip3{}; ip3.mem_size = ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false); ip3.no_alloc = true;
+        c = ggml_init(ip3);
+        g = ggml_new_graph_custom(c, 256, false);
+        graph_builder gb3(c, &hpm_, &wm_, &w_); gb3.bind(&st_mtp_, g, pos);
+        ggml_tensor * res3 = ggml_view_3d(c, t_m_res_, n_embd, hc, n, t_m_res_->nb[1], t_m_res_->nb[2], 0);
+        ggml_tensor * moe3 = ggml_add(c, v(t_m_sh_), v(t_m_pc_));
+        logits = gb3.mtp_head_post(res3, moe3, v(t_m_inject_), il);
+        ggml_set_output(logits);
+        ggml_build_forward_expand(g, logits);
+        run_on(g, true);
+    }
     const int64_t nv = logits->ne[0];
     std::vector<float> lg((size_t) nv * n);
     ggml_backend_tensor_get(logits, lg.data(), 0, lg.size() * sizeof(float));
@@ -2522,6 +2670,85 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, int64_t e_row,
     ggml_free(c);
     t_mtp += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return true;
+}
+
+void engine::qsa_decode_prepare2(int32_t n_past2) {
+    const int64_t r     = qsa_ratio_;
+    const int64_t NBmax = qd_.bias->ne[0];
+    const int32_t b_last = n_past2 / (int32_t) r;
+    const int64_t n_bid  = (n_past2 + 1) / r;
+    const int32_t wi = n_past2;
+    ggml_backend_tensor_set(qd2_.write_idx, &wi, 0, 4);
+    std::vector<int32_t> mi(r);
+    for (int64_t k = 0; k < r; k++) mi[k] = (int32_t) (b_last * r + k);
+    ggml_backend_tensor_set(qd2_.member_idx, mi.data(), 0, mi.size() * 4);
+    int32_t bp[4] = { (int32_t) (b_last * r), (int32_t) (b_last * r), (int32_t) (b_last * r), (int32_t) (b_last * r) };
+    ggml_backend_tensor_set(qd2_.blk_pos, bp, 0, sizeof bp);
+    ggml_backend_tensor_set(qd2_.blk_idx, &b_last, 0, 4);
+    const float nf = (float) n_past2;
+    ggml_backend_tensor_set(qd2_.npast_f, &nf, 0, 4);
+    // The first position's bias, then this position's window on top of it.
+    ggml_backend_tensor_copy(qd_.bias, qd2_.bias);
+    float win[3]; int64_t b0 = std::max<int64_t>(0, b_last - 1), n = 0;
+    for (int64_t b = b0; b <= b_last + 1 && b < NBmax; b++, n++)
+        win[n] = b < n_bid ? 0.0f : (b == b_last ? 1e9f : -INFINITY);
+    ggml_backend_tensor_set(qd2_.bias, win, (size_t) b0 * 4, (size_t) n * 4);
+    // One bucket for both positions (the graph's shape); the later one bounds it.
+    int64_t NB = ((b_last + 1 + 255) / 256) * 256;
+    NB = std::max<int64_t>(NB, 768);
+    NB = std::min<int64_t>(NB, NBmax);
+    qd_.n_bucket = qd2_.n_bucket = std::max(qd_.n_bucket, NB);
+    qd2_.k_blocks = qd_.k_blocks = std::min<int64_t>(qd_.k_blocks, qd_.n_bucket);
+}
+
+const float * engine::eval_decode(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err) {
+    if (n_new < 1 || n_new > 2) { err = "eval_decode: one or two tokens"; return nullptr; }
+    if (n_past_ + n_new > (int32_t) cfg_.n_ctx) { err = "context exhausted"; return nullptr; }
+    if (n_new == 2 && cfg_.skip_miss) { err = "eval_decode: a pair and --skip-miss do not combine"; return nullptr; }
+    ec_.set_max_promotions(cfg_.promote_per_layer * (uint32_t) n_new);   // a pair looks up ~1.7x the experts per layer
+    const bool ok = eval_batch(hist, n_hist, n_new, err, /*cache_batched=*/false, /*force_decode=*/true);
+    ec_.set_max_promotions(cfg_.promote_per_layer);
+    if (!ok) return nullptr;
+    return logits_.data() + (size_t) (n_new - 1) * n_vocab_;
+}
+
+bool engine::rollback(std::string & err) {
+    if (!rb_valid_) { err = "rollback: no snapshot of the state one token back"; return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (uint32_t il = 0; il < hp_.n_layer; il++) {
+        if (!rb_rs_[il]) continue;
+        ggml_backend_tensor_copy(rb_rs_[il],   st_.rs_state(il));
+        ggml_backend_tensor_copy(rb_conv_[il], st_.rs_conv(il));
+    }
+    if (rb_ple_conv_) ggml_backend_tensor_copy(rb_ple_conv_, st_.ple_conv());
+    // The KV, indexer and pooled-key rows the second position wrote are rewritten
+    // by the next token at that position; the bias window is recomputed per token.
+    n_past_ -= 1;
+    rb_valid_ = false;
+    mtp_h_rows_ = std::max<int64_t>(1, mtp_h_rows_ - 1);
+    n_rollback++;
+    t_rollback += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+bool engine::mtp_step(const int32_t * next_toks, int n, std::string & err) {
+    mtp_draft_ = -1;
+    if (!mtp_ready() || n < 1 || n > 2 || mtp_h_rows_ < n || n_past_ < n) return true;
+    const int64_t n_embd = hp_.n_embd;
+    // The embeddings of the tokens that follow each position, gathered on the host.
+    ggml_backend_tensor_set(h_mtp_tok_, next_toks, 0, (size_t) n * sizeof(int32_t));
+    {
+        ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false); ip.no_alloc = true;
+        ggml_context * c = ggml_init(ip);
+        ggml_cgraph *  g = ggml_new_graph_custom(c, 8, false);
+        ggml_tensor * te = ggml_get_rows(c, wh_.get("token_embd.weight"), ggml_view_1d(c, h_mtp_tok_, n, 0));
+        ggml_build_forward_expand(g, ggml_cpy(c, te, ggml_view_2d(c, h_mtp_emb_, n_embd, n, h_mtp_emb_->nb[1], 0)));
+        run_on(g, false);
+        ggml_free(c);
+    }
+    ggml_backend_tensor_get(h_mtp_emb_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
+    ggml_backend_tensor_set(t_mtp_emb_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
+    return mtp_draft(n_past_ - n, n, mtp_h_rows_ - n, t_mtp_emb_, 0, nullptr, 0, err);
 }
 
 // Confidence-margin buckets for the prediction statistics: router logit

@@ -99,8 +99,19 @@ public:
     // out of the caches and attention runs over them with a cell mask. Nothing
     // here touches all n_kv cells, and no shape depends on n_past, so the graph
     // replays within a bucket.
+    // Two positions in one graph (the MTP verify step) run this twice; the
+    // chain carries the caches as written by the first call so the second reads
+    // through those writes (its block may contain the first position's key).
+    struct qsa_chain { ggml_tensor * ic = nullptr, * kc = nullptr, * vc = nullptr, * pc = nullptr; };
     ggml_tensor * sparse_attn_decode(ggml_tensor * cur, ggml_tensor * inp_pos, const int sections[4],
-                                     int il, const qsa_decode_inputs & qd);
+                                     int il, const qsa_decode_inputs & qd, qsa_chain * chain = nullptr);
+
+    // Rollback snapshots for a two-token graph: the DeltaNet block keeps K=2
+    // state snapshots and copies the one-token-back state into `rs`, the conv
+    // history one token back into `conv`, and the PLE conv likewise. The engine
+    // restores them when a verified draft is rejected.
+    void set_rollback(ggml_tensor * rs, ggml_tensor * conv) { rb_rs_ = rs; rb_conv_ = conv; }
+    void set_rollback_ple(ggml_tensor * conv) { rb_ple_conv_ = conv; }
 
     // Fill pool_cache for blocks [0, n_whole) from the raw indexer cache -- after
     // a prefill, which does not maintain it. `blk_pos_all` is I32 [4*n_whole].
@@ -206,6 +217,18 @@ public:
     // index in the MTP file; its tensors come from `w`, the LM head through `alt`.
     ggml_tensor * mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos,
                            ggml_tensor * kq_mask, const int sections[4], int il);
+    // The same head in two halves around its routed MoE, for experts that live
+    // elsewhere (host memory): the first half returns the wide residual after
+    // the attention block, the FFN input, its inject, the routing and the shared
+    // expert; the second folds a routed partial in and produces the logits.
+    void mtp_head_pre(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos, ggml_tensor * kq_mask,
+                      const int sections[4], int il, ggml_tensor ** res_out, ggml_tensor ** cur_out,
+                      ggml_tensor ** inject_out, ggml_tensor ** sel_out, ggml_tensor ** w_out, ggml_tensor ** sh_out);
+    ggml_tensor * mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il);
+    // The head's routed experts as three resident [.., .., n_expert] tensors
+    // (host or device), applied to x [n_embd, T] with ids [U, T] and weights
+    // [1, U, T]: the trunk's summation order.
+    ggml_tensor * moe_resident(ggml_tensor * x, ggml_tensor * ids, ggml_tensor * w, int il, const weights * src);
 
     // residual + broadcast(block_out) * 2*sigmoid(inject/hc).
     // The 2*sigmoid centres the scatter weights on 1, so a zero injection leaves
@@ -217,7 +240,7 @@ public:
     // Read a conv history out of its state row, append the new input, and write
     // the tail back. Returns the padded input for ggml_ssm_conv.
     ggml_tensor * conv_with_history(ggml_tensor * state_row, ggml_tensor * x,
-                                    int64_t hist, int64_t channels);
+                                    int64_t hist, int64_t channels, ggml_tensor * rb_row = nullptr);
 
 private:
     ggml_tensor * W(const std::string & name) const;
@@ -233,6 +256,7 @@ private:
     bool            persist_ = true;
     bool            gpu_fuse_ = false;
     ggml_tensor *   hc_mean_ = nullptr;
+    ggml_tensor *   rb_rs_ = nullptr, * rb_conv_ = nullptr, * rb_ple_conv_ = nullptr;
 };
 
 } // namespace qwfn

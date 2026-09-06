@@ -7,6 +7,8 @@
 #   scripts/serve.sh --no-spec-block without the speculative next-layer block (on by default: the
 #                                    next layer's experts are predicted through its own block,
 #                                    80% -> 96% correct, exact output)
+#   scripts/serve.sh --mtp           with the checkpoint's draft head (MTP/mtp-*.gguf in the model's
+#                                    repository): exact output, +5% decode at 32K context, neutral at 160K
 #   scripts/serve.sh --list          just list the models
 #   scripts/serve.sh --dry-run       print the command instead of running it
 #   scripts/serve.sh --no-vision     leave the vision projector out (images are accepted by
@@ -26,7 +28,7 @@ RAM=${QWFN_RAM:-12}; CTX=${QWFN_CTX:-163840}; BATCH=${QWFN_BATCH:-4096}; KV=${QW
 
 # A model number is only recognised as the FIRST argument; anything else passes
 # through to qwfn-server (so `--reserve 1024` keeps its value).
-pick=""; dry=0; list=0; vision=1; specblk=1; extra=()
+pick=""; dry=0; list=0; vision=1; specblk=1; mtp=0; extra=()
 if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then pick=$1; shift; fi
 for a in "$@"; do
     case "$a" in
@@ -35,6 +37,7 @@ for a in "$@"; do
         --list)    list=1 ;;
         --no-vision) vision=0 ;;
         --no-spec-block) specblk=0 ;;
+        --mtp)     mtp=1 ;;
         *)         extra+=("$a") ;;
     esac
 done
@@ -89,6 +92,12 @@ if [ $vision -eq 1 ]; then
     [ -n "$mm" ] && extra+=(--mmproj "$mm")
 fi
 [ $specblk -eq 1 ] && extra+=(--spec-block)
+# The draft head may sit in another snapshot directory of the same repository.
+if [ $mtp -eq 1 ]; then
+    for f in "$(dirname "$model")"/../../*/MTP/mtp-*.gguf "$(dirname "$model")"/../*/MTP/mtp-*.gguf; do
+        [ -e "$f" ] && { extra+=(--mtp "$f"); break; }
+    done
+fi
 cmd=(./build/qwfn-server "$model" --ram "$RAM" --ctx "$CTX" --batch "$BATCH" --kv "$KV" "${extra[@]}")
 echo "starting: ${cmd[*]}" | sed "s|$HF/||"
 [ $dry -eq 1 ] && exit 0

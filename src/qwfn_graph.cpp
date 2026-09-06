@@ -116,7 +116,7 @@ ggml_tensor * graph_builder::rms(ggml_tensor * x, ggml_tensor * w) const {
 }
 
 ggml_tensor * graph_builder::conv_with_history(ggml_tensor * state_row, ggml_tensor * x,
-                                               int64_t hist, int64_t channels) {
+                                               int64_t hist, int64_t channels, ggml_tensor * rb_row) {
     // state_row is [hist, channels]; x is [channels, T]. ggml_ssm_conv wants the
     // token axis first, so the history is concatenated ahead of x transposed.
     ggml_tensor * st = ggml_reshape_3d(ctx0, state_row, hist, channels, 1);
@@ -126,6 +126,12 @@ ggml_tensor * graph_builder::conv_with_history(ggml_tensor * state_row, ggml_ten
     ggml_tensor * tail = ggml_view_2d(ctx0, padded, hist, channels,
             padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist));
     if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, tail, state_row));   // cpy handles the strided source
+    // Rollback: the history as it stood after the token before the last one.
+    if (persist_ && rb_row && padded->ne[0] - hist >= 2) {
+        ggml_tensor * tail1 = ggml_view_2d(ctx0, padded, hist, channels,
+                padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist - 1));
+        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, tail1, rb_row));
+    }
 
     return padded;
 }
@@ -155,7 +161,7 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
 
     // Short causal conv over all 10240 channels, then SiLU.
     ggml_tensor * padded  = conv_with_history(st_->rs_conv(il), qkv,
-                                              hp_->ssm_d_conv - 1, conv_dim);
+                                              hp_->ssm_d_conv - 1, conv_dim, rb_conv_);
     ggml_tensor * conv_out = ggml_silu(ctx0, ggml_ssm_conv(ctx0, padded, Wl(il, "ssm_conv1d.weight")));
     // conv_out is [conv_dim, T, 1]
 
@@ -174,8 +180,11 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
 
     ggml_tensor * s0 = ggml_reshape_4d(ctx0, st_->rs_state(il), head_v, head_v, n_v_heads, 1);
 
-    // The fused op broadcasts the 16 k-heads across the 48 v-heads itself.
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, beta, s0, /*K=*/1);
+    // The fused op broadcasts the 16 k-heads across the 48 v-heads itself. K
+    // state snapshots follow the scores in its output, most recent first: with
+    // two tokens and a rollback target, slot 1 is the state after the first.
+    const int K = (persist_ && rb_rs_ && T >= 2) ? 2 : 1;
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, beta, s0, K);
 
     ggml_tensor * out = ggml_view_4d(ctx0, result, head_v, n_v_heads, T, 1,
             ggml_row_size(result->type, head_v),
@@ -195,6 +204,14 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
         ggml_tensor * dst = ggml_view_3d(ctx0, st_->rs_state(il), D, 1, 1,
                                          ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D), 0);
         ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s1, dst));
+        if (K == 2) {
+            ggml_tensor * s2 = ggml_view_4d(ctx0, result, head_v, head_v, n_v_heads, 1,
+                    ggml_row_size(result->type, head_v),
+                    ggml_row_size(result->type, head_v * head_v),
+                    ggml_row_size(result->type, head_v * head_v * n_v_heads),
+                    ggml_row_size(result->type, head_v * n_v_heads * T) + ggml_row_size(result->type, D));
+            ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s2, rb_rs_));
+        }
     }
 
     // Gated RMSNorm; sigmoid gate here, unlike Qwen3.5's GDN which uses silu.
@@ -422,7 +439,7 @@ void graph_builder::qsa_pool_rebuild(int il, const qsa_decode_inputs & qd, int64
 }
 
 ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor * inp_pos, const int sections[4],
-                                                int il, const qsa_decode_inputs & qd) {
+                                                int il, const qsa_decode_inputs & qd, qsa_chain * chain) {
     const int64_t hd      = hp_->n_embd_head_k;   // 256
     const int64_t nh      = hp_->n_head;          // 24
     const int64_t nh_kv   = hp_->n_head_kv;       // 2
@@ -439,13 +456,14 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * k_raw = ggml_mul_mat(ctx0, Wl(il, "indexer.k_proj.weight"), cur);     // [128, 1]
     ggml_tensor * ic    = st_->idx_cache(il);                                          // declared 1D
     ic = ggml_reshape_2d(ctx0, ic, idx_dim, ic->ne[0] / idx_dim);
+    if (chain && chain->ic) ic = chain->ic;
     ggml_tensor * ic_w  = ggml_set_rows(ctx0, ic, k_raw, qd.write_idx);
     ggml_build_forward_expand(gf_, ic_w);
     // Reading through ic_w orders the gather after the write.
     ggml_tensor * members = ggml_get_rows(ctx0, ic_w, qd.member_idx);                 // [128, r]
     ggml_tensor * pooled  = qsa_pool_blocks(ctx0, hp_, members, idx_dim, r, 1,
                                             Wl(il, "indexer.k_norm.weight"), qd.blk_pos, secs);   // [128, 1]
-    ggml_tensor * pc_w = ggml_set_rows(ctx0, qd.pool_cache, pooled, qd.blk_idx);
+    ggml_tensor * pc_w = ggml_set_rows(ctx0, (chain && chain->pc) ? chain->pc : qd.pool_cache, pooled, qd.blk_idx);
     ggml_build_forward_expand(gf_, pc_w);
 
     // ---- scores over the bucket, top blocks -> cells ----------------------
@@ -494,6 +512,7 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * vc   = st_->v_cache(il);
     kc = ggml_reshape_2d(ctx0, kc, kv_dim, kc->ne[0] / kv_dim);
     vc = ggml_reshape_2d(ctx0, vc, kv_dim, vc->ne[0] / kv_dim);
+    if (chain && chain->kc) { kc = chain->kc; vc = chain->vc; }
     ggml_tensor * kc_w = ggml_set_rows(ctx0, kc, ggml_reshape_2d(ctx0, K, kv_dim, 1), qd.write_idx);
     ggml_tensor * vc_w = ggml_set_rows(ctx0, vc, ggml_reshape_2d(ctx0, V, kv_dim, 1), qd.write_idx);
     ggml_build_forward_expand(gf_, kc_w);
@@ -513,6 +532,7 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     out = ggml_reshape_2d(ctx0, out, hd * nh, 1);
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, gate));
+    if (chain) { chain->ic = ic_w; chain->pc = pc_w; chain->kc = kc_w; chain->vc = vc_w; }
     return ggml_mul_mat(ctx0, Wl(il, "attn_output.weight"), out);
 }
 
@@ -604,7 +624,7 @@ ggml_tensor * graph_builder::ple(ggml_tensor * emb, ggml_tensor * hidden, int il
     const int64_t dil  = hp_->ple_ngram_size;
     const int64_t hist = (kern - 1) * dil;
 
-    ggml_tensor * padded = conv_with_history(st_->ple_conv(), normalized, hist, hc_dim);
+    ggml_tensor * padded = conv_with_history(st_->ple_conv(), normalized, hist, hc_dim, rb_ple_conv_);
     ggml_tensor * w1d    = Wl(il, "ple_conv1d.weight");   // [kern, hc_dim]
 
     ggml_tensor * conv_out = nullptr;
@@ -710,12 +730,61 @@ ggml_tensor * graph_builder::mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_t
     res = hc_combine(res, cur, inject);
     cur = hc_mix(res, il, /*ffn=*/true, &inject);
     cur = moe(cur, il);                                                                       // the head's 512 experts, resident
-    res = hc_combine(res, cur, inject);
+    return mtp_head_post(res, cur, inject, il);
+}
 
+ggml_tensor * graph_builder::mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il) {
+    res = hc_combine(res, moe_out, inject);
     // The head's own mixer collapses the streams and doubles as the output norm.
     ggml_tensor * o = hc_mix_w(res, Wl(il, "nextn.hc_head_norm.weight"), Wl(il, "nextn.hc_head_down.weight"),
                                Wl(il, "nextn.hc_head_up.weight"), nullptr, nullptr);
     return ggml_mul_mat(ctx0, W("output.weight"), o);                                        // the trunk's LM head, via alt
+}
+
+void graph_builder::mtp_head_pre(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos, ggml_tensor * kq_mask,
+                                 const int sections[4], int il, ggml_tensor ** res_out, ggml_tensor ** cur_out,
+                                 ggml_tensor ** inject_out, ggml_tensor ** sel_out, ggml_tensor ** w_out, ggml_tensor ** sh_out) {
+    const int64_t hc = hp_->hc_count, n_embd = hp_->n_embd, hc_dim = hc * n_embd;
+    const int64_t T  = emb->ne[1];
+    ggml_tensor * hnorm = Wl(il, "nextn.hnorm.weight");
+    ggml_tensor * hn;
+    if (hnorm->ne[0] == n_embd && hnorm->ne[1] == hc) {
+        hn = ggml_mul(ctx0, ggml_rms_norm(ctx0, h, hp_->rms_eps), hnorm);
+    } else {
+        hn = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, hp_->rms_eps), hc_dim, T);
+        hn = ggml_reshape_3d(ctx0, ggml_mul(ctx0, hn, hnorm), n_embd, hc, T);
+    }
+    ggml_tensor * en = rms(emb, Wl(il, "nextn.enorm.weight"));
+    en = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, en, n_embd, 1, T), n_embd, hc, T, 1);
+    ggml_tensor * cat = ggml_concat(ctx0, en, hn, 0);
+    ggml_tensor * res = ggml_mul_mat(ctx0, Wl(il, "nextn.eh_proj.weight"), ggml_reshape_2d(ctx0, cat, 2 * n_embd, hc * T));
+    res = ggml_reshape_3d(ctx0, res, n_embd, hc, T);
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = hc_mix(res, il, /*ffn=*/false, &inject);
+    cur = sparse_attn(cur, inp_pos, kq_mask, sections, il, nullptr);
+    res = hc_combine(res, cur, inject);
+    cur = hc_mix(res, il, /*ffn=*/true, &inject);
+    moe_route(cur, il, sel_out, w_out);
+    *sh_out = shared_expert(cur, il);
+    *res_out = res; *cur_out = cur; *inject_out = inject;
+}
+
+ggml_tensor * graph_builder::moe_resident(ggml_tensor * x, ggml_tensor * ids, ggml_tensor * w, int il, const weights * src) {
+    const int64_t n_embd = x->ne[0], T = x->ne[1], U = ids->ne[0];
+    const std::string b = "blk." + std::to_string(il) + ".";
+    ggml_tensor * gate_w = src->get(b + "ffn_gate_exps.weight");
+    ggml_tensor * up_w   = src->get(b + "ffn_up_exps.weight");
+    ggml_tensor * down_w = src->get(b + "ffn_down_exps.weight");
+    ggml_tensor * x3   = ggml_reshape_3d(ctx0, x, n_embd, 1, T);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx0, gate_w, x3, ids);                 // [n_ff, U, T]
+    ggml_tensor * up   = ggml_mul_mat_id(ctx0, up_w,   x3, ids);
+    ggml_tensor * act  = ggml_swiglu_split(ctx0, gate, up);
+    ggml_tensor * down = ggml_mul_mat_id(ctx0, down_w, act, ids);                // [n_embd, U, T]
+    ggml_tensor * wd   = ggml_mul(ctx0, down, w);
+    ggml_tensor * acc  = ggml_cont(ctx0, ggml_view_2d(ctx0, wd, n_embd, T, wd->nb[2], 0));
+    for (int64_t e = 1; e < U; e++)
+        acc = ggml_add(ctx0, acc, ggml_view_2d(ctx0, wd, n_embd, T, wd->nb[2], (size_t) e * wd->nb[1]));
+    return acc;
 }
 
 ggml_tensor * graph_builder::moe_apply(ggml_tensor * cur, int il,

@@ -41,6 +41,13 @@ def find_mmproj(model_dir):
         if c: return c[0]
     return None
 
+def find_mtp(model_dir):
+    """The checkpoint's nextn draft head (MTP/mtp-*.gguf). Hugging Face may have put it in a
+    different snapshot directory of the same repo than the quant, so search the whole repo."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(model_dir)))   # .../models--x--y
+    c = sorted(glob.glob(os.path.join(repo, "snapshots", "*", "MTP", "mtp-*.gguf")) + glob.glob(os.path.join(repo, "snapshots", "*", "mtp-*.gguf")))
+    return c[0] if c else None
+
 def scan_models():
     out = []
     pattern = os.path.join(HF, "*Qwen3.8-Flash-Next*", "snapshots", "*", "*", "*.gguf")
@@ -52,9 +59,10 @@ def scan_models():
         total = sum(os.stat(s).st_size for s in glob.glob(os.path.join(d, "*.gguf")) if not os.path.basename(s).startswith(("mmproj", "mtp-")))
         key = next((k for k in NOTES if k in quant), None)
         tag, note = NOTES.get(key, ("", ""))
-        mm = find_mmproj(d)
+        mm = find_mmproj(d); mtp = find_mtp(d)
         out.append({"id": len(out), "name": quant, "path": f, "size_gb": round(total / 1e9, 1), "tag": tag, "note": note, "quant": key or quant,
-                    "mmproj": mm, "mmproj_gb": round(os.stat(mm).st_size / 1e9, 2) if mm else 0.0})
+                    "mmproj": mm, "mmproj_gb": round(os.stat(mm).st_size / 1e9, 2) if mm else 0.0,
+                    "mtp": mtp, "mtp_gb": round(os.stat(mtp).st_size / 1e9, 2) if mtp else 0.0})
     return out
 
 # ---- hardware ----------------------------------------------------------------
@@ -155,12 +163,15 @@ def recommend(model, hw, priority="balanced", vision=None):
         notes.append("Vision on: %s (%.2f GB) is loaded onto the GPU and comes out of the expert tier, about %d blocks. Images arrive as OpenAI image_url content parts (base64 data: URLs); turn it off for a text-only server." % (os.path.basename(model["mmproj"]), model.get("mmproj_gb", 0.0), int(mm_gb * 1024 / QUANT_BLOCK_MB.get(q, 2.4))))
     elif not model.get("mmproj"):
         notes.append("No mmproj-*.gguf next to this model, so image input is unavailable: download mmproj-F16.gguf into the model's snapshot directory to enable it.")
+    if model.get("mtp"):
+        notes.append("Draft head available (%s, %.2f GB, off by default): the checkpoint's nextn head drafts the token after next and the trunk verifies it, so the output is the trunk's own. Measured on the reference machine: +5%% decode at 32K context, neutral at 160K (the pair step's disk wait and CPU experts scale per token, and the smaller VRAM tier at long context serves pairs less). Its experts live in host memory, so the RAM tier clamps ~2.7 GB lower; a prompt longer than one batch leaves the head without rows, and drafts switch off for that conversation. The status line shows the acceptance rate." % (os.path.basename(model["mtp"]), model.get("mtp_gb", 0.0)))
     notes.append("RAM tier %d GB: the engine's own clamp (60%% of available memory minus headroom). More RAM tier moves the cache hit rate by about a point; it is not the lever." % ram)
     notes.append("Thinking: xhigh by default; --think-budget 6000 keeps a hard think under ~8 min at Q4 speed, ~6 at Q3. Harnesses with no thinking toggle can end a message with /no_think.")
     return {
         "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": ram, "batch": batch, "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "priority": priority,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
+        "mtp": False, "mtp_file": model.get("mtp"), "mtp_gb": model.get("mtp_gb", 0.0),
         "estimates": {"vram_tier_gb": chosen["tier_gb"], "vram_tier_blocks": chosen["blocks"], "state_gb": chosen["state_gb"], "dense_core_gb": core,
                       "mmproj_gb": round(mm_gb, 2),
                       "desktop_use_gb": round(desktop_use, 2), "decode_tps_short": chosen["tok_s_short"], "decode_tps_133k": chosen["tok_s_long_doc"],
@@ -202,13 +213,22 @@ def start_server(model, s):
                 "--port", str(int(s["port"]))]
         if s.get("skip_miss"): argv.append("--skip-miss")
         if s.get("spec_block", True): argv.append("--spec-block")
+        if s.get("mtp") and s.get("skip_miss"):
+            s["mtp"] = False   # the engine would refuse every request: a verified pair and skip-miss do not combine
+        if s.get("mtp"):
+            if not model.get("mtp"):
+                return {"error": "no MTP/mtp-*.gguf in this model's repository: download it into the snapshot directory, or turn the draft head off"}
+            argv += ["--mtp", model["mtp"]]
         if s.get("cold_path"): argv += ["--cold", s["cold_path"]]
         if s.get("vision"):
             if not model.get("mmproj"):
                 return {"error": "no mmproj-*.gguf next to this model: download mmproj-F16.gguf into its snapshot directory, or turn Vision off"}
             argv += ["--mmproj", model["mmproj"]]
         log = open(STATE["log"], "w")
-        log.write("$ " + " ".join(argv) + "\n"); log.flush()
+        log.write("$ " + " ".join(argv) + "\n")
+        if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
+            log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
+        log.flush()
         try:
             proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
         except Exception as e:

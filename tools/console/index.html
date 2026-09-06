@@ -102,6 +102,7 @@
             <label>Thinking budget (tokens, 0 = none)<input id="think_budget" type="number" min="0" step="500"></label>
             <label>Skip missed experts<select id="skip_miss"><option value="false">off (exact)</option><option value="true">on (+16-29% decode, small NLL cost)</option></select></label>
             <label>Speculative block<select id="spec_block"><option value="true">on (predict the next layer's experts through its own block: 80% → 96%, exact)</option><option value="false">off (router on the residual)</option></select></label>
+            <label>Draft head (MTP)<select id="mtp"><option value="false">off</option><option value="true">on (the checkpoint's nextn head drafts a token, the trunk verifies it: exact; +5% at 32K context, neutral at 160K; stands down when skip-miss is on)</option></select></label>
             <label>Vision (image input)<select id="vision"><option value="true">on (loads the projector onto the GPU, --mmproj)</option><option value="false">off (text only)</option></select></label>
           </form>
           <div class="est" id="est"></div>
@@ -232,6 +233,9 @@ async function loadReco() {
   const von = $('vision').options[0];
   von.disabled = !r.mmproj; von.textContent = r.mmproj ? `on (${r.mmproj.split('/').pop()}, ${r.mmproj_gb} GB of VRAM, --mmproj)` : 'unavailable (no mmproj-*.gguf next to this model)';
   $('vision').value = String(r.vision);
+  const mon = $('mtp').options[1];
+  mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? `on (${r.mtp_file.split('/').pop()}, ${r.mtp_gb} GB in host memory: drafts verified by the trunk, exact; +5% at 32K context, neutral at 160K)` : 'unavailable (no MTP/mtp-*.gguf in this model\'s repository)';
+  $('mtp').value = String(!!r.mtp);
   const tb = $('options');
   tb.innerHTML = '<tr><th>context</th><th>KV</th><th>VRAM tier</th><th>experts in VRAM</th><th>from VRAM</th><th>decode, chat</th><th>decode, long document</th></tr>' +
     r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${(o.ctx/1024).toFixed(0)}K</td><td>${o.kv}</td><td>${o.tier_gb} GB</td><td>${o.blocks}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${o.tok_s_short} tok/s</td><td>${o.tok_s_long_doc} tok/s</td></tr>`).join('');
@@ -244,7 +248,7 @@ $('vision').onchange = () => { visionChoice = $('vision').value === 'true'; load
 function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
-           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true' };
+           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true' };
 }
 $('start').onclick = async () => {
   $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true;
@@ -266,8 +270,8 @@ function setLocked(s) {
   const b = $('banner');
   if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
   const st = s.settings || {}, p = s.props || {};
-  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
-                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.vision ? 'vision' : ''].filter(Boolean);
+  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.mtp ? '--mtp (draft head)' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
+                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.mtp ? 'mtp' : '', p.vision ? 'vision' : ''].filter(Boolean);
   b.className = 'banner';
   b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}</span></span>
     <span class="flags">${flags.map(f => `<span>${f}</span>`).join('')}</span>
@@ -295,7 +299,7 @@ async function poll() {
   if (running && s.model && models.length) {
     const i = models.findIndex(m => m.name === s.model);
     if (i >= 0 && i !== selected) { selected = i; renderModels(); await loadReco(); }
-    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); }
+    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); }
   }
   const chatable = s.state === 'ready' || s.state === 'busy';
   $('send').disabled = !chatable || chatting; const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
@@ -313,7 +317,7 @@ async function poll() {
     $('served').textContent = big(t.generated_tokens + t.prompt_tokens); $('servednote').textContent = big(t.generated_tokens) + ' generated · ' + big(t.prompt_tokens) + ' prompt';
     $('reqs').textContent = t.requests; $('reqsnote').textContent = t.requests ? 'avg ' + big(Math.round(t.generated_tokens / t.requests)) + ' generated per request' : 'since start';
     $('ctxuse').textContent = big(st.context.n_past); $('ctxnote').textContent = 'of ' + big(st.context.n_ctx); $('ctx2').textContent = 'highest reached ' + big(peak.ctx);
-    $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'best hit ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' GB read from NVMe';
+    $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'best hit ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' GB read from NVMe' + (st.speculative && st.speculative.pairs ? ' · drafts ' + (st.speculative.acceptance*100).toFixed(0) + '% accepted (' + st.speculative.pairs + ' pairs)' : '');
     $('cur').textContent = st.busy ? big(g.n) + ' tok' : '—'; $('curnote').textContent = st.busy ? 'so far, ' + fmt(g.ms/1000, 0) + ' s' : 'idle';
     $('last').textContent = g.n && !st.busy ? big(g.n) + ' tok' : (g.n ? '…' : '—'); $('lastnote').textContent = g.n && !st.busy ? 'in ' + fmt(g.ms/1000, 1) + ' s after a ' + big(p.n) + '-token prompt' : '';
     hist.push(now); if (hist.length > 60) hist.shift(); drawChart(); $('chartnote').textContent = 'grey line: peak ' + fmt(peak.tps) + ' tok/s';

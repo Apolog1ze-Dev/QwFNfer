@@ -492,6 +492,7 @@ struct live_stats {
     double t_prompt = 0, t_gen = 0;          // seconds, the current or last request
     double t_prompt_total = 0, t_gen_total = 0;
     long long n_prompt_total = 0, n_gen_total = 0, n_requests = 0;
+    long long n_pairs_total = 0, n_accepted_total = 0;   // the draft head's pairs
     int    n_past = 0;
     json timings() {   // llama.cpp's field names
         std::lock_guard<std::mutex> lk(mu);
@@ -658,6 +659,7 @@ int main(int argc, char ** argv) {
         if (a == "--spec-gate-inflight" && i + 1 < argc) { cfg.spec_gate_inflight = (uint32_t) atoi(next()); continue; }
         if (a == "--spec-block") { cfg.spec_block = true; continue; }
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
+        if (a == "--mtp" && i + 1 < argc) { cfg.mtp_path = next(); cfg.rollback_snapshots = true; continue; }   // the nextn draft head: pairs verified by the trunk, exact
         if (a == "--kv" && i + 1 < argc) {
             std::string v = next();
             cfg.type_k = cfg.type_v = (v == "q8_0") ? GGML_TYPE_Q8_0 :
@@ -847,6 +849,7 @@ int main(int argc, char ** argv) {
     struct gen_result {
         std::string reasoning, content, finish = "stop";
         int n_prompt = 0, n_gen = 0;
+        int n_pairs = 0, n_accepted = 0;     // speculative pairs verified, and how many held
         double t_prompt = 0, t_gen = 0;
         bool reasoning_budget_hit = false;
     };
@@ -920,13 +923,21 @@ int main(int argc, char ** argv) {
         std::string acc;                 // everything emitted, for stop matching
         const auto td = clk::now();
         int n = 0;
+        // With the draft head loaded (--mtp), a sampled token goes in as a pair
+        // with the head's draft for the one after it; the trunk's logits at the
+        // first position sample the real next token, and when it is the draft,
+        // the second position's logits are already the one after. `tok_in` marks
+        // a token that came in that way: in the history, evaluated, sampled
+        // from, so nothing to do at the evaluation point but move on.
+        int32_t tok = smp.pick(lg, S.eng.n_vocab());
+        if (!S.eng.mtp_step(&tok, 1, e)) return false;
+        bool tok_in = false; int32_t tok_next = -1;
         for (; n < budget; n++) {
-            const int tok = smp.pick(lg, S.eng.n_vocab());
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
-            if (S.vb.is_eog(tok)) { hist.push_back(tok); n++; break; }
+            if (!tok_in) hist.push_back(tok);
+            if (S.vb.is_eog(tok)) { n++; break; }
             const std::string piece = S.vb.piece(tok, false);
-            hist.push_back(tok);
-            smp.gen.push_back(tok);
+            if (!tok_in) smp.gen.push_back(tok);
 
             if (in_think && piece.find("</think>") != std::string::npos) {
                 in_think = false;
@@ -942,14 +953,16 @@ int main(int argc, char ** argv) {
                 for (int32_t t : ct) hist.push_back(t);
                 R.reasoning += "\n\n[thinking budget reached]";
                 if ((int32_t) hist.size() + 1 > (int32_t) S.n_ctx) { R.finish = "length"; n++; break; }
-                // The token just sampled has not been evaluated yet: it goes in
-                // with the injected phrase, or the engine ends one position
-                // behind the history.
-                lg = S.eng.eval(hist.data(), (int32_t) hist.size(), (int32_t) ct.size() + 1, e);
+                // The token just sampled has not been evaluated yet (unless it
+                // came in as an accepted draft): it goes in with the injected
+                // phrase, or the engine ends one position behind the history.
+                lg = S.eng.eval(hist.data(), (int32_t) hist.size(), (int32_t) ct.size() + (tok_in ? 0 : 1), e);
                 if (!lg) return false;
                 in_think = false;
                 R.reasoning_budget_hit = true;
                 n++;
+                tok = smp.pick(lg, S.eng.n_vocab()); tok_in = false;
+                if (!S.eng.mtp_step(&tok, 1, e)) return false;
                 continue;
             } else {
                 std::string emit = piece;
@@ -973,14 +986,40 @@ int main(int argc, char ** argv) {
 
             if ((int32_t) hist.size() + 1 > (int32_t) S.n_ctx) { R.finish = "length"; n++; break; }
             if (on_tick) on_tick();
-            lg = S.eng.eval(hist.data(), (int32_t) hist.size(), 1, e);
-            if (!lg) return false;
+            if (tok_in) { tok = tok_next; tok_in = false; continue; }   // already evaluated with its predecessor
+            const int32_t draft = S.eng.mtp_draft_id();
+            if (draft >= 0 && !S.vb.is_eog(draft) && n + 1 < budget && (int32_t) hist.size() + 2 <= (int32_t) S.n_ctx) {
+                hist.push_back(draft);
+                if (!S.eng.eval_decode(hist.data(), (int32_t) hist.size(), 2, e)) return false;
+                const float * l0 = S.eng.logits_pos(0), * l1 = S.eng.logits_pos(1);
+                const int32_t y = smp.pick(l0, S.eng.n_vocab());
+                R.n_pairs++;
+                if (y == draft) {
+                    R.n_accepted++;
+                    smp.gen.push_back(draft);
+                    tok_next = smp.pick(l1, S.eng.n_vocab());
+                    const int32_t two[2] = { draft, tok_next };
+                    if (!S.eng.mtp_step(two, 2, e)) return false;
+                    tok = draft; tok_in = true;
+                } else {
+                    if (!S.eng.rollback(e)) return false;
+                    hist.pop_back();
+                    tok = y;
+                    if (!S.eng.mtp_step(&tok, 1, e)) return false;
+                }
+            } else {
+                lg = S.eng.eval(hist.data(), (int32_t) hist.size(), 1, e);
+                if (!lg) return false;
+                tok = smp.pick(lg, S.eng.n_vocab());
+                if (!S.eng.mtp_step(&tok, 1, e)) return false;
+            }
         }
         if (n >= budget && budget > 0) R.finish = "length";
         R.t_gen = since(td);
         R.n_gen = n;
         { std::lock_guard<std::mutex> lk(S.live.mu); S.live.busy = false; S.live.n_gen = n; S.live.t_gen = R.t_gen;
-          S.live.n_prompt_total += R.n_prompt; S.live.t_prompt_total += R.t_prompt; S.live.n_gen_total += n; S.live.t_gen_total += R.t_gen; S.live.n_past = S.eng.n_past(); }
+          S.live.n_prompt_total += R.n_prompt; S.live.t_prompt_total += R.t_prompt; S.live.n_gen_total += n; S.live.t_gen_total += R.t_gen; S.live.n_past = S.eng.n_past();
+          S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; }
 
         // Close the turn so the next request can continue from here. The sampled
         // end-of-turn token was appended but never evaluated, so the engine's
@@ -1063,7 +1102,7 @@ int main(int argc, char ** argv) {
                 {"reasoning_effort", S.def_effort}, {"max_tokens", S.def_max_tokens},
                 {"reasoning_budget", S.def_reasoning_budget},
                 {"thinking", S.preset_think.to_json()}, {"non_thinking", S.preset_nothink.to_json()}}},
-            {"skip_miss", cfg.skip_miss}, {"spec_block", cfg.spec_block}, {"model_file", S.model_file},
+            {"skip_miss", cfg.skip_miss}, {"spec_block", cfg.spec_block}, {"mtp", S.eng.mtp_loaded()}, {"model_file", S.model_file},
             {"vision", S.vis.loaded()},
             {"total_slots", 1}};
     };
@@ -1095,9 +1134,10 @@ int main(int argc, char ** argv) {
     auto stats_json = [&]() {
         json t = S.live.timings();
         const auto & c = S.eng.cache_stats();   // racy reads of plain counters: a monitor, not a ledger
-        long long np, ng, nr; double tp, tg; bool busy; int n_past;
+        long long np, ng, nr, npair, nacc; double tp, tg; bool busy; int n_past;
         { std::lock_guard<std::mutex> lk(S.live.mu); np = S.live.n_prompt_total; ng = S.live.n_gen_total; nr = S.live.n_requests;
-          tp = S.live.t_prompt_total; tg = S.live.t_gen_total; busy = S.live.busy; n_past = S.live.n_past; }
+          tp = S.live.t_prompt_total; tg = S.live.t_gen_total; busy = S.live.busy; n_past = S.live.n_past;
+          npair = S.live.n_pairs_total; nacc = S.live.n_accepted_total; }
         return json{
             {"busy", busy},
             {"prompt", {{"n", t["prompt_n"]}, {"ms", t["prompt_ms"]}, {"tokens_per_second", t["prompt_per_second"]}}},
@@ -1107,6 +1147,7 @@ int main(int argc, char ** argv) {
                         {"generated_tokens", ng}, {"generated_tokens_per_second", tg > 0 ? ng / tg : 0.0}}},
             {"expert_cache", {{"hit_rate", c.hit_rate()}, {"vram_served", c.gpu_rate()},
                               {"bytes_from_disk", c.bytes_from_disk}}},
+            {"speculative", {{"pairs", npair}, {"accepted", nacc}, {"acceptance", npair ? (double) nacc / npair : 0.0}}},
             {"timings", t}};
     };
     svr.Get("/stats", [&](const httplib::Request &, httplib::Response & res) {
@@ -1467,9 +1508,10 @@ int main(int argc, char ** argv) {
                 } else if (!ok) {
                     fprintf(stderr, "[qwfn-server] %s: generation failed after %d tokens: %s\n", id.c_str(), R.n_gen, e2.c_str());
                 } else {
-                    fprintf(stderr, "[qwfn-server] %s: prompt %d tok %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s\n",
+                    fprintf(stderr, "[qwfn-server] %s: prompt %d tok %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s%s\n",
                             id.c_str(), R.n_prompt, R.t_prompt > 0 ? R.n_prompt / R.t_prompt : 0.0, R.n_gen, R.reasoning.size(),
-                            R.reasoning_budget_hit ? ", budget hit" : "", R.t_gen, R.t_gen > 0 ? R.n_gen / R.t_gen : 0.0, R.finish.c_str());
+                            R.reasoning_budget_hit ? ", budget hit" : "", R.t_gen, R.t_gen > 0 ? R.n_gen / R.t_gen : 0.0, R.finish.c_str(),
+                            R.n_pairs ? (" | drafts: " + std::to_string(R.n_accepted) + " of " + std::to_string(R.n_pairs) + " pairs accepted").c_str() : "");
                 }
                 if (!ok) {
                     S.last_msgs = json();

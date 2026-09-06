@@ -201,6 +201,8 @@ public:
     // 1 demand reads (fetch_end), 2 speculative reads (settle). Racy by design.
     int    wait_state() const { return wait_state_; }
     size_t pf_outstanding() const { return pf_reads_outstanding_; }   // speculative reads in flight
+    // Promotions a fetch may make; a two-token step looks up ~1.7x the experts and gets a budget to match.
+    void   set_max_promotions(uint32_t n) { cfg_.max_promotions_per_layer = n; }
     size_t wait_count() const { return wait_state_ == 1 ? inflight_reqs_ + inflight_cold_reqs_ : wait_state_ == 2 ? pf_reads_outstanding_ : 0; }
 
     // Wait for the asynchronous promotion copies queued since the last call and

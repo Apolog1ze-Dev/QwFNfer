@@ -111,6 +111,9 @@ struct engine_config {
     // scored against the token that actually followed. Nothing is verified or
     // rolled back yet: this measures the acceptance rate the rest depends on.
     std::string mtp_path;
+    // Keep the one-token-back snapshots a two-token decode step needs for
+    // rollback(). Set with the head; the rollback test sets it alone.
+    bool rollback_snapshots = false;
     // Decode without waiting for expert misses: the token is computed from the
     // experts that are resident (gates renormalised), the misses' reads still
     // go out and land for next time. An approximation -- measure its NLL.
@@ -185,6 +188,23 @@ public:
     // from the new tokens alone. Returns logits for the final position.
     const float * eval(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err);
 
+    // Decode one or two tokens through the decode path (the MTP verify step feeds
+    // the sampled token and the draft as a pair): returns the last position's
+    // logits; logits_pos(i) gives each position's. After a pair, rollback()
+    // restores the state as it was after the first token and steps n_past back
+    // by one -- the caches the second position wrote are rewritten by the next
+    // token at that position.
+    const float * eval_decode(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err);
+    const float * logits_pos(int i) const { return logits_.data() + (size_t) i * n_vocab_; }
+    bool rollback(std::string & err);
+    // MTP head: run it over the last n positions of the sequence (their wide
+    // residuals from the last eval) with the tokens that follow each, and keep
+    // the last position's draft. mtp_ready() says whether the head can draft.
+    bool    mtp_step(const int32_t * next_toks, int n, std::string & err);
+    int32_t mtp_draft_id() const { return mtp_draft_; }
+    bool    mtp_ready() const { return mtp_on_ && mtp_have_h_ && mtp_kv_valid_; }
+    bool    mtp_loaded() const { return mtp_on_; }     // the head is resident (not with --skip-miss)
+
     void    reset();                       // clear state, rewind to position 0
 
     // Substitute externally computed embeddings (vision) for the tokens at
@@ -232,7 +252,8 @@ public:
     // MTP experiment: drafts scored against the next token (decode), and against
     // the prompt's own tokens when the prompt went through in one batch.
     uint64_t mtp_n = 0, mtp_acc = 0, mtp_top3 = 0, mtp_prompt_n = 0, mtp_prompt_acc = 0;
-    double   t_mtp = 0;
+    double   t_mtp = 0, t_rollback = 0;
+    uint64_t n_rollback = 0;
     static int   margin_bucket(float m);
     static float margin_edge(int b);   // lower edge of bucket b
     uint64_t check_moe_gpu_calls = 0, check_moe_cpu_calls = 0;   // QWFN_CHECK_MOE bookkeeping
@@ -240,7 +261,7 @@ public:
 
 private:
     bool eval_batch(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err,
-                    bool cache_batched = false);
+                    bool cache_batched = false, bool force_decode = false);
     bool eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, std::string & err);
     // Per-chunk attention inputs for the mask-based path: the causal mask and
     // the QSA block tables for Tc queries starting at n_past_c.
@@ -284,7 +305,19 @@ private:
     // Per attention layer a cache of pooled block keys; shared static tables,
     // the block bias and the five per-token inputs. Allocated before the VRAM
     // tier so it is accounted for.
-    qsa_decode_inputs          qd_;
+    qsa_decode_inputs          qd_, qd2_;   // qd2_: the second position of a two-token decode step
+    ggml_tensor *              inp_pos_one_ = nullptr;   // I32 [4*Bd]: per-position [p,p,p,0] for single-position attention calls
+    void qsa_decode_prepare2(int32_t n_past2);       // qd2_'s inputs, bias from qd_'s plus its own window; one bucket for both
+    // Rollback snapshots (MTP): per DeltaNet layer the state and conv history as
+    // they stood after the first token of a two-token step, and the PLE conv.
+    ggml_context *             rbctx_ = nullptr;
+    ggml_backend_buffer_t      rbbuf_ = nullptr;
+    std::vector<ggml_tensor *> rb_rs_, rb_conv_;
+    ggml_tensor *              rb_ple_conv_ = nullptr;
+    bool                       rb_valid_ = false;   // the snapshots describe the current state minus one token
+    std::vector<uint8_t>       gA_T_;               // per layer: the T the cached graph was built for
+    ggml_tensor *              t_mtp_emb_ = nullptr;             // device [n_embd, Bd]: the head's next-token embeddings
+    ggml_tensor *              h_mtp_tok_ = nullptr, * h_mtp_emb_ = nullptr;   // host: their gather
     std::vector<ggml_tensor *> pool_cache_;   // per layer; null for recurrent layers
     ggml_context *             qctx_ = nullptr;
     ggml_backend_buffer_t      qbuf_ = nullptr;
@@ -431,7 +464,16 @@ private:
     ggml_tensor *        t_hcmean_ = nullptr; // F32 [hc]: 1/hc each, for the fused stream mean (GPU graphs)
     // MTP draft head (experiment).
     model_index   mi_mtp_;
-    weights       wm_;                        // the nextn block, experts included, resident
+    weights       wm_;                        // the nextn block's dense part on the GPU (and its experts, with QWFN_MTP_EXPERTS_VRAM=1)
+    weights       wmh_;                       // its routed experts in host memory, computed on the CPU per draft
+    bool          mtp_experts_host_ = false;
+    // Persistent tensors of the split head: device outputs of the first half, host
+    // inputs/outputs of the CPU MoE, the partial's device landing.
+    ggml_context * mctx_ = nullptr; ggml_backend_buffer_t mbuf_ = nullptr;
+    ggml_tensor  * t_m_res_ = nullptr, * t_m_cur_ = nullptr, * t_m_inject_ = nullptr, * t_m_sel_ = nullptr,
+                 * t_m_w_ = nullptr, * t_m_sh_ = nullptr, * t_m_pc_ = nullptr;
+    ggml_context * mhctx_ = nullptr; ggml_backend_buffer_t mhbuf_ = nullptr;
+    ggml_tensor  * h_m_cur_ = nullptr, * h_m_ids_ = nullptr, * h_m_w_ = nullptr, * h_m_partial_ = nullptr;
     state         st_mtp_;                    // its KV: one attention layer at n_ctx
     hparams       hpm_;                       // the MTP file's hparams, the block typed as attention
     bool          mtp_on_ = false, mtp_have_h_ = false, mtp_kv_valid_ = true;
@@ -442,7 +484,7 @@ private:
     // Run the head for n positions starting at `pos`, reading rows h_row.. of
     // t_hlast_ and e_row.. of t_emb_; `actual` (may be null) are the tokens at
     // positions pos+2.. for scoring, n_actual of them.
-    bool mtp_draft(int64_t pos, int64_t n, int64_t h_row, int64_t e_row, const int32_t * actual, int64_t n_actual, std::string & err);
+    bool mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_src, int64_t e_row, const int32_t * actual, int64_t n_actual, std::string & err);
     ggml_tensor * t_sh_ = nullptr, * t_pg_ = nullptr, * t_pc_ = nullptr, * t_ple_ = nullptr;
     ggml_tensor * inp_tok_ = nullptr, * inp_pos_ = nullptr, * inp_ple_ = nullptr;
     // persistent, host side
