@@ -52,9 +52,9 @@ What it does:
 - **An OpenAI-compatible server** with streaming, tool calling (mapped to the model's own
   `<tool_call>` template), thinking control and a thinking budget, live `timings`, `/stats`,
   `/props` and Prometheus `/metrics`; and a **console** that lists the downloaded quants,
-  reads the hardware, recommends settings from a cost model fitted to the measurements
-  (it shows what every context step costs in expert tier and tok/s), starts and stops the
-  server, chats with it, and watches it live.
+  reads the hardware, sizes the flags for it behind three presets (chat at 32K, agentic
+  coding at 128K and 256K, each with its predicted speed), starts and stops the server,
+  self-tests it on the machine, chats with it, and watches it live.
 
 Where it stands on the reference machine (RTX 4080 SUPER 16 GB, 30 GB RAM, one NVMe),
 163,840-token context, KV q4_0, measured 2026-09-05:
@@ -126,8 +126,7 @@ C++, built on ggml, validated bit-exact against llama.cpp) is organised around t
 • decode attention that costs the same at 160K context as at 4K
 • prefill of a 133K-token document at ~280 tok/s instead of 2.6
 • an OpenAI-compatible server (streaming, tool calling, thinking budget, live stats) and a
-  console that recommends settings for your hardware from a cost model fitted to the
-  measurements
+  console with three presets sized for your hardware and a self-test
 
 And the machine stays usable while it serves: 22 of 31 GB of RAM in use, 13 of 16 GB of
 VRAM, the GPU 70% busy, the engine on 3 of 16 CPU threads — a video, a Discord or Teams

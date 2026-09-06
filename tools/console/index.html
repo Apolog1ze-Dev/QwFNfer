@@ -18,21 +18,32 @@
   nav button.on { color:var(--fg); border-color:var(--line); background:var(--panel) }
   main { max-width:1400px; margin:0 auto; padding:18px 22px }
   .tab { display:none } .tab.on { display:block }
-  .grid2 { display:grid; grid-template-columns: 1.1fr 1fr; gap:18px }
+  .grid2 { display:grid; grid-template-columns: 1fr 1.35fr; gap:18px }
   section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:18px }
   h2 { font-size:12.5px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); margin:0 0 12px }
   .banner { border:1px solid rgba(110,231,183,.35); background:rgba(110,231,183,.06); border-radius:12px; padding:12px 16px; margin-bottom:18px; display:flex; gap:18px; align-items:center; flex-wrap:wrap }
   .banner.off { border-color:var(--line); background:transparent; color:var(--dim) }
   .banner b { font-size:15px } .banner .flags { font-family:var(--mono); font-size:12.5px; color:var(--dim) } .banner .flags span { display:inline-block; margin-right:10px; color:var(--fg) }
-  .model { display:grid; grid-template-columns: 22px 1fr auto; gap:10px; align-items:center; padding:11px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
+  .model { display:grid; grid-template-columns: 22px 1fr; gap:10px; align-items:center; padding:11px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
   .model.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
-  .model .name { font-weight:600 } .model .note { color:var(--dim); font-size:12.5px; margin-top:2px }
-  .tag { font-size:11px; padding:2px 7px; border-radius:6px; border:1px solid var(--line); color:var(--dim) }
-  .tag.recommended { color:var(--ok); border-color:rgba(110,231,183,.4) } .tag.slower { color:var(--warn); border-color:rgba(246,196,83,.4) } .tag.cold { color:var(--bad); border-color:rgba(248,113,113,.4) }
+  .model .name { font-weight:600 }
   .kv { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:10px }
   .kv div { border:1px solid var(--line); border-radius:10px; padding:10px 12px } .kv b { display:block; font-size:19px; font-weight:600; margin-top:2px } .kv span { color:var(--dim); font-size:12px } .kv small { display:block; color:var(--dim); font-size:11.5px; margin-top:3px }
+  .presets { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:12px }
+  .preset { border:1px solid var(--line); border-radius:10px; padding:10px 12px; cursor:pointer }
+  .preset.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
+  .preset .pname { font-weight:600 } .preset .pctx { color:var(--dim); font-size:12px }
+  .preset .pnum { font-size:12.5px; margin-top:8px; color:var(--dim) } .preset .pnum b { color:var(--fg) }
+  .preset .pfit { color:var(--warn); font-size:12px; margin-top:4px }
+  .plan { color:var(--dim); font-size:12.5px; line-height:1.7; margin-bottom:6px } .plan b { color:var(--fg) }
+  details.adv { margin:0 0 6px; border-top:1px solid var(--line); padding-top:8px } details.adv > summary { cursor:pointer; font-size:12.5px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.8px; padding:4px 0; list-style:none } details.adv > summary::before { content:'▸ '; } details.adv[open] > summary::before { content:'▾ '; } details.adv[open] > summary { margin-bottom:10px }
   form { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px 14px }
   label { display:flex; flex-direction:column; gap:4px; color:var(--dim); font-size:12px }
+  .lbl { display:flex; align-items:center; gap:6px }
+  .tip { position:relative; display:inline-flex; width:15px; height:15px; border-radius:50%; border:1px solid var(--line); color:var(--dim); font-size:10px; align-items:center; justify-content:center; cursor:help; font-weight:600 }
+  .tip::after { content:attr(data-tip); position:absolute; left:0; top:20px; z-index:5; width:290px; background:#0b0e12; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; font-weight:400; white-space:normal; display:none; box-shadow:0 8px 24px rgba(0,0,0,.5) }
+  .tip:hover::after { display:block }
+  form label:nth-child(3n) .tip::after { left:auto; right:0 }
   input, select, textarea { background:#0f1216; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit }
   input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc) }
   .locked { opacity:.45; pointer-events:none }
@@ -40,11 +51,13 @@
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px }
   button { background:var(--acc); color:#0b0f12; border:0; border-radius:9px; padding:9px 14px; font:inherit; font-weight:600; cursor:pointer }
   button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line) } button.danger { background:var(--bad); color:#fff } button:disabled { opacity:.45; cursor:default }
-  .notes { color:var(--dim); font-size:12.5px; margin-top:10px } .notes li { margin:3px 0 }
   .est { display:flex; gap:14px; flex-wrap:wrap; color:var(--dim); font-size:12.5px; margin-top:10px } .est b { color:var(--fg) }
   #options { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px }
   #options th { text-align:left; color:var(--dim); font-weight:500; padding:4px 6px; border-bottom:1px solid var(--line) }
   #options td { padding:5px 6px; border-bottom:1px solid var(--line); cursor:pointer } #options tr.sel td { background:rgba(110,231,183,.08) } #options tr:hover td { background:rgba(255,255,255,.03) }
+  .selftest { margin-top:14px; border-top:1px solid var(--line); padding-top:12px }
+  .steps { font-family:var(--mono); font-size:12px; color:var(--dim); white-space:pre-wrap; margin:0 0 10px; max-height:120px; overflow:auto }
+  .verdict { margin:10px 0 0; font-size:13px } .verdict.ok { color:var(--ok) } .verdict.warn { color:var(--warn) } .verdict.bad { color:var(--bad) }
   .endpoint { font-family:var(--mono); font-size:13px; background:#0f1216; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; gap:10px }
   canvas { width:100%; height:80px; display:block; margin-top:10px }
   pre { background:#0b0e12; border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px; line-height:1.4; max-height:560px; overflow:auto; margin:0; white-space:pre-wrap; color:#b7c0cc }
@@ -54,10 +67,10 @@
   .msg { border:1px solid var(--line); border-radius:12px; padding:10px 14px; max-width:92% } .msg.user { align-self:flex-end; background:rgba(110,231,183,.07); border-color:rgba(110,231,183,.3) } .msg.assistant { align-self:flex-start }
   .msg .who { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px; margin-bottom:4px }
   .msg .text { white-space:pre-wrap; word-break:break-word }
-  details { margin:4px 0 8px } summary { cursor:pointer; color:var(--dim); font-size:12.5px } .think { color:var(--dim); font-size:12.5px; white-space:pre-wrap; border-left:2px solid var(--line); padding-left:10px; margin-top:6px; max-height:260px; overflow:auto }
+  .msg details { margin:4px 0 8px } .msg summary { cursor:pointer; color:var(--dim); font-size:12.5px } .think { color:var(--dim); font-size:12.5px; white-space:pre-wrap; border-left:2px solid var(--line); padding-left:10px; margin-top:6px; max-height:260px; overflow:auto }
   .meta { color:var(--dim); font-size:11.5px; margin-top:6px }
   .compose { display:flex; gap:10px; margin-top:12px } .compose textarea { flex:1; min-height:64px; resize:vertical }
-  @media (max-width: 980px) { .grid2, .chat { grid-template-columns: 1fr } form { grid-template-columns: repeat(2, 1fr) } }
+  @media (max-width: 980px) { .grid2, .chat { grid-template-columns: 1fr } form { grid-template-columns: repeat(2, 1fr) } .presets { grid-template-columns: 1fr } }
 </style>
 </head>
 <body>
@@ -85,36 +98,43 @@
         <div class="kv" id="hw"></div>
       </section>
       <section>
-        <h2>Settings <span class="muted" style="text-transform:none;letter-spacing:0">— for the selected model on this machine; edit anything</span></h2>
+        <h2>Settings <span class="muted" style="text-transform:none;letter-spacing:0">— sized for the selected model on this machine</span></h2>
         <div id="settingsbox">
-          <div class="row" style="margin:0 0 10px">
-            <span class="muted" style="font-size:12.5px">priority</span>
-            <select id="priority"><option value="fastest">fastest chat (32K context)</option><option value="balanced" selected>balanced (largest context within 10% of the best decode)</option><option value="context">longest context</option></select>
-          </div>
-          <form id="form" onsubmit="return false">
-            <label>Context (tokens)<select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
-            <label>KV cache<select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
-            <label>RAM tier (GB)<input id="ram" type="number" min="2" max="64"></label>
-            <label>Batch<select id="batch"><option>2048</option><option>4096</option></select></label>
-            <label>VRAM reserve (MB)<input id="reserve" type="number" min="256" max="4096" step="128"></label>
-            <label>Port<input id="port" type="number" min="1024" max="65535"></label>
-            <label>Thinking<select id="think"><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
-            <label>Thinking budget (tokens, 0 = none)<input id="think_budget" type="number" min="0" step="500"></label>
-            <label>Skip missed experts<select id="skip_miss"><option value="false">off (exact)</option><option value="true">on (+16-29% decode, small NLL cost)</option></select></label>
-            <label>Speculative block<select id="spec_block"><option value="true">on (predict the next layer's experts through its own block: 80% → 96%, exact)</option><option value="false">off (router on the residual)</option></select></label>
-            <label>Draft head (MTP)<select id="mtp"><option value="false">off</option><option value="true">on (the checkpoint's nextn head drafts a token, the trunk verifies it: exact; +5% at 32K context, neutral at 160K; stands down when skip-miss is on)</option></select></label>
-            <label>Vision (image input)<select id="vision"><option value="true">on (loads the projector onto the GPU, --mmproj)</option><option value="false">off (text only)</option></select></label>
-          </form>
-          <div class="est" id="est"></div>
-          <table id="options"></table>
-          <ul class="notes" id="notes"></ul>
+          <div class="presets" id="presets"></div>
+          <div class="plan" id="plan"></div>
+          <details class="adv" id="advanced">
+            <summary>Advanced settings</summary>
+            <form id="form" onsubmit="return false">
+              <label><span class="lbl">Context (tokens) <span class="tip" data-tip="The most tokens one conversation can hold, prompt and answer together. The attention state for it is allocated in VRAM up front and comes out of the expert tier, so a larger context leaves fewer experts on the GPU and decodes a little slower; the table below shows the cost of every step on this machine. The presets set it.">?</span></span><select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
+              <label><span class="lbl">KV cache <span class="tip" data-tip="Storage type of the attention cache. q4_0 takes a quarter of f16 for no measurable difference in the answers and is what every measurement used; it is the choice from 32K up. q8_0 and f16 spend more VRAM per token of context.">?</span></span><select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
+              <label><span class="lbl">RAM tier (GB) <span class="tip" data-tip="Pinned host memory for the expert cache behind the VRAM tier, sized from the memory available right now (the engine also caps itself at 60% of it). Each extra GB moves the cache hit rate by about a point; VRAM is the lever, not RAM.">?</span></span><input id="ram" type="number" min="2" max="64"></label>
+              <label><span class="lbl">Batch <span class="tip" data-tip="Tokens per prefill chunk. 4096 on a GPU with 12 GB or more, 2048 leaves more room on smaller cards; prefill speed changes little either way.">?</span></span><select id="batch"><option>2048</option><option>4096</option></select></label>
+              <label><span class="lbl">VRAM reserve (MB) <span class="tip" data-tip="VRAM kept free after the expert tier is sized: 1024 MB when a desktop shares the GPU (what it uses right now is subtracted as well), 768 MB on a headless card. Raise it if the desktop stutters or the log shows allocation failures.">?</span></span><input id="reserve" type="number" min="256" max="4096" step="128"></label>
+              <label><span class="lbl">Port <span class="tip" data-tip="The server's port. Clients use http://127.0.0.1:PORT/v1 with any API key.">?</span></span><input id="port" type="number" min="1024" max="65535"></label>
+              <label><span class="lbl">Thinking <span class="tip" data-tip="Default reasoning effort. A client overrides it per request with reasoning_effort (xhigh, medium, low, off), or with /think and /no_think in a message; harnesses without a thinking toggle get this value.">?</span></span><select id="think"><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
+              <label><span class="lbl">Thinking budget (tokens, 0 = none) <span class="tip" data-tip="Cap on reasoning tokens per answer. 6000 keeps a hard think under about eight minutes at Q4 speed, inside the timeouts most harnesses have; the model is told time is up and answers from what it has. 0 lifts the cap.">?</span></span><input id="think_budget" type="number" min="0" step="500"></label>
+              <label><span class="lbl">Skip missed experts <span class="tip" data-tip="Compute a token without the experts that are still on the NVMe instead of waiting for them. Faster decode at a small, measured quality cost: the output is no longer exact. Cannot be combined with the draft head.">?</span></span><select id="skip_miss"><option value="false">off</option><option value="true">on</option></select></label>
+              <label><span class="lbl">Speculative block <span class="tip" data-tip="Predict the next layer's experts by running that layer's own block on the current residual, and fetch them while the current layer computes. The output is exact; on by default because it was never measured slower.">?</span></span><select id="spec_block"><option value="true">on</option><option value="false">off</option></select></label>
+              <label><span class="lbl">Draft head (MTP) <span class="tip" data-tip="The checkpoint's draft head (MTP/mtp-*.gguf): it proposes the token after next and the trunk verifies it, so the output stays the trunk's own. A small gain at short context, none at long; its experts take about 2.7 GB of host memory from the RAM tier. Needs the file in the model's repository.">?</span></span><select id="mtp"><option value="false">off</option><option value="true">on</option></select></label>
+              <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood; costs about 1 GB of VRAM from the expert tier. On by default whenever the file is next to the model; off gives a text-only server.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
+            </form>
+            <div class="est" id="est"></div>
+            <table id="options"></table>
+          </details>
         </div>
         <p class="hint" id="lockhint" hidden>A server is running with the settings shown in the banner. Stop it to change the model or the settings.</p>
         <div class="row">
           <button id="start">Start server</button>
           <button id="stop" class="danger" disabled>Stop server</button>
-          <button id="reco" class="secondary">Reset to recommended</button>
+          <button id="selftest" class="secondary">Self-test</button>
+          <button id="reco" class="secondary">Reset</button>
           <span id="msg" class="muted"></span>
+        </div>
+        <div class="selftest" id="st" hidden>
+          <h2>Self-test <span class="muted" id="st_sub" style="text-transform:none;letter-spacing:0"></span></h2>
+          <div class="steps" id="st_steps"></div>
+          <div class="kv" id="st_result"></div>
+          <p class="verdict" id="st_verdict"></p>
         </div>
       </section>
     </div>
@@ -178,9 +198,11 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let models = [], selected = 0, reco = null, hist = [], peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }, lastStatus = null;
+let models = [], selected = 0, reco = null, presetId = 'coding', hist = [], peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }, lastStatus = null, pageReady = false;
 const fmt = (n, d=1) => (n === undefined || n === null || isNaN(n)) ? '—' : Number(n).toFixed(d);
 const big = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n);
+const kctx = c => (c/1024).toFixed(0) + 'K';
+const commas = n => Number(n).toLocaleString('en-US');
 async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
@@ -189,16 +211,10 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   try { localStorage.setItem('qwfn.tab', b.dataset.tab); } catch (e) {}
 });
 try { const t = (location.hash || '').replace('#', '') || localStorage.getItem('qwfn.tab'); if (t) { const b = document.querySelector('nav button[data-tab="' + t + '"]'); if (b) b.click(); } } catch (e) {}
-// ?ask=<text>: send one message on load (for a headless screenshot). The page's load
-// event is held back by an image the console answers only when this page reports the
-// reply complete, so a headless browser captures the finished exchange.
-const askParam = new URLSearchParams(location.search).get('ask'), holdParam = new URLSearchParams(location.search).get('hold');
-let holdToken = null;
-if (askParam || holdParam) { holdToken = String(Date.now()); const img = new Image(); img.src = '/api/hold?token=' + holdToken; document.body.appendChild(img); img.style.display = 'none'; }
 
 async function loadModels() {
   const d = await api('/api/models'); models = d.models; $('hfdir').textContent = 'from ' + d.hf;
-  const rec = models.findIndex(m => m.tag === 'recommended'); if (rec >= 0) selected = rec;
+  const q4 = models.findIndex(m => m.quant === 'Q4_K_XL'); if (q4 >= 0) selected = q4;
   renderModels();
 }
 function renderModels() {
@@ -206,7 +222,7 @@ function renderModels() {
   if (!models.length) { el.textContent = 'no Qwen3.8-Flash-Next GGUF found in the Hugging Face cache'; return; }
   models.forEach(m => {
     const div = document.createElement('div'); div.className = 'model' + (m.id === selected ? ' sel' : '');
-    div.innerHTML = `<input type="radio" ${m.id === selected ? 'checked' : ''}><div><div class="name">${m.name} <span class="muted">${m.size_gb} GB</span></div><div class="note">${m.note}</div></div><span class="tag ${m.tag === 'cold only' ? 'cold' : m.tag}">${m.tag}</span>`;
+    div.innerHTML = `<input type="radio" ${m.id === selected ? 'checked' : ''}><div class="name">${m.name} <span class="muted">${m.size_gb} GB</span></div>`;
     div.onclick = () => { selected = m.id; visionChoice = null; renderModels(); loadReco(); };
     el.appendChild(div);
   });
@@ -219,36 +235,63 @@ async function loadHw() {
     <div><span>CPU threads</span><b>${hw.cpu_threads}</b><span></span></div>
     <div><span>desktop on GPU</span><b>${hw.desktop_gpu ? 'yes' : 'no'}</b><span>${hw.other_gpu_apps || 0} other GPU apps</span></div>`;
 }
+function currentOption() {
+  if (!reco) return null;
+  return reco.options.find(o => o.ctx === +$('ctx').value) || null;
+}
+function renderPresets() {
+  const el = $('presets'); el.innerHTML = '';
+  if (!reco) return;
+  reco.presets.forEach(p => {
+    const div = document.createElement('div'); div.className = 'preset' + (p.id === presetId ? ' sel' : '');
+    div.innerHTML = `<div class="pname">${p.label}</div><div class="pctx">${kctx(p.ctx)} context</div>` +
+      `<div class="pnum"><b>${fmt(p.tok_s_short)}</b> tok/s in chat<br><b>${fmt(p.tok_s_long_doc)}</b> tok/s on a long document</div>` +
+      (p.note ? `<div class="pfit">${p.note}</div>` : '');
+    div.onclick = () => { presetId = p.id; loadReco(); };
+    el.appendChild(div);
+  });
+}
+function renderPlan() {
+  const o = currentOption(), m = models[selected];
+  if (!reco || !m) { $('plan').textContent = ''; return; }
+  const custom = presetId === 'custom' ? '<b>custom settings</b> · ' : '';
+  $('plan').innerHTML = custom + `<b>${m.name}</b> · context <b>${commas($('ctx').value)}</b> tokens, KV <b>${$('kv').value}</b> · ` +
+    (o ? (o.tier_gb > 0 ? `expert tier <b>${o.tier_gb} GB</b> of VRAM (~${commas(o.blocks)} experts, ${(o.vram_served*100).toFixed(0)}% of lookups) + <b>${$('ram').value} GB</b> of RAM` : `<b>no VRAM expert tier</b> at this context on this GPU (experts from <b>${$('ram').value} GB</b> of RAM and the NVMe)`) + ` · predicted <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document · ` : `RAM tier <b>${$('ram').value} GB</b> · `) +
+    `vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
+}
 function applyOption(o) {
   $('ctx').value = o.ctx; $('kv').value = o.kv;
-  $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb} GB</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>KV + state <b>${o.state_gb} GB</b></span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b></span>` : ''}<span>predicted decode <b>${o.tok_s_short}</b> tok/s in chat, <b>${o.tok_s_long_doc}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
+  $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>KV + state <b>${o.state_gb} GB</b></span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b></span>` : ''}<span>predicted decode <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
   document.querySelectorAll('#options tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.ctx === o.ctx));
+  renderPlan();
 }
 let visionChoice = null;   // null: the model's default (on when an mmproj file is there)
 async function loadReco() {
-  const r = await api('/api/recommend?model=' + selected + '&priority=' + $('priority').value + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0'))); reco = r;
+  const r = await api('/api/recommend?model=' + selected + '&preset=' + (presetId === 'custom' ? 'coding' : presetId) + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0'))); reco = r;
+  if (presetId !== 'custom') presetId = r.preset;
   ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
   $('skip_miss').value = String(r.skip_miss);
   if (r.spec_block !== undefined) $('spec_block').value = String(r.spec_block);
   const von = $('vision').options[0];
-  von.disabled = !r.mmproj; von.textContent = r.mmproj ? `on (${r.mmproj.split('/').pop()}, ${r.mmproj_gb} GB of VRAM, --mmproj)` : 'unavailable (no mmproj-*.gguf next to this model)';
+  von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'on' : 'unavailable (no mmproj file)';
   $('vision').value = String(r.vision);
   const mon = $('mtp').options[1];
-  mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? `on (${r.mtp_file.split('/').pop()}, ${r.mtp_gb} GB in host memory: drafts verified by the trunk, exact; +5% at 32K context, neutral at 160K)` : 'unavailable (no MTP/mtp-*.gguf in this model\'s repository)';
+  mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'on' : 'unavailable (no MTP file)';
   $('mtp').value = String(!!r.mtp);
   const tb = $('options');
   tb.innerHTML = '<tr><th>context</th><th>KV</th><th>VRAM tier</th><th>experts in VRAM</th><th>from VRAM</th><th>decode, chat</th><th>decode, long document</th></tr>' +
-    r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${(o.ctx/1024).toFixed(0)}K</td><td>${o.kv}</td><td>${o.tier_gb} GB</td><td>${o.blocks}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${o.tok_s_short} tok/s</td><td>${o.tok_s_long_doc} tok/s</td></tr>`).join('');
-  tb.querySelectorAll('tr[data-ctx]').forEach(tr => tr.onclick = () => applyOption(r.options.find(o => o.ctx === +tr.dataset.ctx)));
+    r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${kctx(o.ctx)}</td><td>${o.kv}</td><td>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</td><td>${o.tier_gb > 0 ? o.blocks : '—'}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${fmt(o.tok_s_short)} tok/s</td><td>${fmt(o.tok_s_long_doc)} tok/s</td></tr>`).join('');
+  tb.querySelectorAll('tr[data-ctx]').forEach(tr => tr.onclick = () => { presetId = 'custom'; renderPresets(); applyOption(r.options.find(o => o.ctx === +tr.dataset.ctx)); });
+  renderPresets();
   applyOption(r.options.find(o => o.ctx === r.ctx) || r.options[r.options.length - 1]);
-  $('notes').innerHTML = r.notes.map(n => `<li>${n}</li>`).join('');
 }
-$('priority').onchange = loadReco;
+$('ctx').onchange = () => { presetId = 'custom'; renderPresets(); const o = currentOption(); if (o) applyOption(o); else renderPlan(); };
+['kv','ram','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { if (k === 'kv') { presetId = 'custom'; renderPresets(); } renderPlan(); }));
 $('vision').onchange = () => { visionChoice = $('vision').value === 'true'; loadReco(); };
 function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
-           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true' };
+           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true', preset: presetId };
 }
 $('start').onclick = async () => {
   $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true;
@@ -258,14 +301,58 @@ $('start').onclick = async () => {
   poll();
 };
 $('stop').onclick = async () => { $('msg').textContent = 'stopping…'; $('msg').className = 'muted'; await api('/api/stop', { method: 'POST' }); poll(); };
-$('reco').onclick = () => { visionChoice = null; loadReco(); };
+$('reco').onclick = () => { visionChoice = null; presetId = 'coding'; loadReco(); };
 $('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('endpoint').textContent);
+
+// ---- self-test: the chosen model on this hardware, through the server ----
+let stTimer = null;
+$('selftest').onclick = async () => {
+  $('msg').textContent = ''; $('msg').className = 'muted';
+  const r = await api('/api/selftest', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ model: selected, settings: settings() }) });
+  if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; return; }
+  $('st').hidden = false; $('st_result').innerHTML = ''; $('st_verdict').textContent = ''; $('st_steps').textContent = 'starting…';
+  pollSelftest();
+};
+async function pollSelftest() {
+  const t = await api('/api/selftest');
+  renderSelftest(t);
+  clearTimeout(stTimer);
+  if (t.running) { stTimer = setTimeout(pollSelftest, 2000); if (!lastStatus || lastStatus.state !== 'ready') poll(); }
+  else poll();
+}
+function renderSelftest(t) {
+  const running = t.running;
+  $('selftest').disabled = running; $('start').disabled = running || (lastStatus && ['loading','ready','busy'].includes(lastStatus.state)); $('stop').disabled = running || !(lastStatus && lastStatus.console_started);
+  if (!t.result && !running && !t.error) { $('st').hidden = true; return; }
+  $('st').hidden = false;
+  $('st_steps').textContent = running || t.error ? (t.log || []).join('\n') : '';
+  $('st_steps').hidden = !running && !t.error;
+  if (t.error) { $('st_sub').textContent = ''; $('st_result').innerHTML = ''; $('st_verdict').textContent = t.error; $('st_verdict').className = 'verdict bad'; if (!running) return; }
+  const r = t.result; if (!r || running) { if (running) { $('st_sub').textContent = '— running'; $('st_verdict').textContent = ''; $('st_result').innerHTML = ''; } return; }
+  const pl = reco && reco.presets.find(p => p.id === r.preset);
+  $('st_sub').textContent = `— ${r.model} · ${pl ? pl.label + ', ' : ''}${kctx(r.ctx)} context · ${r.date}`;
+  const d = r.doc, c = r.chat, p = r.predicted || {};
+  $('st_result').innerHTML = `
+    <div><span>chat, decode</span><b>${fmt(c.tok_s)}</b><span>tok/s</span><small>predicted ${fmt(p.chat)} · ${c.n} tokens</small></div>
+    <div><span>document, prefill</span><b>${fmt(d.prefill_tok_s, 0)}</b><span>tok/s</span><small>${commas(d.tokens)} tokens in ${d.prefill_s} s</small></div>
+    <div><span>document, decode</span><b>${fmt(d.tok_s)}</b><span>tok/s at ${kctx(d.tokens)} of context</span><small>predicted ${fmt(p.doc)}</small></div>
+    <div><span>grounded answer</span><b style="color:${d.found ? 'var(--ok)' : 'var(--bad)'}">${d.found ? 'yes' : 'no'}</b><span>${d.found ? 'found the passphrase planted in the document' : 'did not quote the planted passphrase'}</span></div>
+    <div><span>expert cache</span><b>${(r.cache.hit*100).toFixed(0)}% · ${(r.cache.vram_served*100).toFixed(0)}%</b><span>hit · from VRAM</span><small>predicted ${(p.vram_served*100).toFixed(0)}% from VRAM</small></div>
+    <div><span>VRAM in use</span><b>${fmt(r.vram_used_gb)} / ${fmt(r.vram_total_gb, 0)} GB</b><span>${r.ram_available_gb} GB of RAM still free</span></div>`;
+  const ratio = p.doc ? d.tok_s / p.doc : 1, ratioC = p.chat ? c.tok_s / p.chat : 1;
+  let v, cls = 'ok';
+  if (!d.found) { v = 'The answer did not quote the passphrase: the model did not read the document correctly on this setup. Check the Log tab and try a smaller context.'; cls = 'bad'; }
+  else if (Math.min(ratio, ratioC) >= 0.9) v = `This machine runs ${r.model} at these settings as predicted${Math.max(ratio, ratioC) > 1.15 ? ', faster than the estimate' : ''}. The server is still running: point your tools at the endpoint or use the Chat tab.`;
+  else if (Math.min(ratio, ratioC) >= 0.7) { v = `A little below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% on the slower of the two). A busy desktop, a slower NVMe or less free RAM than the estimate assumed do this; the server is still running.`; cls = 'warn'; }
+  else { v = `Well below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% slower): check that nothing else is using the GPU or the NVMe, that the model files are on an NVMe, and that the RAM tier fitted (Log tab).`; cls = 'bad'; }
+  $('st_verdict').textContent = v; $('st_verdict').className = 'verdict ' + cls;
+}
 
 function setLocked(s) {
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
   $('settingsbox').classList.toggle('locked', running); $('models').classList.toggle('locked', running);
   $('lockhint').hidden = !running;
-  $('start').disabled = running; $('stop').disabled = !s.console_started;
+  $('start').disabled = running || s.selftest_running; $('stop').disabled = !s.console_started || s.selftest_running; $('selftest').disabled = !!s.selftest_running;
   if (!running && $('msg').textContent === 'started, loading the model…') $('msg').textContent = '';
   const b = $('banner');
   if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
@@ -298,11 +385,15 @@ async function poll() {
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
   if (running && s.model && models.length) {
     const i = models.findIndex(m => m.name === s.model);
-    if (i >= 0 && i !== selected) { selected = i; renderModels(); await loadReco(); }
-    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); }
+    let reload = false;
+    if (s.settings && s.settings.preset && s.settings.preset !== presetId) { presetId = s.settings.preset; reload = true; }
+    if (i >= 0 && i !== selected) { selected = i; renderModels(); reload = true; }
+    if (reload) await loadReco();   // the running preset's own options (its context, and its vision choice)
+    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); const o = currentOption(); if (o) applyOption(o); else renderPlan(); }
   }
+  if (s.selftest_running && !stTimer) pollSelftest();
   const chatable = s.state === 'ready' || s.state === 'busy';
-  $('send').disabled = !chatable || chatting; const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
+  $('send').disabled = !chatable || chatting || !!s.selftest_running; const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
   const st = s.stats;
   if (st) {
     const g = st.generation, p = st.prompt, t = st.totals, c = st.expert_cache;
@@ -382,9 +473,9 @@ $('prompt').addEventListener('keydown', e => { if ((e.key === 'Enter' || e.keyCo
 $('abort').onclick = () => aborter && aborter.abort();
 $('clear').onclick = () => { chatHistory = []; $('msgs').innerHTML = '<div class="muted" id="chatempty" hidden></div>'; };
 
-(async () => { await loadModels(); await loadHw(); await loadReco(); await poll(); setInterval(poll, 5000);
-  if (askParam) { $('prompt').value = askParam; await send(); await poll(); }
-  if (holdToken) { await new Promise(r => setTimeout(r, 300)); fetch('/api/release?token=' + holdToken); } })();
+(async () => { await loadModels(); await loadHw(); await loadReco(); await poll();
+  try { const t = await api('/api/selftest'); renderSelftest(t); if (t.running) pollSelftest(); } catch (e) {}
+  setInterval(poll, 5000); pageReady = true; })();
 </script>
 </body>
 </html>

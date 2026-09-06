@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """qwfn console: a local web page to see which models are downloaded, pick one,
-get settings recommended for this machine, start/stop qwfn-server and watch it
-live (state, tokens/s, prefill speed, tokens served, endpoint).
+get settings for this machine (three presets: chat, agentic coding, agentic coding+),
+start/stop qwfn-server, self-test it on this hardware and watch it live (state,
+tokens/s, prefill speed, tokens served, endpoint).
 
     python3 tools/qwfn_console.py            # http://127.0.0.1:8090
     python3 tools/qwfn_console.py --port 8091 --server-port 8080
@@ -11,7 +12,7 @@ one qwfn-server and refuses to start a second while any qwfn engine is running.
 Vision: when an mmproj-*.gguf sits next to the model (or in its snapshot directory)
 the server is started with --mmproj by default, so images sent by a harness work.
 """
-import argparse, glob, http.server, json, os, re, signal, socket, subprocess, sys, threading, time, urllib.request
+import argparse, glob, http.server, json, math, os, random, signal, socket, subprocess, sys, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
@@ -21,17 +22,11 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": os.path.join(LOG_DIR, "server.log"), "port": 8080}
 LOCK = threading.Lock()
-HOLDS = {}   # screenshot holds, see /api/hold
 
 # ---- models ------------------------------------------------------------------
-NOTES = {
-    "Q3_K_XL": ("recommended", "14.7 tok/s at 133K on the reference machine; the measured choice"),
-    "Q4_K_XL": ("slower", "35-42% slower decode than Q3_K_XL here: expert blocks are 42% larger, so both tiers hold ~30% fewer"),
-    "IQ1_S":   ("cold only", "1-bit checkpoint: meant as the cold tier (--cold), not to serve"),
-}
 QUANT_BLOCK_MB = {"Q3_K_XL": 2.4, "Q4_K_XL": 3.4, "IQ1_S": 1.5}   # expert block size, for tier estimates
 QUANT_CORE_GB  = {"Q3_K_XL": 4.68, "Q4_K_XL": 4.83, "IQ1_S": 4.5}  # dense core on the GPU
-QUANT_TPS      = {"Q3_K_XL": (17.0, 14.7), "Q4_K_XL": (11.0, 9.5), "IQ1_S": (0, 0)}   # (short ctx, 133K) measured
+COLD_ONLY = ("IQ1_S",)   # 1-bit checkpoints: a cold tier (--cold), never served on their own
 
 def find_mmproj(model_dir):
     """The vision projector shipped with the model: mmproj-*.gguf in the quant's own
@@ -56,11 +51,11 @@ def scan_models():
         if base.startswith("mmproj") or base.startswith("mtp-"): continue
         if "-of-" in base and "-00001-of-" not in base: continue
         d = os.path.dirname(f); quant = os.path.basename(d)
+        key = next((k for k in QUANT_BLOCK_MB if k in quant), None)
+        if key in COLD_ONLY: continue
         total = sum(os.stat(s).st_size for s in glob.glob(os.path.join(d, "*.gguf")) if not os.path.basename(s).startswith(("mmproj", "mtp-")))
-        key = next((k for k in NOTES if k in quant), None)
-        tag, note = NOTES.get(key, ("", ""))
         mm = find_mmproj(d); mtp = find_mtp(d)
-        out.append({"id": len(out), "name": quant, "path": f, "size_gb": round(total / 1e9, 1), "tag": tag, "note": note, "quant": key or quant,
+        out.append({"id": len(out), "name": quant, "path": f, "size_gb": round(total / 1e9, 1), "quant": key or quant,
                     "mmproj": mm, "mmproj_gb": round(os.stat(mm).st_size / 1e9, 2) if mm else 0.0,
                     "mtp": mtp, "mtp_gb": round(os.stat(mtp).st_size / 1e9, 2) if mtp else 0.0})
     return out
@@ -90,16 +85,20 @@ def hardware():
         pass
     return hw
 
-# ---- recommendations: a cost model fitted to this session's measurements -----
+# ---- settings: a cost model fitted to the reference machine's measurements ----
 # Per token: GPU graph time + CPU time for the experts served from RAM + NVMe
 # time for the misses. What the hardware and the model decide:
 #   blocks in VRAM   = (VRAM - dense core - KV/indexer state at ctx - reserve - desktop use) / block size
-#   VRAM-served f_v  = 0.95 (1 - exp(-blocks / 1500))          fits Q3 86% @3392-3717, Q4 68% @1834, 74% @2212, 78% @2447
-#   cache hit  f_h   = 0.97 (1 - exp(-(vram+ram blocks) / 1800)) fits 95-96% (Q3), 94% (Q4); -2 pts on a real long document
-#   ms/token         = gpu + 480 [ (f_h - f_v) 0.086 + (1 - f_h) io ] + 8,   io = 1.1 (block/2.4 MB)^1.4 ms per missed expert
-# Predicts Q3 4K 18.5 (measured 16.8-18), Q4 4K 10.7 (10.2), Q3 133K document 14.7 (14.7), Q4 133K document 8.7 (8.6).
+#   VRAM-served f_v  = 0.95 (1 - exp(-blocks / 1500)), 6 pts lower after a long document's prefill
+#   cache hit  f_h   = 0.97 (1 - exp(-(vram+ram blocks) / 1050))   (the speculative block: 96-97% measured)
+#   ms/token         = gpu + 480 [ (f_h - f_v) 0.110 + (1 - f_h) io ] + 8,   io = 1.4 (block/2.4 MB)^1.4 ms per missed expert
+# Refit 2026-09-06 to the server at 160K context with the speculative block on (tiers 1647 Q4 / 2364 Q3 blocks,
+# 12 GB RAM tier): Q4 short chat 10.4 -> 10.4, Q4 155K document 10.0 -> 10.1, Q3 short 15.8 -> 15.6, Q3 document 14.9 -> 14.9.
 CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 163840, 262144]
-QUANT_GPU_MS = {"Q3_K_XL": 23.0, "Q4_K_XL": 24.0, "IQ1_S": 23.0}
+PRESETS = [("chat", "Chat", 32768, "short conversations; the fastest decode"),
+           ("coding", "Agentic coding", 131072, "a coding harness with tool calls; room for a repository's worth of context"),
+           ("coding_plus", "Agentic coding+", 262144, "the model's full trained context, for the longest sessions")]
+QUANT_GPU_MS = {"Q3_K_XL": 24.0, "Q4_K_XL": 32.0, "IQ1_S": 24.0}   # graph A with the speculative block, per token
 LOOKUPS_PER_TOKEN = 480   # 48 layers x 10 routed experts
 def state_gb(ctx, kv):
     per_k = {"q4_0": 6.9, "q8_0": 13.1, "f16": 26.2}[kv]      # KV MB per 1K tokens
@@ -108,21 +107,23 @@ def state_gb(ctx, kv):
 def predict(quant, tier_gb, ram_gb, long_doc):
     block = QUANT_BLOCK_MB.get(quant, 2.4)
     vb = max(0.0, tier_gb) * 1024 / block; rb = ram_gb * 1024 / block
-    import math
-    f_v = 0.95 * (1 - math.exp(-vb / 1500))
-    f_h = 0.97 * (1 - math.exp(-(vb + rb) / 1800)) - (0.02 if long_doc else 0.0)
+    f_v = max(0.0, 0.95 * (1 - math.exp(-vb / 1500)) - (0.06 if long_doc else 0.0)) if vb > 0 else 0.0
+    f_h = 0.97 * (1 - math.exp(-(vb + rb) / 1050))
     f_h = max(f_h, f_v)
-    io = 1.1 * (block / 2.4) ** 1.4
-    ms = QUANT_GPU_MS.get(quant, 23.0) + LOOKUPS_PER_TOKEN * ((f_h - f_v) * 0.086 + (1 - f_h) * io) + 8.0
+    io = 1.4 * (block / 2.4) ** 1.4
+    ms = QUANT_GPU_MS.get(quant, 24.0) + LOOKUPS_PER_TOKEN * ((f_h - f_v) * 0.110 + (1 - f_h) * io) + 8.0
     return {"tok_s": round(1000 / ms, 1), "vram_served": round(f_v, 3), "hit": round(f_h, 3), "blocks": int(vb)}
 
-def recommend(model, hw, priority="balanced", vision=None):
+def recommend(model, hw, preset="coding", vision=None):
+    """Settings for one preset on this machine, with every context step's cost and the
+    three presets summarised, so the page can show the choice without a table."""
     q = model["quant"]
     core = QUANT_CORE_GB.get(q, 4.7)
     # Vision: the projector is loaded onto the GPU after the expert tier is sized, so
     # qwfn-server adds its file size (+128 MB of graph arena) to --reserve. Default on
     # whenever the file is there: a harness that sends an image gets an answer instead of
     # a 400, and the cost is a few hundred expert blocks.
+    forced_vision = vision   # None: the model's default (on when the file is there); True/False: the user's choice
     if vision is None: vision = bool(model.get("mmproj"))
     vision = bool(vision and model.get("mmproj"))
     mm_gb = (model.get("mmproj_gb", 0.0) + 0.128) if vision else 0.0
@@ -135,48 +136,52 @@ def recommend(model, hw, priority="balanced", vision=None):
     avail = hw["ram_available_gb"] if not engines_running() else max(hw["ram_available_gb"], hw["ram_total_gb"] - 8.0)
     ram = max(4, min(12, int(0.6 * avail - 3.2)))
     batch = 4096 if vram >= 12 else 2048
-    options = []
-    for c in CTX_STEPS:
+    # What the engine does with the VRAM left after the dense core and the context's state:
+    # it takes OVERHEAD_GB for its CUDA context, decode state and graph arenas (measured
+    # against the tier it actually built at 160K), and it only builds an expert tier that
+    # can hold the prefill's dynamic buffer (staging, work set, arenas: LEND_GB), because
+    # that buffer is lent by the tier while a prompt streams. Below that it runs with no
+    # VRAM tier at all: every expert comes from RAM or the NVMe, about 25% slower.
+    OVERHEAD_GB = 1.2
+    lend_gb = (4.4 if batch >= 4096 else 3.9) - (0.27 if q == "Q3_K_XL" else 0.0)
+    def tier_for(c, kv, with_vision):
+        mm = (model.get("mmproj_gb", 0.0) + 0.128) if with_vision else 0.0
+        t = vram - core - state_gb(c, kv) - reserve_mb / 1024 - desktop_use - OVERHEAD_GB - mm
+        return t if t >= lend_gb + 0.1 else 0.0
+    def option(c, with_vision):
         kv = "q4_0" if c >= 32768 else "q8_0"
-        tier = vram - core - state_gb(c, kv) - reserve_mb / 1024 - desktop_use - 0.2 - mm_gb   # 0.2: residency tables, work set
-        if tier < 2.0: continue
+        tier = tier_for(c, kv, with_vision)
         short = predict(q, tier, ram, False); longd = predict(q, tier, ram, True)
-        options.append({"ctx": c, "kv": kv, "tier_gb": round(tier, 2), "blocks": short["blocks"], "state_gb": round(state_gb(c, kv), 2),
-                        "tok_s_short": short["tok_s"], "tok_s_long_doc": longd["tok_s"], "vram_served": short["vram_served"], "hit": short["hit"]})
-    if not options:
-        options.append({"ctx": 8192, "kv": "q8_0", "tier_gb": 0.0, "blocks": 0, "state_gb": round(state_gb(8192, "q8_0"), 2), "tok_s_short": 0, "tok_s_long_doc": 0, "vram_served": 0, "hit": 0})
-    best_speed = max(o["tok_s_long_doc"] for o in options)
-    if priority == "fastest":
-        chosen = next(o for o in options if o["ctx"] >= 32768) if any(o["ctx"] >= 32768 for o in options) else options[-1]
-    elif priority == "context":
-        chosen = options[-1]
-    else:   # balanced: the largest context that keeps long-document decode within 10% of the best
-        chosen = [o for o in options if o["tok_s_long_doc"] >= 0.9 * best_speed][-1]
-    notes = []
-    if q == "IQ1_S": notes.append("This file is the cold checkpoint (1-bit). Serve Q3_K_XL and pass this one with --cold if you want the cold tier; the numbers below assume it could be served.")
-    if q == "Q4_K_XL": notes.append("Q4_K_XL's expert blocks are 42% larger than Q3_K_XL's, so every GB of VRAM holds 30% fewer experts and every miss reads more: the table shows what each context costs on this GPU.")
-    lo, hi = options[-1], options[0]
-    if hi["tok_s_long_doc"] > 0 and lo["tok_s_long_doc"] < 0.85 * hi["tok_s_long_doc"]:
-        notes.append("Going from %sK to %sK context costs %d%% of long-document decode on this GPU (%.1f -> %.1f tok/s): the KV/indexer state comes out of the expert tier." % (hi["ctx"] // 1024, lo["ctx"] // 1024, round(100 * (1 - lo["tok_s_long_doc"] / hi["tok_s_long_doc"])), hi["tok_s_long_doc"], lo["tok_s_long_doc"]))
-    if hw["desktop_gpu"]: notes.append("A desktop session shares this GPU (%.1f GB in use now): reserve %d MB and that usage are taken off the tier." % (desktop_use, reserve_mb))
-    if vision:
-        notes.append("Vision on: %s (%.2f GB) is loaded onto the GPU and comes out of the expert tier, about %d blocks. Images arrive as OpenAI image_url content parts (base64 data: URLs); turn it off for a text-only server." % (os.path.basename(model["mmproj"]), model.get("mmproj_gb", 0.0), int(mm_gb * 1024 / QUANT_BLOCK_MB.get(q, 2.4))))
-    elif not model.get("mmproj"):
-        notes.append("No mmproj-*.gguf next to this model, so image input is unavailable: download mmproj-F16.gguf into the model's snapshot directory to enable it.")
-    if model.get("mtp"):
-        notes.append("Draft head available (%s, %.2f GB, off by default): the checkpoint's nextn head drafts the token after next and the trunk verifies it, so the output is the trunk's own. Measured on the reference machine: +5%% decode at 32K context, neutral at 160K (the pair step's disk wait and CPU experts scale per token, and the smaller VRAM tier at long context serves pairs less). Its experts live in host memory, so the RAM tier clamps ~2.7 GB lower; a prompt longer than one batch leaves the head without rows, and drafts switch off for that conversation. The status line shows the acceptance rate." % (os.path.basename(model["mtp"]), model.get("mtp_gb", 0.0)))
-    notes.append("RAM tier %d GB: the engine's own clamp (60%% of available memory minus headroom). More RAM tier moves the cache hit rate by about a point; it is not the lever." % ram)
-    notes.append("Thinking: xhigh by default; --think-budget 6000 keeps a hard think under ~8 min at Q4 speed, ~6 at Q3. Harnesses with no thinking toggle can end a message with /no_think.")
+        return {"ctx": c, "kv": kv, "tier_gb": round(tier, 2), "blocks": short["blocks"], "state_gb": round(state_gb(c, kv), 2), "vision": with_vision,
+                "tok_s_short": short["tok_s"], "tok_s_long_doc": longd["tok_s"], "vram_served": short["vram_served"], "hit": short["hit"]}
+    presets = []
+    for pid, label, ctx, blurb in PRESETS:
+        o = option(ctx, vision); note = ""
+        if o["tier_gb"] == 0 and vision and forced_vision is None:
+            alt = option(ctx, False)
+            if alt["tier_gb"] > 0: o = alt; note = "vision off: the projector's %.1f GB is what lets the expert tier fit" % model.get("mmproj_gb", 0.0)
+        if o["tier_gb"] == 0:
+            fallback = [option(c, vision) for c in CTX_STEPS if c < ctx]
+            fallback = [f for f in fallback if f["tier_gb"] > 0]
+            if fallback: o = fallback[-1]; note = "no room for an expert tier at %dK on this GPU: %dK instead" % (ctx // 1024, o["ctx"] // 1024)
+            else: note = "no room for a VRAM expert tier on this GPU: experts come from RAM and the NVMe"
+        presets.append({"id": pid, "label": label, "blurb": blurb, "ctx": ctx, "fits": o["ctx"] == ctx, "note": note, "ctx_actual": o["ctx"], "kv": o["kv"], "vision": o["vision"],
+                        "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": o["tok_s_short"], "tok_s_long_doc": o["tok_s_long_doc"], "vram_served": o["vram_served"]})
+    if preset not in [p["id"] for p in presets]: preset = "coding"
+    p = next(p for p in presets if p["id"] == preset)
+    vision = p["vision"]; mm_gb = (model.get("mmproj_gb", 0.0) + 0.128) if vision else 0.0
+    options = [option(c, vision) for c in CTX_STEPS]
+    chosen = next(o for o in options if o["ctx"] == p["ctx_actual"])
     return {
         "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": ram, "batch": batch, "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
-        "skip_miss": False, "spec_block": True, "port": STATE["port"], "priority": priority,
+        "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "mtp": False, "mtp_file": model.get("mtp"), "mtp_gb": model.get("mtp_gb", 0.0),
         "estimates": {"vram_tier_gb": chosen["tier_gb"], "vram_tier_blocks": chosen["blocks"], "state_gb": chosen["state_gb"], "dense_core_gb": core,
                       "mmproj_gb": round(mm_gb, 2),
-                      "desktop_use_gb": round(desktop_use, 2), "decode_tps_short": chosen["tok_s_short"], "decode_tps_133k": chosen["tok_s_long_doc"],
+                      "desktop_use_gb": round(desktop_use, 2), "decode_tps_short": chosen["tok_s_short"], "decode_tps_long_doc": chosen["tok_s_long_doc"],
                       "vram_served": chosen["vram_served"], "prefill_tps_long": 275 if q != "IQ1_S" else 0},
-        "options": options, "notes": notes,
+        "options": options, "presets": presets,
     }
 
 # ---- server control ----------------------------------------------------------
@@ -281,7 +286,115 @@ def status():
         st["state"] = "loading"
     st["log"] = log_tail(40)
     st["engines"] = engines_running()
+    st["selftest_running"] = SELFTEST["running"]
     return st
+
+# ---- self-test: the chosen model on this hardware, through the server ---------
+# Starts the server if none is running (with the settings the page shows), then measures
+# what a user would see: a short chat (decode tok/s), and a long document with a passphrase
+# planted in it (prefill tok/s, decode tok/s on that context, and whether the answer found
+# the passphrase). The server is left running afterwards.
+SELFTEST = {"running": False, "step": "", "log": [], "result": None, "error": None, "t0": 0.0}
+SELFTEST_FILE = os.path.join(LOG_DIR, "selftest.json")
+try: SELFTEST["result"] = json.load(open(SELFTEST_FILE))
+except Exception: pass
+WORDS = ["amber", "basalt", "cedar", "delta", "ember", "falcon", "garnet", "harbor", "indigo", "juniper", "kestrel", "lagoon",
+         "marble", "nectar", "onyx", "pebble", "quartz", "raven", "saffron", "tundra", "umber", "velvet", "willow", "zephyr"]
+
+def selftest_document(n_tokens):
+    """A long document made of the engine's own sources (real prose and code, the kind of
+    text a coding harness sends), with a passphrase planted at about 40% depth and a
+    random header so the server's prefix cache cannot skip the prefill on a repeat run."""
+    files = [os.path.join(ROOT, "README.md")] + sorted(glob.glob(os.path.join(ROOT, "src", "*.cpp"))) + sorted(glob.glob(os.path.join(ROOT, "tools", "*.cpp")))
+    parts = []
+    for f in files:
+        try: parts.append("\n\n===== %s =====\n\n" % os.path.relpath(f, ROOT) + open(f, encoding="utf-8", errors="replace").read())
+        except Exception: pass
+    text = "".join(parts) or ("The quick brown fox jumps over the lazy dog. " * 2000)
+    want = int(n_tokens * 3.3)   # this tokenizer takes ~3.3 characters per token on the mix of C++ and prose
+    while len(text) < want: text += text
+    text = text[:want]
+    rng = random.Random()
+    phrase = "%s-%s-%d" % (rng.choice(WORDS), rng.choice(WORDS), rng.randint(100, 999))
+    at = text.find("\n", int(len(text) * 0.4)) + 1
+    needle = "\n\nNOTE FOR THE READER: the passphrase for this self-test is \"%s\". Remember it.\n\n" % phrase
+    header = "Self-test document %d\n\n" % rng.randint(10**6, 10**7)
+    return header + text[:at] + needle + text[at:], phrase
+
+def chat_request(port, content, max_tokens, timeout=3600):
+    body = json.dumps({"model": "qwfn", "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,
+                       "reasoning_effort": "off", "temperature": 0.0, "stream": False}).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r: return json.load(r)
+
+def run_selftest(model, settings):
+    T = SELFTEST
+    def log(s): T["step"] = s; T["log"].append("%4.0f s  %s" % (time.time() - T["t0"], s))
+    try:
+        st = status(); started_here = False
+        if st["state"] in ("ready", "busy", "loading"):
+            if st.get("model") and st["model"] != model["name"]:
+                raise RuntimeError("a different model is being served (%s): stop it first, or test that one" % st["model"])
+            log("using the running server" if st["state"] != "loading" else "waiting for the server to finish loading")
+        else:
+            log("starting the server with the settings shown")
+            r = start_server(model, settings)
+            if r.get("error"): raise RuntimeError(r["error"])
+            started_here = True
+        deadline = time.time() + 1200
+        while time.time() < deadline:
+            st = status()
+            if st["state"] in ("ready", "busy"): break
+            if st["state"] in ("exited", "stopped"):
+                raise RuntimeError("the server exited while loading (exit code %s): see the Log tab" % st.get("exit_code"))
+            time.sleep(2)
+        else:
+            raise RuntimeError("the server did not become ready within 20 minutes")
+        port = st["port"]
+        run = st.get("settings") or {}
+        ctx = int(run.get("ctx") or (st.get("props") or {}).get("n_ctx") or settings.get("ctx") or 32768)
+        log("warm-up")
+        chat_request(port, "Say hello in one short sentence.", 24)
+        log("short chat: a three-sentence answer")
+        r = chat_request(port, "Explain in three sentences why mixture-of-experts models are cheaper to run than dense models with the same parameter count.", 200)
+        t = r.get("timings") or {}
+        chat = {"tok_s": round(t.get("predicted_per_second", 0), 1), "n": t.get("predicted_n", 0), "prefill_tok_s": round(t.get("prompt_per_second", 0), 0),
+                "answer": (r["choices"][0]["message"].get("content") or "").strip()[:400]}
+        n_doc = min(32768, ctx // 2)
+        doc, phrase = selftest_document(n_doc)
+        log("long document: prefilling about %dK tokens, then a grounded answer" % (n_doc // 1024))
+        r = chat_request(port, doc + "\n\nTwo things: (1) What is the passphrase that the note in this document asks the reader to remember? Quote it exactly. (2) In two sentences, what is this document about?", 160)
+        t = r.get("timings") or {}
+        answer = (r["choices"][0]["message"].get("content") or "").strip()
+        docres = {"tokens": t.get("prompt_n", 0), "prefill_tok_s": round(t.get("prompt_per_second", 0), 0), "prefill_s": round(t.get("prompt_ms", 0) / 1000, 0),
+                  "tok_s": round(t.get("predicted_per_second", 0), 1), "n": t.get("predicted_n", 0), "found": phrase.lower() in answer.lower(),
+                  "phrase": phrase, "answer": answer[:400]}
+        stats = fetch_json(f"http://127.0.0.1:{port}/stats", 3.0) or {}
+        c = stats.get("expert_cache") or {}
+        hw = hardware()
+        est = recommend(model, hw, run.get("preset") or settings.get("preset") or "coding", run.get("vision"))
+        o = min(est["options"], key=lambda o: abs(o["ctx"] - ctx))
+        T["result"] = {"model": model["name"], "ctx": ctx, "preset": run.get("preset") or settings.get("preset"), "flags": run,
+                       "date": time.strftime("%Y-%m-%d %H:%M"), "chat": chat, "doc": docres,
+                       "cache": {"hit": round(c.get("hit_rate", 0), 3), "vram_served": round(c.get("vram_served", 0), 3)},
+                       "vram_used_gb": round(hw["vram_used_mb"] / 1024, 1), "vram_total_gb": round(hw["vram_total_mb"] / 1024, 1),
+                       "ram_available_gb": hw["ram_available_gb"], "gpu": hw.get("gpu"),
+                       "predicted": {"chat": o["tok_s_short"], "doc": o["tok_s_long_doc"], "vram_served": o["vram_served"]},
+                       "started_server": started_here, "elapsed_s": round(time.time() - T["t0"])}
+        try: json.dump(T["result"], open(SELFTEST_FILE, "w"))
+        except Exception: pass
+        log("done in %d s" % (time.time() - T["t0"]))
+    except Exception as e:
+        T["error"] = str(e); log("failed: %s" % e)
+    finally:
+        T["running"] = False
+
+def start_selftest(model, settings):
+    with LOCK:
+        if SELFTEST["running"]: return {"error": "a self-test is already running"}
+        SELFTEST.update(running=True, step="starting", log=[], error=None, t0=time.time())
+    threading.Thread(target=run_selftest, args=(model, settings), daemon=True).start()
+    return {"ok": True}
 
 # ---- HTTP -----------------------------------------------------------------------
 INDEX = os.path.join(ROOT, "tools", "console", "index.html")
@@ -293,6 +406,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
         path = self.path.split("?")[0]
+        q = dict(x.split("=", 1) for x in self.path.split("?", 1)[1].split("&") if "=" in x) if "?" in self.path else {}
         if path in ("/", "/index.html"):
             try: body = open(INDEX, "rb").read()
             except Exception: body = b"<h1>tools/console/index.html missing</h1>"
@@ -300,29 +414,22 @@ class H(http.server.BaseHTTPRequestHandler):
         if path == "/api/models": return self._json({"models": scan_models(), "hf": HF})
         if path == "/api/hardware": return self._json(hardware())
         if path == "/api/recommend":
-            q = dict(x.split("=", 1) for x in self.path.split("?", 1)[1].split("&")) if "?" in self.path else {}
             models = scan_models(); i = int(q.get("model", 0))
             if not models: return self._json({"error": "no models"}, 404)
             v = q.get("vision", ""); vision = None if v == "" else v in ("1", "true")
-            return self._json(recommend(models[min(i, len(models) - 1)], hardware(), q.get("priority", "balanced"), vision))
+            return self._json(recommend(models[min(i, len(models) - 1)], hardware(), q.get("preset", "coding"), vision))
         if path == "/api/status": return self._json(status())
         if path == "/api/log": return self._json({"log": log_tail(400)})
-        if path == "/api/hold":      # 1x1 GIF, answered when /api/release?token= arrives (or after 10 min)
-            q = dict(x.split("=", 1) for x in self.path.split("?", 1)[1].split("&")) if "?" in self.path else {}
-            ev = HOLDS.setdefault(q.get("token", ""), threading.Event()); ev.wait(600)
-            gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
-            self.send_response(200); self.send_header("Content-Type", "image/gif"); self.send_header("Content-Length", str(len(gif))); self.end_headers(); self.wfile.write(gif); return
-        if path == "/api/release":
-            q = dict(x.split("=", 1) for x in self.path.split("?", 1)[1].split("&")) if "?" in self.path else {}
-            HOLDS.setdefault(q.get("token", ""), threading.Event()).set(); return self._json({"ok": True})
+        if path == "/api/selftest": return self._json({k: SELFTEST[k] for k in ("running", "step", "log", "result", "error")})
         self._json({"error": "not found"}, 404)
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0)); body = json.loads(self.rfile.read(n) or b"{}")
-        if self.path == "/api/start":
+        if self.path in ("/api/start", "/api/selftest"):
             models = scan_models(); i = int(body.get("model", 0))
             if not models: return self._json({"error": "no models"}, 404)
-            s = body.get("settings") or recommend(models[i], hardware())
-            return self._json(start_server(models[i], s))
+            model = models[min(i, len(models) - 1)]
+            s = body.get("settings") or recommend(model, hardware())
+            return self._json(start_server(model, s) if self.path == "/api/start" else start_selftest(model, s))
         if self.path == "/api/stop": return self._json(stop_server())
         self._json({"error": "not found"}, 404)
 

@@ -1220,7 +1220,7 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
         ggml_set_output(logits);
         ggml_build_forward_expand(g, logits);
         run_on(g, true);
-        ggml_backend_tensor_get(logits, logits_.data(), 0, logits_.size() * sizeof(float));
+        ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * sizeof(float));   // one position: logits_ holds two for a decoded pair
         ggml_free(c);
     }
     ec_.settle_promotions();
