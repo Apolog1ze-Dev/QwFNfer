@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# qwfnfer: the one command. Starts the console (or finds the one already running) and
+# opens it in your browser. Works from the release bundle (this file next to bin/ and
+# tools/) and from a source checkout (this file under scripts/).
+#
+#   qwfnfer                 open the console at http://127.0.0.1:8090
+#   qwfnfer --no-browser    just run the console in this terminal
+#   qwfnfer --port 8091     another console port (--server-port N for the engine's)
+set -u
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+[ -f "$HERE/tools/qwfn_console.py" ] || HERE=$(cd "$HERE/.." && pwd)
+[ -f "$HERE/tools/qwfn_console.py" ] || { echo "qwfnfer: tools/qwfn_console.py not found next to $0" >&2; exit 1; }
+cd "$HERE"
+
+port=8090; browser=1; args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-browser) browser=0 ;;
+        --port) port=$2; args+=("$1" "$2"); shift ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+url="http://127.0.0.1:$port"
+open_browser() {
+    [ $browser -eq 1 ] || return 0
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+    (sleep 1.5; xdg-open "$url" >/dev/null 2>&1 || true) &
+}
+# Already running? Just open it.
+if python3 - "$port" <<'EOF' 2>/dev/null
+import socket, sys
+s = socket.socket(); s.settimeout(0.3)
+try: s.connect(("127.0.0.1", int(sys.argv[1]))); sys.exit(0)
+except OSError: sys.exit(1)
+EOF
+then
+    echo "qwfnfer console is already running at $url"
+    open_browser; wait; exit 0
+fi
+# The bundle keeps its libraries next to the engine.
+[ -f "$HERE/bin/libggml-base.so.0" ] && export LD_LIBRARY_PATH="$HERE/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+open_browser
+exec python3 tools/qwfn_console.py "${args[@]}"

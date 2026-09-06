@@ -16,7 +16,8 @@ import argparse, glob, http.server, json, math, os, random, signal, socket, subp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
-SERVER_BIN = os.path.join(ROOT, "build", "qwfn-server")
+# The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
+SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server"))
 LOG_DIR = os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -212,7 +213,7 @@ def start_server(model, s):
         if STATE["proc"] and STATE["proc"].poll() is None: return {"error": "a server started by this console is already running"}
         running = engines_running()
         if running: return {"error": "an engine is already running on this machine (one at a time): " + "; ".join(running)[:300]}
-        if not os.path.exists(SERVER_BIN): return {"error": f"{SERVER_BIN} not found; build first (cmake --build build)"}
+        if not os.path.exists(SERVER_BIN): return {"error": f"{SERVER_BIN} not found: install the release bundle, or build first (cmake --build build)"}
         argv = [SERVER_BIN, model["path"], "--ram", str(int(s["ram"])), "--ctx", str(int(s["ctx"])), "--batch", str(int(s["batch"])),
                 "--kv", s["kv"], "--reserve", str(int(s["reserve"])), "--think", s["think"], "--think-budget", str(int(s["think_budget"])),
                 "--port", str(int(s["port"]))]
@@ -234,8 +235,13 @@ def start_server(model, s):
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
             log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
         log.flush()
+        # The bundle keeps ggml, the CUDA runtime and liburing next to the engine; the loader
+        # needs the directory for the libraries the CUDA backend dlopens.
+        env = dict(os.environ); bindir = os.path.dirname(SERVER_BIN)
+        if os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
+            env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         try:
-            proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+            proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
         except Exception as e:
             return {"error": f"cannot start: {e}"}
         STATE.update(proc=proc, model=model, settings=s, started=time.time(), port=int(s["port"]))
@@ -245,7 +251,13 @@ def stop_server():
     with LOCK:
         p = STATE["proc"]
         if not p or p.poll() is not None:
-            return {"ok": True, "note": "no console-started server running"}
+            # A server started outside this console (serve.sh, or a console that has since
+            # exited) still answers on the port: stop it too, it is the one engine there is.
+            pids = [l.split()[0] for l in engines_running() if "qwfn-server" in l]
+            for pid in pids:
+                try: os.kill(int(pid), signal.SIGTERM)
+                except Exception: pass
+            return {"ok": True, "note": "stopped the server running outside the console" if pids else "no server running"}
         p.send_signal(signal.SIGTERM)
         for _ in range(50):
             if p.poll() is not None: break

@@ -322,7 +322,7 @@ async function pollSelftest() {
 }
 function renderSelftest(t) {
   const running = t.running;
-  $('selftest').disabled = running; $('start').disabled = running || (lastStatus && ['loading','ready','busy'].includes(lastStatus.state)); $('stop').disabled = running || !(lastStatus && lastStatus.console_started);
+  $('selftest').disabled = running; $('start').disabled = running || (lastStatus && ['loading','ready','busy'].includes(lastStatus.state)); $('stop').disabled = running || !(lastStatus && ['loading','ready','busy'].includes(lastStatus.state));
   if (!t.result && !running && !t.error) { $('st').hidden = true; return; }
   $('st').hidden = false;
   $('st_steps').textContent = running || t.error ? (t.log || []).join('\n') : '';
@@ -352,7 +352,7 @@ function setLocked(s) {
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
   $('settingsbox').classList.toggle('locked', running); $('models').classList.toggle('locked', running);
   $('lockhint').hidden = !running;
-  $('start').disabled = running || s.selftest_running; $('stop').disabled = !s.console_started || s.selftest_running; $('selftest').disabled = !!s.selftest_running;
+  $('start').disabled = running || s.selftest_running; $('stop').disabled = !running || s.selftest_running; $('selftest').disabled = !!s.selftest_running;
   if (!running && $('msg').textContent === 'started, loading the model…') $('msg').textContent = '';
   const b = $('banner');
   if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }

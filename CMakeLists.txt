@@ -19,6 +19,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Where llama.cpp/ggml lives. Override with -DLLAMA_CPP_ROOT=...
 set(LLAMA_CPP_ROOT "$ENV{HOME}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
 set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build/bin"   CACHE PATH "llama.cpp built libraries")
+# QWFN_PORTABLE builds the release bundle (scripts/package.sh): baseline x86-64-v3 code
+# instead of this machine's -march=native, a glibc 2.34 floor (cmake/glibc_compat.h keeps
+# the pre-C23 strtol/sscanf symbols, -fno-math-errno the pre-2.43 sqrtf), libstdc++ and
+# libgcc linked in, and the ggml/CUDA libraries found next to the binaries ($ORIGIN).
+option(QWFN_PORTABLE "Relocatable release build" OFF)
+if(QWFN_PORTABLE)
+  set(QWFN_ARCH_FLAGS -march=x86-64-v3 -mtune=generic)
+  add_compile_options(-include "${CMAKE_SOURCE_DIR}/cmake/glibc_compat.h" -fno-math-errno)
+  add_link_options(-static-libstdc++ -static-libgcc)
+  set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+  set(CMAKE_INSTALL_RPATH "$ORIGIN")
+else()
+  set(QWFN_ARCH_FLAGS -march=native)
+endif()
 
 if(NOT EXISTS "${LLAMA_CPP_ROOT}/ggml/include/ggml.h")
   message(FATAL_ERROR "ggml headers not found under ${LLAMA_CPP_ROOT}. Pass -DLLAMA_CPP_ROOT=<path>.")
@@ -64,23 +78,23 @@ target_include_directories(qwfn_core PUBLIC
   "${URING_INCLUDE_DIR}"
 )
 target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}")
-target_compile_options(qwfn_core PRIVATE -O3 -march=native -Wall -Wextra -Wno-unused-parameter)
+target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
 
 add_executable(qwfn-iobench tools/qwfn_iobench.cpp)
 target_link_libraries(qwfn-iobench PRIVATE qwfn_core)
-target_compile_options(qwfn-iobench PRIVATE -O3 -march=native)
+target_compile_options(qwfn-iobench PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-inspect tools/qwfn_inspect.cpp)
 target_link_libraries(qwfn-inspect PRIVATE qwfn_core)
-target_compile_options(qwfn-inspect PRIVATE -O3 -march=native)
+target_compile_options(qwfn-inspect PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-test-hc tools/qwfn_test_hc.cpp)
 target_link_libraries(qwfn-test-hc PRIVATE qwfn_core)
-target_compile_options(qwfn-test-hc PRIVATE -O3 -march=native)
+target_compile_options(qwfn-test-hc PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-logits tools/qwfn_logits.cpp)
 target_link_libraries(qwfn-logits PRIVATE qwfn_core)
-target_compile_options(qwfn-logits PRIVATE -O3 -march=native)
+target_compile_options(qwfn-logits PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-refdump tools/qwfn_refdump.cpp)
 target_include_directories(qwfn-refdump PRIVATE "${LLAMA_CPP_ROOT}/include" "${LLAMA_CPP_ROOT}/ggml/include")
@@ -89,13 +103,13 @@ target_compile_options(qwfn-refdump PRIVATE -O2)
 
 add_executable(qwfn-run tools/qwfn_run.cpp)
 target_link_libraries(qwfn-run PRIVATE qwfn_core)
-target_compile_options(qwfn-run PRIVATE -O3 -march=native)
+target_compile_options(qwfn-run PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 # qwfn_vocab.cpp is deliberately NOT in qwfn_core: only this binary should
 # carry a libllama dependency.
 add_executable(qwfn-vtest tools/qwfn_vtest.cpp)
 target_link_libraries(qwfn-vtest PRIVATE qwfn_core)
-target_compile_options(qwfn-vtest PRIVATE -O3 -march=native)
+target_compile_options(qwfn-vtest PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 # cpp-httplib 0.54 is split header/source, so its .cpp joins the target.
 add_executable(qwfn-server tools/qwfn_server.cpp src/qwfn_vocab.cpp
@@ -110,7 +124,7 @@ target_compile_options(qwfn-server PRIVATE -O2)
 add_executable(qwfn-chat tools/qwfn_chat.cpp src/qwfn_vocab.cpp)
 target_include_directories(qwfn-chat PRIVATE "${LLAMA_CPP_ROOT}/include")
 target_link_libraries(qwfn-chat PRIVATE qwfn_core llama_ref)
-target_compile_options(qwfn-chat PRIVATE -O3 -march=native)
+target_compile_options(qwfn-chat PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-tok tools/qwfn_tok.cpp src/qwfn_vocab.cpp)
 target_include_directories(qwfn-tok PRIVATE "${LLAMA_CPP_ROOT}/include")
@@ -119,9 +133,9 @@ target_compile_options(qwfn-tok PRIVATE -O2)
 
 add_executable(qwfn-gen tools/qwfn_gen.cpp)
 target_link_libraries(qwfn-gen PRIVATE qwfn_core)
-target_compile_options(qwfn-gen PRIVATE -O3 -march=native)
+target_compile_options(qwfn-gen PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-train-predictor tools/qwfn_train_predictor.cpp)
 target_link_libraries(qwfn-train-predictor PRIVATE qwfn_core)
-target_compile_options(qwfn-train-predictor PRIVATE -O3 -march=native)
+target_compile_options(qwfn-train-predictor PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 target_compile_definitions(qwfn-train-predictor PRIVATE LLAMA_CPP_BUILD_DIR="${LLAMA_CPP_BUILD}")

@@ -39,3 +39,7 @@ venv/
 # Agent scratch
 .claude/
 bench/
+
+# Release bundles (scripts/package.sh)
+dist/
+build-portable.cmake.log

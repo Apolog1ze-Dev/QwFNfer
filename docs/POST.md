@@ -7,7 +7,7 @@ Images: `docs/img/results.png` (the numbers and the how), `docs/img/console-serv
 
 ## Hugging Face community post (long form)
 
-**Running Qwen3.8-Flash-Next UD-Q4_K_XL (111 GB, 56B MoE, 512 experts) with 160K context on a single 16 GB GPU — a purpose-built engine, not a llama.cpp fork**
+**Running Qwen3.8-Flash-Next UD-Q4_K_XL (125B, 111 GB, 512 experts) with 160K context on a single 16 GB GPU — a purpose-built engine, not a llama.cpp fork**
 
 Qwen3.8-Flash-Next is the Qwen4-architecture preview: 48 layers, 512 routed experts (top-10
 plus one shared), gated DeltaNet on 36 layers and sparse attention with an indexer on 12,
@@ -108,7 +108,7 @@ model ships separately is the obvious next lever).
 ## LinkedIn post (short form)
 
 I built a small inference engine that runs Qwen3.8-Flash-Next at UD-Q4_K_XL — a 111 GB
-checkpoint of a 56B-parameter MoE with 512 experts — on one 16 GB GPU with 30 GB of RAM,
+checkpoint of a 125B-parameter MoE with 512 experts — on one 16 GB GPU with 30 GB of RAM,
 with 160K tokens of context in use: 12 tok/s in chat, 9 tok/s answering questions about a
 155K-token document it just read at 228 tok/s (the lighter Q3 file: 17 and 14.5).
 
