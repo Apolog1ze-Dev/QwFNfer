@@ -7,7 +7,7 @@
 | <a href="#getting-started"><b>Getting Started</b></a> | <a href="#results"><b>Results</b></a> | <a href="#how-it-works"><b>How it works</b></a> | <a href="#built-around-the-qwen4-architecture"><b>Qwen4</b></a> | <a href="https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF"><b>Model (Unsloth GGUF)</b></a> |
 </p>
 
-Run a frontier-size open-weight MoE on the gaming PC you already own, at interactive speed: 10–11 tok/s in chat, 10 tok/s answering questions about a 155K-token document it read at 240 tok/s — with the desktop still usable next to it.
+Run a **125B** open-weight MoE on the gaming PC you already own, at interactive speed: **10–11 tok/s** in chat, 10 tok/s answering questions about a 155K-token document it read at 240 tok/s — with the desktop still usable next to it.
 
 ## About
 
@@ -98,7 +98,7 @@ Per decoded token the model touches about 1.1 GB of expert weights (48 layers ×
 Qwen3.8-Flash-Next ships the Qwen4-generation design, `qwen4exp` in the GGUF, and the engine is shaped by what that checkpoint actually contains rather than by its parameter count:
 
 - **48 layers, 36 Gated DeltaNet + 12 sparse attention** (every fourth layer), a residual of 4 hyper-connected streams, 512 routed experts with top-10 routing plus one shared expert, a lightning indexer (4 × 128, top-2048) with 4-way pooled keys, and a 51B-parameter per-layer n-gram embedding table (PLE) — 28.8 GB on its own.
-- **Placement follows the shape.** The dense core (about 5 GB) is resident in VRAM. The routed experts are the only weights that need bandwidth, so they get the three-tier cache. The PLE table stays on the NVMe: a token reads 16 rows of 90 bytes from it (181 µs), so the largest tensor in the file costs no RAM at all — a decision you can only make by reading the architecture.
+- **Placement follows the shape.** The dense core (about 5 GB) is resident in VRAM. The routed experts are the only weights that need bandwidth, so they get the three-tier cache. The PLE table stays on the NVMe: a token reads 16 rows of 90 bytes from it (181 µs), so the largest tensor in the file costs no RAM at all.
 - **The hybrid layer mix is what makes decode flat.** DeltaNet layers carry a fixed recurrent state and no KV, so their decode graphs reference nothing that changes with position and replay as CUDA graphs; the 12 attention layers select over pooled block keys, so their cost does not grow with context up to the trained 262K.
 - **The MoE's routing skew is what makes a small GPU enough.** With 512 fine-grained experts and 10 active, routing is far from uniform, so a VRAM tier of ~1,650–2,400 experts serves 57–68% of lookups at 160K context (~3,700 serve 86% at short context), and the next layer's routing can be computed a layer early by running its block on the residual stream and prefetched while the current layer runs.
 - **The model card is followed** for the thinking template, the tool-call format, mrope for images and the sampling presets; the forward pass is checked node by node against llama.cpp's `qwen4exp`, which matters because this architecture is unusually sensitive to accumulation order.
