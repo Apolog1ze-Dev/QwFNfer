@@ -769,6 +769,45 @@ void graph_builder::mtp_head_pre(ggml_tensor * h, ggml_tensor * emb, ggml_tensor
     *res_out = res; *cur_out = cur; *inject_out = inject;
 }
 
+void graph_builder::mtp_head_kv(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos, const int sections[4], int il) {
+    const int64_t hc = hp_->hc_count, n_embd = hp_->n_embd, hc_dim = hc * n_embd;
+    const int64_t T  = emb->ne[1];
+    ggml_tensor * hnorm = Wl(il, "nextn.hnorm.weight");
+    ggml_tensor * hn;
+    if (hnorm->ne[0] == n_embd && hnorm->ne[1] == hc) {
+        hn = ggml_mul(ctx0, ggml_rms_norm(ctx0, h, hp_->rms_eps), hnorm);
+    } else {
+        hn = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, hp_->rms_eps), hc_dim, T);
+        hn = ggml_reshape_3d(ctx0, ggml_mul(ctx0, hn, hnorm), n_embd, hc, T);
+    }
+    ggml_tensor * en = rms(emb, Wl(il, "nextn.enorm.weight"));
+    en = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, en, n_embd, 1, T), n_embd, hc, T, 1);
+    ggml_tensor * cat = ggml_concat(ctx0, en, hn, 0);
+    ggml_tensor * res = ggml_mul_mat(ctx0, Wl(il, "nextn.eh_proj.weight"), ggml_reshape_2d(ctx0, cat, 2 * n_embd, hc * T));
+    res = ggml_reshape_3d(ctx0, res, n_embd, hc, T);
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = hc_mix(res, il, /*ffn=*/false, &inject);
+    // The same K/V path as sparse_attn, same ops in the same order.
+    const int64_t hd = hp_->n_embd_head_k, nh_kv = hp_->n_head_kv, kv_dim = hd * nh_kv;
+    int secs[4] = { sections[0], sections[1], sections[2], sections[3] };
+    ggml_tensor * K = ggml_mul_mat(ctx0, Wl(il, "attn_k.weight"), cur);
+    K = ggml_reshape_3d(ctx0, K, hd, nh_kv, T);
+    K = rms(K, Wl(il, "attn_k_norm.weight"));
+    ggml_tensor * V = ggml_mul_mat(ctx0, Wl(il, "attn_v.weight"), cur);
+    V = ggml_reshape_3d(ctx0, V, hd, nh_kv, T);
+    K = ggml_rope_multi(ctx0, K, inp_pos, nullptr, hp_->rope_dim, secs,
+                        GGML_ROPE_TYPE_IMROPE, hp_->n_ctx_train, hp_->rope_freq_base,
+                        1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    ggml_tensor * kc = st_->k_cache(il);
+    ggml_tensor * vc = st_->v_cache(il);
+    ggml_build_forward_expand(gf_, ggml_cpy(ctx0,
+            ggml_reshape_2d(ctx0, K, kv_dim, T),
+            ggml_view_2d(ctx0, kc, kv_dim, T, ggml_row_size(kc->type, kv_dim), ggml_row_size(kc->type, kv_dim) * n_past_)));
+    ggml_build_forward_expand(gf_, ggml_cpy(ctx0,
+            ggml_reshape_2d(ctx0, V, kv_dim, T),
+            ggml_view_2d(ctx0, vc, kv_dim, T, ggml_row_size(vc->type, kv_dim), ggml_row_size(vc->type, kv_dim) * n_past_)));
+}
+
 ggml_tensor * graph_builder::moe_resident(ggml_tensor * x, ggml_tensor * ids, ggml_tensor * w, int il, const weights * src) {
     const int64_t n_embd = x->ne[0], T = x->ne[1], U = ids->ne[0];
     const std::string b = "blk." + std::to_string(il) + ".";

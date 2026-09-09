@@ -186,8 +186,9 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         if (lend && want < lend + (1ull << 20)) want = lend + (1ull << 20);
         // Back off rather than fail: the tier is an optimisation, and asking
         // for more than the device has left should cost throughput, not the run.
-        // Step down in 8% increments, not quarters: coarse steps threw away up
-        // to a quarter of the device memory that was actually free, and every
+        // Step down in 4% increments, not quarters: coarse steps threw away up
+        // to a quarter of the device memory that was actually free, and 8% steps
+        // still turned a 0.4 GB draft head into a 0.73 GB loss of tier; every
         // 2.18 MB block that fits is an expert that computes 3.2x faster.
         // Probe once with the reservation included, then release it, so the
         // back-off converges on a size that still leaves room for the graphs.
@@ -199,7 +200,7 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                !(fit = ggml_backend_buft_alloc_buffer(cfg.vram_buft, want + cfg.vram_reserve))) {
             want = 1ull << 20;
             for (uint32_t il = 0; il < n_layer; il++) {
-                gslots[il] = (uint32_t) std::max<size_t>(1, (size_t) (gslots[il] * 0.92));
+                gslots[il] = (uint32_t) std::max<size_t>(1, (size_t) (gslots[il] * 0.96));
                 want += (size_t) gslots[il] * nat[il] + TIER_PAD;
             }
             if (lend && want < lend + (1ull << 20)) want = lend + (1ull << 20);
@@ -507,17 +508,17 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
                                expert_handle * out, bool * ready) {
     if (layer >= blk_.size()) return false;
     const auto t_enter = std::chrono::steady_clock::now();
-    // Only the speculative reads this token needs must have landed: this
-    // layer's entries for experts in the request. The rest of this layer's
-    // predictions (the ranks past the routed set) and every later layer's keep
-    // flying and go valid when they land, so a deeper prediction costs
-    // bandwidth, not wait. In-flight slots are never chosen as victims.
-    prefetch_settle_for(layer, expert_ids, n);
+    // Nothing is waited for here. A speculative read for one of these experts
+    // that has not landed yet is reported as not ready and settled in
+    // fetch_end(), after the demand reads have been submitted, so the caller
+    // can compute the experts it already has while both kinds of read land.
+    // In-flight slots are never chosen as victims.
     layer_pool & lp = blk_[layer];
     tick_++;
     fetch_epoch_ = tick_;
     fetch_count_++;
     live_.clear();
+    pending_.clear();
     // Mark every VRAM-resident expert of this token as in use BEFORE any
     // promotion runs: a promotion picks a recency victim, and an expert later
     // in this same list still carried last token's tick, so it could be
@@ -566,6 +567,21 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
             }
         }
 
+        // Claimed by a speculative read that has not landed: a hit, waited for in fetch_end.
+        {
+            const int32_t cs = lp.expert_slot[e];
+            if (cs >= 0 && lp.slot_expert[cs] == (uint16_t) e && !lp.slot_valid[cs] && !lp.slot_cold[cs]) {
+                st_.hits++;
+                lp.slot_freq[cs]++;
+                lp.slot_used[cs] = ++tick_;
+                if (lp.slot_speculative[cs]) { st_.pf_used++; lp.slot_speculative[cs] = 0; }
+                live_.push_back(cs);
+                fill_handle(lp, (uint32_t) cs, out[i]);
+                ready[i] = false;
+                pending_.push_back(pending_spec{ e, cs });
+                continue;
+            }
+        }
         const int32_t s = find_slot(lp, e);
 
         // A resident block that came from the cold checkpoint is upgraded the
@@ -702,7 +718,50 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
     return true;
 }
 
+bool expert_cache::read_block_now(layer_pool & lp, uint32_t layer, int32_t slot, uint32_t expert) {
+    io_request reqs[EXPERT_NPARTS];
+    uint8_t * base = slot_ptr(lp, (uint32_t) slot);
+    for (int q = 0; q < EXPERT_NPARTS; q++) {
+        const byte_range br = hot_->expert_range(layer, expert, (expert_part) q);
+        if (!br.valid()) return false;
+        reqs[q] = io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 };
+        st_.bytes_from_disk += br.nbytes;
+    }
+    size_t submitted = 0; uint64_t tags[16]; size_t reaped = 0;
+    while (submitted < EXPERT_NPARTS) {
+        const size_t k = io_hot_.submit(reqs + submitted, EXPERT_NPARTS - submitted);
+        if (k == 0) { const size_t got = io_hot_.reap(tags, 16, 1); if (got == 0) return false; reaped += got; continue; }
+        submitted += k;
+    }
+    while (reaped < EXPERT_NPARTS) { const size_t got = io_hot_.reap(tags, 16, EXPERT_NPARTS - reaped); if (got == 0) return false; reaped += got; }
+    st_.n_reads += EXPERT_NPARTS;
+    lp.slot_valid[slot] = 1;
+    return true;
+}
+
+bool expert_cache::settle_pending(const uint32_t * expert_ids, uint32_t n, bool * ready) {
+    if (pending_.empty()) return true;
+    const auto tw = std::chrono::steady_clock::now();
+    layer_pool & lp = blk_[inflight_layer_];
+    std::vector<uint32_t> ids; ids.reserve(pending_.size());
+    for (const pending_spec & p : pending_) ids.push_back(p.expert);
+    wait_state_ = 2;
+    prefetch_settle_for(inflight_layer_, ids.data(), (uint32_t) ids.size());
+    wait_state_ = 0;
+    for (const pending_spec & p : pending_) {
+        // The speculative engine lost track of this read (its count drifted and
+        // was reset): fetch the block now rather than compute on stale bytes.
+        if (lp.slot_expert[p.slot] != (uint16_t) p.expert) return false;
+        if (!lp.slot_valid[p.slot] && !read_block_now(lp, inflight_layer_, p.slot, p.expert)) return false;
+        if (ready) for (uint32_t i = 0; i < n; i++) if (expert_ids[i] == p.expert) ready[i] = true;
+    }
+    pending_.clear();
+    st_.t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+    return true;
+}
+
 bool expert_cache::fetch_end() {
+    if (!settle_pending(nullptr, 0, nullptr)) return false;
     if (inflight_reqs_ == 0 && inflight_cold_reqs_ == 0) return true;
     const auto tw = std::chrono::steady_clock::now();
 

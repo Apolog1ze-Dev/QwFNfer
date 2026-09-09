@@ -225,6 +225,11 @@ public:
                       const int sections[4], int il, ggml_tensor ** res_out, ggml_tensor ** cur_out,
                       ggml_tensor ** inject_out, ggml_tensor ** sel_out, ggml_tensor ** w_out, ggml_tensor ** sh_out);
     ggml_tensor * mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il);
+    // The head's KV rows for n prompt positions and nothing else: eh_proj, the
+    // attention mixer and the K/V projections, written into the head's cache at
+    // n_past. No mask, no attention output, no MoE, no LM head -- what a streamed
+    // prefill needs so the head can draft after it.
+    void mtp_head_kv(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos, const int sections[4], int il);
     // The head's routed experts as three resident [.., .., n_expert] tensors
     // (host or device), applied to x [n_embd, T] with ids [U, T] and weights
     // [1, U, T]: the trunk's summation order.

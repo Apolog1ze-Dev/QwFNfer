@@ -110,6 +110,59 @@ struct sampler {
     std::mt19937 rng{0xC0FFEEu};
     std::vector<int32_t> gen;   // tokens generated so far, for the penalties
 
+    // The distribution pick() samples from -- penalties, top-k, temperature,
+    // min-p, top-p -- as (token, probability) over the kept candidates. Empty
+    // at temperature 0 (greedy: pick() takes the argmax).
+    std::vector<std::pair<int32_t, float>> dist(const float * lg_in, int64_t n) {
+        std::vector<std::pair<int32_t, float>> out;
+        if (cfg.temp <= 0.0f) return out;
+        std::vector<float> pen;
+        const float * lg = lg_in;
+        const bool penalise = cfg.repeat_last_n != 0 && !gen.empty() &&
+            (cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f || cfg.repeat_penalty != 1.0f);
+        if (penalise) {
+            pen.assign(lg_in, lg_in + n);
+            const size_t from = cfg.repeat_last_n > 0 && gen.size() > (size_t) cfg.repeat_last_n ? gen.size() - cfg.repeat_last_n : 0;
+            std::unordered_map<int32_t, int> cnt;
+            for (size_t i = from; i < gen.size(); i++) cnt[gen[i]]++;
+            for (const auto & [t, c] : cnt) {
+                if (t < 0 || t >= n) continue;
+                float & v = pen[t];
+                if (cfg.repeat_penalty != 1.0f) v = v > 0 ? v / cfg.repeat_penalty : v * cfg.repeat_penalty;
+                v -= cfg.presence_penalty + cfg.frequency_penalty * c;
+            }
+            lg = pen.data();
+        }
+        const int k = (int) std::min<int64_t>(cfg.top_k > 0 ? cfg.top_k : n, n);
+        std::vector<int> idx(n);
+        for (int64_t v = 0; v < n; v++) idx[v] = (int) v;
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        idx.resize(k);
+        const float mx = lg[idx[0]];
+        std::vector<float> p(k);
+        double sum = 0;
+        for (int i = 0; i < k; i++) { p[i] = std::exp((lg[idx[i]] - mx) / cfg.temp); sum += p[i]; }
+        for (int i = 0; i < k; i++) p[i] = (float) (p[i] / sum);
+        int keep = k;
+        if (cfg.min_p > 0.0f) { const float floor_ = cfg.min_p * p[0]; keep = 1; while (keep < k && p[keep] >= floor_) keep++; }
+        double cum = 0; int keep_p = keep;
+        for (int i = 0; i < keep; i++) { cum += p[i]; if (cum >= cfg.top_p) { keep_p = i + 1; break; } }
+        keep = keep_p;
+        out.reserve(keep);
+        for (int i = 0; i < keep; i++) out.emplace_back(idx[i], (float) (p[i] / cum));
+        return out;
+    }
+    int32_t sample(const std::vector<std::pair<int32_t, float>> & d) {
+        std::uniform_real_distribution<double> U(0.0, 1.0);
+        double r = U(rng), acc = 0;
+        for (const auto & [t, p] : d) { acc += p; if (r <= acc) return t; }
+        return d.empty() ? 0 : d.back().first;
+    }
+    static float prob_of(const std::vector<std::pair<int32_t, float>> & d, int32_t t) {
+        for (const auto & [x, p] : d) if (x == t) return p;
+        return 0.0f;
+    }
+
     int pick(const float * lg_in, int64_t n) {
         std::vector<float> pen;
         const float * lg = lg_in;
@@ -701,6 +754,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", S.eng.memory_summary().c_str());
+    S.eng.set_mtp_logits(true);   // the draft is sampled from the head's distribution at temperature
     if (!mmproj_path.empty()) {
         if (!S.vis.load(mmproj_path, S.eng.backend(), S.eng.buft(), err)) {
             fprintf(stderr, "vision: %s\n", err.c_str()); return 1;
@@ -995,14 +1049,45 @@ int main(int argc, char ** argv) {
             if ((int32_t) hist.size() + 1 > (int32_t) S.n_ctx) { R.finish = "length"; n++; break; }
             if (on_tick) on_tick();
             if (tok_in) { tok = tok_next; tok_in = false; continue; }   // already evaluated with its predecessor
-            const int32_t draft = S.eng.mtp_draft_id();
+            // The draft: the head's argmax when sampling is greedy; at temperature,
+            // a sample from the head's own distribution under the request's
+            // sampler (speculative sampling: accept with probability
+            // min(1, p(d)/q(d)), on rejection draw from the residual p - q, so
+            // every emitted token is distributed exactly as the trunk's p).
+            // Sampling the draft rather than taking its argmax is what keeps the
+            // acceptance near the greedy rate when the trunk itself is sampled.
+            static const bool argmax_draft = getenv("QWFN_MTP_ARGMAX_DRAFT") != nullptr;   // the old rule, for A/B
+            int32_t draft = S.eng.mtp_draft_id();
+            float q_d = 1.0f;
+            const float * hl = S.eng.mtp_logits();
+            if (draft >= 0 && hl && smp.cfg.temp > 0.0f && !argmax_draft) {
+                const auto qd = smp.dist(hl, S.eng.n_vocab());
+                if (!qd.empty()) { draft = smp.sample(qd); q_d = sampler::prob_of(qd, draft); }
+            }
             if (draft >= 0 && !S.vb.is_eog(draft) && n + 1 < budget && (int32_t) hist.size() + 2 <= (int32_t) S.n_ctx) {
                 hist.push_back(draft);
                 if (!S.eng.eval_decode(hist.data(), (int32_t) hist.size(), 2, e)) return false;
                 const float * l0 = S.eng.logits_pos(0), * l1 = S.eng.logits_pos(1);
-                const int32_t y = smp.pick(l0, S.eng.n_vocab());
                 R.n_pairs++;
-                if (y == draft) {
+                bool accept; int32_t y = -1;
+                if (smp.cfg.temp <= 0.0f || argmax_draft || q_d >= 1.0f) {
+                    y = smp.pick(l0, S.eng.n_vocab());
+                    accept = y == draft;
+                } else {
+                    const auto pd = smp.dist(l0, S.eng.n_vocab());
+                    const float p_d = sampler::prob_of(pd, draft);
+                    std::uniform_real_distribution<double> U(0.0, 1.0);
+                    accept = p_d >= q_d || U(smp.rng) < (double) p_d / (double) q_d;
+                    if (!accept) {
+                        // The residual max(0, p - q), normalised, over p's candidates.
+                        const auto qd = smp.dist(hl, S.eng.n_vocab());
+                        std::vector<std::pair<int32_t, float>> res; double sum = 0;
+                        for (const auto & [t, p] : pd) { const float r = p - sampler::prob_of(qd, t); if (r > 0) { res.emplace_back(t, r); sum += r; } }
+                        if (res.empty() || sum <= 0) y = smp.sample(pd);
+                        else { for (auto & [t, r] : res) r = (float) (r / sum); y = smp.sample(res); }
+                    }
+                }
+                if (accept) {
                     R.n_accepted++;
                     smp.gen.push_back(draft);
                     tok_next = smp.pick(l1, S.eng.n_vocab());

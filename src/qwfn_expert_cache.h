@@ -148,15 +148,18 @@ public:
     bool fetch(uint32_t layer, const uint32_t * expert_ids, uint32_t n, expert_handle * out);
 
     // Split form. fetch_begin() fills every handle and submits reads for the
-    // misses without waiting; `ready[i]` says whether expert i's weights are
-    // already valid. The caller computes the ready ones -- typically ~80% of the
-    // selection -- while the NVMe fills the rest, then calls fetch_end().
-    //
-    // The MoE output is a sum over experts, so computing it in two passes and
-    // adding the partials is exact.
+    // misses without waiting for anything: `ready[i]` says whether expert i's
+    // weights are valid now. An expert whose speculative read is still in
+    // flight comes back with ready = false and no new read; fetch_end() waits
+    // for those and for the demand reads. The caller computes the ready ones
+    // while every read lands -- the engine keeps that exact by summing every
+    // CPU expert once, in selection order, after both passes.
     bool fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint32_t n,
                      expert_handle * out, bool * ready);
     bool fetch_end();
+    // Wait only for the in-flight speculative reads the last fetch_begin found,
+    // flipping their `ready` flags; the demand reads stay in flight.
+    bool settle_pending(const uint32_t * expert_ids, uint32_t n, bool * ready);
 
     // --- speculative prefetch -------------------------------------------
     // Issue reads for one or more layers' *predicted* selections without
@@ -195,8 +198,9 @@ public:
     // Pin a precomputed hot set (from qwfn-profile) so it is never evicted.
     void pin(const std::vector<uint32_t> & packed_keys);
 
-    // Reads submitted by the last fetch_begin() and not yet waited for.
-    bool has_inflight() const { return inflight_reqs_ > 0 || inflight_cold_reqs_ > 0; }
+    // Reads submitted by the last fetch_begin() and not yet waited for, or
+    // speculative reads it found still in flight.
+    bool has_inflight() const { return inflight_reqs_ > 0 || inflight_cold_reqs_ > 0 || !pending_.empty(); }
     // What the cache is blocked on right now, for a stall watchdog: 0 nothing,
     // 1 demand reads (fetch_end), 2 speculative reads (settle). Racy by design.
     int    wait_state() const { return wait_state_; }
@@ -336,6 +340,11 @@ private:
     std::vector<int32_t> inflight_slots_;
     std::vector<uint32_t> inflight_experts_;
     size_t               inflight_cold_reqs_ = 0;   // of those, reads from the cold checkpoint (its own engine)
+    // Experts of the fetch in progress whose speculative read had not landed at
+    // fetch_begin: valid after fetch_end (or settle_pending).
+    struct pending_spec { uint32_t expert; int32_t slot; };
+    std::vector<pending_spec> pending_;
+    bool read_block_now(layer_pool & lp, uint32_t layer, int32_t slot, uint32_t expert);   // a blocking full-precision read into a claimed slot
     volatile int         wait_state_ = 0;
 
     // Outstanding speculative reads, one entry per claimed block. The io tag is

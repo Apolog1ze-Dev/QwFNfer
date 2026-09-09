@@ -210,6 +210,10 @@ public:
     // the last position's draft. mtp_ready() says whether the head can draft.
     bool    mtp_step(const int32_t * next_toks, int n, std::string & err);
     int32_t mtp_draft_id() const { return mtp_draft_; }
+    // The head's logits at the draft position, read back only when asked for
+    // (the server samples the draft from them at temperature); nullptr otherwise.
+    void          set_mtp_logits(bool on) { mtp_want_logits_ = on; }
+    const float * mtp_logits() const { return mtp_have_logits_ ? mtp_logits_.data() : nullptr; }
     bool    mtp_ready() const { return mtp_on_ && mtp_have_h_ && mtp_kv_valid_; }
     bool    mtp_loaded() const { return mtp_on_; }     // the head is resident (not with --skip-miss)
 
@@ -495,8 +499,11 @@ private:
     bool          mtp_on_ = false, mtp_have_h_ = false, mtp_kv_valid_ = true;
     ggml_tensor * t_hlast_ = nullptr;         // F32 [n_embd, hc, Bd]: the wide residual after the last layer, per position of the last eval
     ggml_tensor * t_mtp_pos_ = nullptr;       // I32 [4*Bd]: the draft's positions
+    ggml_tensor * t_mtp_mask_ = nullptr;      // F16 [2*(n_ctx+2)]: the two-row causal mask of a two-position draft, viewed [n_kv, 2]
     int64_t       mtp_h_rows_ = 0;            // rows of t_hlast_ the last eval filled
     int32_t       mtp_draft_ = -1, mtp_draft_top_[3] = { -1, -1, -1 };
+    bool          mtp_want_logits_ = false, mtp_have_logits_ = false;
+    std::vector<float> mtp_logits_;
     // Run the head for n positions starting at `pos`, reading rows h_row.. of
     // t_hlast_ and e_row.. of t_emb_; `actual` (may be null) are the tokens at
     // positions pos+2.. for scoring, n_actual of them.
@@ -505,6 +512,7 @@ private:
     ggml_tensor * inp_tok_ = nullptr, * inp_pos_ = nullptr, * inp_ple_ = nullptr;
     // persistent, host side
     ggml_tensor * h_cur_ = nullptr, * h_partial_ = nullptr, * h_ple_ = nullptr, * h_ple_idx_ = nullptr;
+    ggml_tensor * h_wd_ = nullptr;   // F32 [n_embd, 2U, 2]: every CPU expert's weighted output row of a decode step, summed once in selection order
 
     int32_t  n_past_  = 0;
     int64_t  n_vocab_ = 0;
