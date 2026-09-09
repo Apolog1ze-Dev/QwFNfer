@@ -15,6 +15,8 @@
 #                                    default when mmproj-*.gguf sits next to the model)
 #   scripts/serve.sh 2 --port 8081   pick #2 without asking (the number must come first);
 #                                    other flags pass through, e.g. --reserve 1024 on a desktop GPU
+#                                    or --state-host idx|kv,idx (attention caches in pinned RAM, their VRAM
+#                                    to the expert tier; the console picks this per context)
 #
 # Optimal flags (measured on the reference machine, 16 GB GPU + 30 GB RAM):
 # --ram 12 --ctx 163840 --batch 4096 --kv q4_0. Change them with

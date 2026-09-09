@@ -119,9 +119,10 @@ ggml_tensor * vision_encoder::get(const std::string & name) const {
 }
 
 bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
-                          ggml_backend_buffer_type_t buft, std::string & err) {
+                          ggml_backend_buffer_type_t buft, std::string & err, bool host_weights) {
     backend_ = backend;
     buft_    = buft;
+    stage_   = false;
 
     // no_alloc: read metadata first, then place the tensors on the backend and
     // stream the data in. Loading into host memory first would cost 0.9 GB.
@@ -180,7 +181,16 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
         ggml_set_name(dst, name);
     }
 
-    buf_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft_);
+    // The weights' home: the device, or pinned host memory when they are to be
+    // staged per image (host_weights). On a CPU backend the two are the same
+    // and nothing is staged.
+    ggml_backend_buffer_type_t wbuft = buft_;
+    if (host_weights) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft_);
+        ggml_backend_buffer_type_t h = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (h && h != buft_) { wbuft = h; stage_ = true; }
+    }
+    buf_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, wbuft);
     if (!buf_) { err = "failed to allocate mmproj weights"; gguf_free(gc); ggml_free(meta); return false; }
 
     FILE * f = fopen(path.c_str(), "rb");
@@ -244,9 +254,51 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
         use_fa_ = ggml_backend_supports_op(backend_, o);
         ggml_free(pc);
     }
-    fprintf(stderr, "[qwfn] vision: %u blocks, n_embd %u, patch %u, merge %u -> %u, attention: %s\n",
-            hp_.n_layer, hp_.n_embd, hp_.patch, hp_.merge, hp_.proj_dim, use_fa_ ? "flash" : "materialised scores");
+    fprintf(stderr, "[qwfn] vision: %u blocks, n_embd %u, patch %u, merge %u -> %u, attention: %s, weights %s\n",
+            hp_.n_layer, hp_.n_embd, hp_.patch, hp_.merge, hp_.proj_dim, use_fa_ ? "flash" : "materialised scores",
+            stage_ ? "in host memory, staged per image" : "on the device");
     return true;
+}
+
+// ---- staging: weights host -> device for one encode -------------------------
+
+bool vision_encoder::stage_in(std::string & err) {
+    if (!stage_ || dbuf_) return true;
+    const size_t align = ggml_backend_buft_get_alignment(buft_);
+    auto padded = [&](size_t n) { return (n + align - 1) / align * align; };
+    size_t total = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) total += padded(ggml_nbytes(t));
+    dbuf_ = ggml_backend_buft_alloc_buffer(buft_, total);
+    if (!dbuf_) {
+        err = "not enough free VRAM to stage the vision projector (" + std::to_string(total >> 20) + " MB)";
+        return false;
+    }
+    ggml_backend_buffer_set_usage(dbuf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    char * base = (char *) ggml_backend_buffer_get_base(dbuf_);
+    size_t off = 0;
+    saved_.clear();
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) {
+        const size_t nb = ggml_nbytes(t);
+        void * host = t->data;
+        saved_.emplace_back(t->data, t->buffer);
+        t->buffer = dbuf_;
+        t->data   = base + off;
+        ggml_backend_tensor_set(t, host, 0, nb);   // a DMA from pinned memory
+        off += padded(nb);
+    }
+    return true;
+}
+
+void vision_encoder::stage_out() {
+    if (!dbuf_) return;
+    size_t i = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t), i++) {
+        t->data = saved_[i].first; t->buffer = saved_[i].second;
+    }
+    ggml_backend_buffer_free(dbuf_); dbuf_ = nullptr;
+    // The activation arena was carved from the same borrowed VRAM: return it too,
+    // or the tier cannot take its dynamic buffer back after the prefill.
+    if (galloc_) { ggml_gallocr_free(galloc_); galloc_ = ggml_gallocr_new(buft_); }
 }
 
 // ---- encode -----------------------------------------------------------------
@@ -254,6 +306,9 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
 bool vision_encoder::encode(const image_u8 & img, std::vector<float> & out,
                             int & n_out, int & grid_w, int & grid_h, std::string & err) {
     if (!ctx_) { err = "vision encoder not loaded"; return false; }
+    // Weights onto the device for the duration of this encode (no-op when they live there).
+    if (!stage_in(err)) return false;
+    struct unstage { vision_encoder * v; ~unstage() { v->stage_out(); } } unstage_guard{this};
 
     const int patch_area = (int) (hp_.patch * hp_.patch * hp_.merge * hp_.merge);
     int W = 0, H = 0;

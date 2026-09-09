@@ -44,6 +44,12 @@ int main(int argc, char ** argv) {
         if (a == "--cpu")    { cfg.use_gpu = false; continue; }
         if (a == "--io-threads" && i + 1 < argc) { cfg.io_threads = true; cfg.io_workers = (unsigned) atoi(next()); continue; }
         if (a == "--io-uring") { cfg.io_threads = false; continue; }
+        if (a == "--state-host" && i + 1 < argc) {   // none | idx | kv | kv,idx
+            std::string v = next();
+            cfg.idx_host = v.find("idx") != std::string::npos;
+            cfg.kv_host  = v.find("kv")  != std::string::npos;
+            continue;
+        }
         if (a == "--kv" && i + 1 < argc) { std::string v = next();
             cfg.type_k = cfg.type_v = (v == "q8_0") ? GGML_TYPE_Q8_0 :
                                       (v == "q4_0") ? GGML_TYPE_Q4_0 : GGML_TYPE_F16; continue; }

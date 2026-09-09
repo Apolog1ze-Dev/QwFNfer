@@ -53,8 +53,14 @@ public:
     vision_encoder(const vision_encoder &) = delete;
     vision_encoder & operator=(const vision_encoder &) = delete;
 
+    // host_weights: keep the 0.9 GB of weights in (pinned) host memory and stage
+    // them onto the device only while an image is encoded, so the projector
+    // costs no VRAM at decode. The upload is ~40 ms per image; reading them
+    // over PCIe in place instead measured 0.40 -> 2.3 s per screenshot, so the
+    // staging is not optional. The caller makes room first (engine::vram_lend_begin).
     bool load(const std::string & mmproj_path, ggml_backend_t backend,
-              ggml_backend_buffer_type_t buft, std::string & err);
+              ggml_backend_buffer_type_t buft, std::string & err, bool host_weights = false);
+    bool weights_on_host() const { return stage_; }
 
     bool loaded() const { return ctx_ != nullptr; }
     const vision_hparams & hp() const { return hp_; }
@@ -81,6 +87,8 @@ private:
     };
 
     ggml_tensor * get(const std::string & name) const;
+    bool stage_in(std::string & err);           // weights host -> a temporary device buffer
+    void stage_out();                           // ... and back; frees the buffer and the arena
 
     vision_hparams hp_;
     ggml_context * ctx_ = nullptr;              // holds the tensor metadata
@@ -89,6 +97,9 @@ private:
     ggml_backend_buffer_type_t buft_ = nullptr;
     ggml_gallocr_t        galloc_ = nullptr;
     bool                  use_fa_ = false;      // flash attention supported by the backend at this head size
+    bool                  stage_ = false;       // weights live on the host; staged per encode
+    ggml_backend_buffer_t dbuf_ = nullptr;      // the staging buffer while an encode runs
+    std::vector<std::pair<void *, ggml_backend_buffer_t>> saved_;   // the host placement to restore
 
     std::vector<layer> layers_;
     ggml_tensor * pe0_ = nullptr, * pe1_ = nullptr, * patch_bias_ = nullptr;

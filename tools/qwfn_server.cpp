@@ -581,7 +581,10 @@ static bool render_content(server & S, const json & content, std::string & text,
             pending_img pi;
             int gw = 0, gh = 0;
             const auto t0 = clk::now();
-            if (!S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err)) return false;
+            // Room for the staged weights and the arena: the tier's dynamic buffer,
+            // which the prefill that follows would take anyway.
+            if (S.vis.weights_on_host()) S.eng.vram_lend_begin();
+            if (!S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err)) { S.eng.vram_lend_end(); return false; }
             fprintf(stderr, "[qwfn-server] image: %zu bytes, %dx%d px -> %dx%d grid, %d tokens, encoded in %.2f s\n",
                     raw.size(), img.nx, img.ny, gw, gh, pi.n_tok, since(t0));
             imgs.emplace_back(text.size(), std::move(pi));   // marker position in text
@@ -598,7 +601,10 @@ int main(int argc, char ** argv) {
           "\n"
           "      --host HOST     bind address (default 127.0.0.1)\n"
           "      --port N        port (default 8080)\n"
-          "      --mmproj PATH   vision projector gguf; enables image input\n"
+          "      --mmproj PATH   vision projector gguf; enables image input. Its weights stay in host memory and are\n"
+          "                      staged onto the GPU per image (~40 ms), so vision costs no VRAM at decode; --vision-vram keeps them resident\n"
+          "      --state-host V  attention state in pinned host memory: none (default) | idx | kv,idx. The VRAM it held goes to\n"
+          "                      the expert tier; costs ~0.35 ms/token (idx) or ~2 ms/token (kv,idx) of PCIe reads\n"
           "      --alias NAME    model id reported by /v1/models\n"
           "      --think LEVEL   default reasoning effort: xhigh|medium|low|off\n"
           "      --think-budget N  max reasoning tokens per answer (0 = unlimited); also POST /props {\"reasoning_budget\":N} or per request\n"
@@ -618,6 +624,7 @@ int main(int argc, char ** argv) {
     }
 
     std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
+    bool vision_vram = false;
     int def_reasoning_budget = 0;
     int port = 8080;
     engine_config cfg;
@@ -659,6 +666,13 @@ int main(int argc, char ** argv) {
         if (a == "--spec-gate-inflight" && i + 1 < argc) { cfg.spec_gate_inflight = (uint32_t) atoi(next()); continue; }
         if (a == "--spec-block") { cfg.spec_block = true; continue; }
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
+        if (a == "--state-host" && i + 1 < argc) {   // none | idx | kv | kv,idx
+            std::string v = next();
+            cfg.idx_host = v.find("idx") != std::string::npos;
+            cfg.kv_host  = v.find("kv")  != std::string::npos;
+            continue;
+        }
+        if (a == "--vision-vram") { vision_vram = true; continue; }   // keep the projector resident in VRAM (the old placement)
         if (a == "--mtp" && i + 1 < argc) { cfg.mtp_path = next(); cfg.rollback_snapshots = true; continue; }   // the nextn draft head: pairs verified by the trunk, exact
         if (a == "--kv" && i + 1 < argc) {
             std::string v = next();
@@ -682,7 +696,10 @@ int main(int argc, char ** argv) {
     // The vision projector is loaded onto the device AFTER the engine has sized
     // its expert tier from the free VRAM: reserve its size up front, or it comes
     // out of the decode reserve and the first CUDA graph instantiation fails.
-    if (!mmproj_path.empty()) {
+    // With the default placement the projector's weights live in host memory and
+    // are staged into the tier's lent buffer while an image is encoded, so
+    // nothing is reserved for them.
+    if (!mmproj_path.empty() && vision_vram) {
         struct stat sb{};
         const size_t mm = stat(mmproj_path.c_str(), &sb) == 0 ? (size_t) sb.st_size : (1024ull << 20);
         cfg.vram_reserve = (cfg.vram_reserve ? cfg.vram_reserve : (768ull << 20)) + mm + (128ull << 20);
@@ -694,7 +711,7 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "%s\n", S.eng.memory_summary().c_str());
     if (!mmproj_path.empty()) {
-        if (!S.vis.load(mmproj_path, S.eng.backend(), S.eng.buft(), err)) {
+        if (!S.vis.load(mmproj_path, S.eng.backend(), S.eng.buft(), err, /*host_weights=*/!vision_vram)) {
             fprintf(stderr, "vision: %s\n", err.c_str()); return 1;
         }
         const auto ip = S.vb.encode("<|image_pad|>", false, true);
@@ -1103,7 +1120,8 @@ int main(int argc, char ** argv) {
                 {"reasoning_budget", S.def_reasoning_budget},
                 {"thinking", S.preset_think.to_json()}, {"non_thinking", S.preset_nothink.to_json()}}},
             {"skip_miss", cfg.skip_miss}, {"spec_block", cfg.spec_block}, {"mtp", S.eng.mtp_loaded()}, {"model_file", S.model_file},
-            {"vision", S.vis.loaded()},
+            {"vision", S.vis.loaded()}, {"vision_weights", S.vis.loaded() ? (S.vis.weights_on_host() ? "host" : "vram") : "off"},
+            {"state_host", cfg.kv_host && cfg.idx_host ? "kv,idx" : cfg.kv_host ? "kv" : cfg.idx_host ? "idx" : "none"},
             {"total_slots", 1}};
     };
     svr.Get("/props", [&](const httplib::Request &, httplib::Response & res) {

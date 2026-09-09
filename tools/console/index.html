@@ -116,7 +116,8 @@
               <label><span class="lbl">Skip missed experts <span class="tip" data-tip="Compute a token without the experts that are still on the NVMe instead of waiting for them. Faster decode at a small, measured quality cost: the output is no longer exact. Cannot be combined with the draft head.">?</span></span><select id="skip_miss"><option value="false">off</option><option value="true">on</option></select></label>
               <label><span class="lbl">Speculative block <span class="tip" data-tip="Predict the next layer's experts by running that layer's own block on the current residual, and fetch them while the current layer computes. The output is exact; on by default because it was never measured slower.">?</span></span><select id="spec_block"><option value="true">on</option><option value="false">off</option></select></label>
               <label><span class="lbl">Draft head (MTP) <span class="tip" data-tip="The checkpoint's draft head (MTP/mtp-*.gguf): it proposes the token after next and the trunk verifies it, so the output stays the trunk's own. A small gain at short context, none at long; its experts take about 2.7 GB of host memory from the RAM tier. Needs the file in the model's repository.">?</span></span><select id="mtp"><option value="false">off</option><option value="true">on</option></select></label>
-              <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood; costs about 1 GB of VRAM from the expert tier. On by default whenever the file is next to the model; off gives a text-only server.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
+              <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood. Its 0.9 GB of weights stay in RAM and are uploaded to the GPU only while an image is encoded (about 40 ms per image), so vision costs no VRAM at decode. On by default whenever the file is next to the model; off gives a text-only server.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
+              <label><span class="lbl">Attention state in RAM <span class="tip" data-tip="Where the attention caches live. 'indexer cache' keeps the indexer keys (3 MB per 1K tokens of context) in pinned RAM, read over PCIe at about 0.35 ms per token; 'indexer + KV cache' also moves the KV cache (7 MB per 1K tokens at q4_0) at about 2 ms per token. The VRAM they free goes to the expert tier: about 4% of decode per GB at 128K, and the difference between an expert tier and none at 256K (measured 7.0 to 9.7 tok/s). The presets pick it per context: indexer from 64K, both from 128K (measured +5% decode at 126K) or whenever the tier would not fit otherwise.">?</span></span><select id="state_host"><option value="none">off (all in VRAM)</option><option value="idx">indexer cache</option><option value="kv,idx">indexer + KV cache</option></select></label>
             </form>
             <div class="est" id="est"></div>
             <table id="options"></table>
@@ -255,19 +256,21 @@ function renderPlan() {
   const o = currentOption(), m = models[selected];
   if (!reco || !m) { $('plan').textContent = ''; return; }
   const custom = presetId === 'custom' ? '<b>custom settings</b> · ' : '';
+  const sh = $('state_host').value, shName = sh === 'kv,idx' ? 'indexer + KV cache in RAM' : sh === 'idx' ? 'indexer cache in RAM' : 'attention state in VRAM';
   $('plan').innerHTML = custom + `<b>${m.name}</b> · context <b>${commas($('ctx').value)}</b> tokens, KV <b>${$('kv').value}</b> · ` +
     (o ? (o.tier_gb > 0 ? `expert tier <b>${o.tier_gb} GB</b> of VRAM (~${commas(o.blocks)} experts, ${(o.vram_served*100).toFixed(0)}% of lookups) + <b>${$('ram').value} GB</b> of RAM` : `<b>no VRAM expert tier</b> at this context on this GPU (experts from <b>${$('ram').value} GB</b> of RAM and the NVMe)`) + ` · predicted <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document · ` : `RAM tier <b>${$('ram').value} GB</b> · `) +
-    `vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
+    `<b>${shName}</b>${o && o.state_host_gb ? ' (' + o.state_host_gb + ' GB)' : ''} · vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
 }
 function applyOption(o) {
-  $('ctx').value = o.ctx; $('kv').value = o.kv;
-  $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>KV + state <b>${o.state_gb} GB</b></span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b></span>` : ''}<span>predicted decode <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
+  $('ctx').value = o.ctx; $('kv').value = o.kv; if (o.state_host) $('state_host').value = o.state_host; if (o.ram) $('ram').value = o.ram;
+  $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>KV + state <b>${o.state_vram_gb !== undefined ? o.state_vram_gb : o.state_gb} GB</b> in VRAM${o.state_host_gb ? ` + <b>${o.state_host_gb} GB</b> in RAM` : ''}</span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b> in RAM, staged per image</span>` : ''}<span>predicted decode <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
   document.querySelectorAll('#options tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.ctx === o.ctx));
   renderPlan();
 }
 let visionChoice = null;   // null: the model's default (on when an mmproj file is there)
+let stateChoice = null;    // null: chosen per context by the presets
 async function loadReco() {
-  const r = await api('/api/recommend?model=' + selected + '&preset=' + (presetId === 'custom' ? 'coding' : presetId) + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0'))); reco = r;
+  const r = await api('/api/recommend?model=' + selected + '&preset=' + (presetId === 'custom' ? 'coding' : presetId) + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0')) + '&state_host=' + encodeURIComponent(stateChoice === null ? '' : stateChoice)); reco = r;
   if (presetId !== 'custom') presetId = r.preset;
   ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
   $('skip_miss').value = String(r.skip_miss);
@@ -275,12 +278,14 @@ async function loadReco() {
   const von = $('vision').options[0];
   von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'on' : 'unavailable (no mmproj file)';
   $('vision').value = String(r.vision);
+  if (r.state_host) $('state_host').value = r.state_host;
   const mon = $('mtp').options[1];
   mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'on' : 'unavailable (no MTP file)';
   $('mtp').value = String(!!r.mtp);
   const tb = $('options');
-  tb.innerHTML = '<tr><th>context</th><th>KV</th><th>VRAM tier</th><th>experts in VRAM</th><th>from VRAM</th><th>decode, chat</th><th>decode, long document</th></tr>' +
-    r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${kctx(o.ctx)}</td><td>${o.kv}</td><td>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</td><td>${o.tier_gb > 0 ? o.blocks : '—'}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${fmt(o.tok_s_short)} tok/s</td><td>${fmt(o.tok_s_long_doc)} tok/s</td></tr>`).join('');
+  const shShort = sh => sh === 'kv,idx' ? 'indexer + KV' : sh === 'idx' ? 'indexer' : '—';
+  tb.innerHTML = '<tr><th>context</th><th>KV</th><th>state in RAM</th><th>VRAM tier</th><th>experts in VRAM</th><th>from VRAM</th><th>decode, chat</th><th>decode, long document</th></tr>' +
+    r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${kctx(o.ctx)}</td><td>${o.kv}</td><td>${shShort(o.state_host)}${o.state_host_gb ? ' (' + o.state_host_gb + ' GB)' : ''}</td><td>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</td><td>${o.tier_gb > 0 ? o.blocks : '—'}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${fmt(o.tok_s_short)} tok/s</td><td>${fmt(o.tok_s_long_doc)} tok/s</td></tr>`).join('');
   tb.querySelectorAll('tr[data-ctx]').forEach(tr => tr.onclick = () => { presetId = 'custom'; renderPresets(); applyOption(r.options.find(o => o.ctx === +tr.dataset.ctx)); });
   renderPresets();
   applyOption(r.options.find(o => o.ctx === r.ctx) || r.options[r.options.length - 1]);
@@ -288,10 +293,12 @@ async function loadReco() {
 $('ctx').onchange = () => { presetId = 'custom'; renderPresets(); const o = currentOption(); if (o) applyOption(o); else renderPlan(); };
 ['kv','ram','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { if (k === 'kv') { presetId = 'custom'; renderPresets(); } renderPlan(); }));
 $('vision').onchange = () => { visionChoice = $('vision').value === 'true'; loadReco(); };
+$('state_host').onchange = () => { stateChoice = $('state_host').value; loadReco(); };
 function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
-           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true', preset: presetId };
+           spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true',
+           state_host: $('state_host').value, preset: presetId };
 }
 $('start').onclick = async () => {
   $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true;
@@ -301,7 +308,7 @@ $('start').onclick = async () => {
   poll();
 };
 $('stop').onclick = async () => { $('msg').textContent = 'stopping…'; $('msg').className = 'muted'; await api('/api/stop', { method: 'POST' }); poll(); };
-$('reco').onclick = () => { visionChoice = null; presetId = 'coding'; loadReco(); };
+$('reco').onclick = () => { visionChoice = null; stateChoice = null; presetId = 'coding'; loadReco(); };
 $('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('endpoint').textContent);
 
 // ---- self-test: the chosen model on this hardware, through the server ----
@@ -357,8 +364,8 @@ function setLocked(s) {
   const b = $('banner');
   if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
   const st = s.settings || {}, p = s.props || {};
-  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.mtp ? '--mtp (draft head)' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
-                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.mtp ? 'mtp' : '', p.vision ? 'vision' : ''].filter(Boolean);
+  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.state_host && st.state_host !== 'none' ? `--state-host ${st.state_host}` : '', st.mtp ? '--mtp (draft head)' : '', st.vision ? '--mmproj (vision, staged per image)' : ''].filter(Boolean)
+                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.state_host && p.state_host !== 'none' ? `state-host ${p.state_host}` : '', p.mtp ? 'mtp' : '', p.vision ? (p.vision_weights === 'host' ? 'vision (staged per image)' : 'vision') : ''].filter(Boolean);
   b.className = 'banner';
   b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}</span></span>
     <span class="flags">${flags.map(f => `<span>${f}</span>`).join('')}</span>
@@ -389,7 +396,7 @@ async function poll() {
     if (s.settings && s.settings.preset && s.settings.preset !== presetId) { presetId = s.settings.preset; reload = true; }
     if (i >= 0 && i !== selected) { selected = i; renderModels(); reload = true; }
     if (reload) await loadReco();   // the running preset's own options (its context, and its vision choice)
-    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); const o = currentOption(); if (o) applyOption(o); else renderPlan(); }
+    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); $('state_host').value = s.settings.state_host || 'none'; renderPlan(); }
   }
   if (s.selftest_running && !stTimer) pollSelftest();
   const chatable = s.state === 'ready' || s.state === 'busy';

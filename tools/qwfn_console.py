@@ -12,7 +12,7 @@ one qwfn-server and refuses to start a second while any qwfn engine is running.
 Vision: when an mmproj-*.gguf sits next to the model (or in its snapshot directory)
 the server is started with --mmproj by default, so images sent by a harness work.
 """
-import argparse, glob, http.server, json, math, os, random, signal, socket, subprocess, sys, threading, time, urllib.request
+import argparse, glob, http.server, json, math, os, random, signal, socket, subprocess, sys, threading, time, urllib.parse, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
@@ -101,33 +101,49 @@ PRESETS = [("chat", "Chat", 32768, "short conversations; the fastest decode"),
            ("coding_plus", "Agentic coding+", 262144, "the model's full trained context, for the longest sessions")]
 QUANT_GPU_MS = {"Q3_K_XL": 24.0, "Q4_K_XL": 32.0, "IQ1_S": 24.0}   # graph A with the speculative block, per token
 LOOKUPS_PER_TOKEN = 480   # 48 layers x 10 routed experts
-def state_gb(ctx, kv):
+# Attention state per 1K tokens of context: the KV cache (by its type), the indexer key
+# cache and the pooled block keys; plus the constant DeltaNet state. The KV and indexer
+# caches can live in pinned RAM instead of VRAM (--state-host), read over PCIe: measured
+# on the doc replay at 131K, +0.35 ms/token for the indexer, +1.7 ms/token for the KV
+# cache; the VRAM they free is worth ~4% of decode per GB at 131K and is what gives the
+# 256K preset an expert tier at all (7.0 -> 9.7 tok/s measured, 2026-09-09).
+STATE_HOST_OPTIONS = ["none", "idx", "kv,idx"]
+STATE_HOST_MS = {"none": 0.0, "idx": 0.35, "kv": 1.7, "kv,idx": 2.0}
+def state_parts(ctx, kv):
     per_k = {"q4_0": 6.9, "q8_0": 13.1, "f16": 26.2}[kv]      # KV MB per 1K tokens
-    return (ctx / 1024) * (per_k + 3.1 + 0.8) / 1024 + 0.113   # + indexer keys + pooled block keys + DeltaNet state
+    k = ctx / 1024 / 1024
+    return {"kv": per_k * k, "idx": 3.1 * k, "pooled": 0.8 * k, "delta": 0.113}
+def state_gb(ctx, kv):
+    return sum(state_parts(ctx, kv).values())
+def state_host_gb(ctx, kv, state_host):
+    p = state_parts(ctx, kv)
+    return (p["kv"] if "kv" in state_host else 0.0) + (p["idx"] if "idx" in state_host else 0.0)
+def state_vram_gb(ctx, kv, state_host):
+    return state_gb(ctx, kv) - state_host_gb(ctx, kv, state_host)
 
-def predict(quant, tier_gb, ram_gb, long_doc):
+def predict(quant, tier_gb, ram_gb, long_doc, extra_ms=0.0):
     block = QUANT_BLOCK_MB.get(quant, 2.4)
     vb = max(0.0, tier_gb) * 1024 / block; rb = ram_gb * 1024 / block
     f_v = max(0.0, 0.95 * (1 - math.exp(-vb / 1500)) - (0.06 if long_doc else 0.0)) if vb > 0 else 0.0
     f_h = 0.97 * (1 - math.exp(-(vb + rb) / 1050))
     f_h = max(f_h, f_v)
     io = 1.4 * (block / 2.4) ** 1.4
-    ms = QUANT_GPU_MS.get(quant, 24.0) + LOOKUPS_PER_TOKEN * ((f_h - f_v) * 0.110 + (1 - f_h) * io) + 8.0
+    ms = QUANT_GPU_MS.get(quant, 24.0) + extra_ms + LOOKUPS_PER_TOKEN * ((f_h - f_v) * 0.110 + (1 - f_h) * io) + 8.0
     return {"tok_s": round(1000 / ms, 1), "vram_served": round(f_v, 3), "hit": round(f_h, 3), "blocks": int(vb)}
 
-def recommend(model, hw, preset="coding", vision=None):
+def recommend(model, hw, preset="coding", vision=None, state_host=None):
     """Settings for one preset on this machine, with every context step's cost and the
     three presets summarised, so the page can show the choice without a table."""
     q = model["quant"]
     core = QUANT_CORE_GB.get(q, 4.7)
-    # Vision: the projector is loaded onto the GPU after the expert tier is sized, so
-    # qwfn-server adds its file size (+128 MB of graph arena) to --reserve. Default on
-    # whenever the file is there: a harness that sends an image gets an answer instead of
-    # a 400, and the cost is a few hundred expert blocks.
+    # Vision: the projector's weights stay in host memory and are staged onto the GPU
+    # only while an image is encoded (~40 ms per image), so vision costs no VRAM at
+    # decode. Default on whenever the file is there: a harness that sends an image gets
+    # an answer instead of a 400.
     forced_vision = vision   # None: the model's default (on when the file is there); True/False: the user's choice
     if vision is None: vision = bool(model.get("mmproj"))
     vision = bool(vision and model.get("mmproj"))
-    mm_gb = (model.get("mmproj_gb", 0.0) + 0.128) if vision else 0.0
+    mm_gb = model.get("mmproj_gb", 0.0) if vision else 0.0   # host memory, not VRAM
     vram = hw["vram_total_mb"] / 1024.0
     reserve_mb = 1024 if hw["desktop_gpu"] else 768
     # The desktop's own VRAM use, measured now (minus any qwfn engine).
@@ -135,8 +151,8 @@ def recommend(model, hw, preset="coding", vision=None):
     eng_used = hw.get("qwfn_vram_mb", 0) / 1024.0
     desktop_use = max(0.2, used - eng_used) if hw["desktop_gpu"] else 0.1
     avail = hw["ram_available_gb"] if not engines_running() else max(hw["ram_available_gb"], hw["ram_total_gb"] - 8.0)
-    ram = max(4, min(12, int(0.6 * avail - 3.2)))
     batch = 4096 if vram >= 12 else 2048
+    forced_state = state_host if state_host in STATE_HOST_OPTIONS else None   # None: chosen per context below
     # What the engine does with the VRAM left after the dense core and the context's state:
     # it takes OVERHEAD_GB for its CUDA context, decode state and graph arenas (measured
     # against the tier it actually built at 160K), and it only builds an expert tier that
@@ -145,22 +161,34 @@ def recommend(model, hw, preset="coding", vision=None):
     # VRAM tier at all: every expert comes from RAM or the NVMe, about 25% slower.
     OVERHEAD_GB = 1.2
     lend_gb = (4.4 if batch >= 4096 else 3.9) - (0.27 if q == "Q3_K_XL" else 0.0)
-    def tier_for(c, kv, with_vision):
-        mm = (model.get("mmproj_gb", 0.0) + 0.128) if with_vision else 0.0
-        t = vram - core - state_gb(c, kv) - reserve_mb / 1024 - desktop_use - OVERHEAD_GB - mm
+    def tier_for(c, kv, sh):
+        t = vram - core - state_vram_gb(c, kv, sh) - reserve_mb / 1024 - desktop_use - OVERHEAD_GB
         return t if t >= lend_gb + 0.1 else 0.0
+    def state_host_for(c, kv):
+        # Measured on the doc replay (Q4, 2026-09-09): the indexer move is a small clean
+        # gain from 64K up; moving the KV cache too wins from 128K (126K: 10.5 -> 11.1
+        # tok/s, 26 fewer CPU-served experts per token), and at 256K it is what keeps
+        # an expert tier alive at all (7.0 -> 9.7 tok/s). Below 128K the KV cache is
+        # too small to pay for its ~1.7 ms/token of PCIe gathers.
+        if forced_state: return forced_state
+        if c < 65536: return "none"
+        if c >= 131072 or (tier_for(c, kv, "idx") <= 0 and tier_for(c, kv, "kv,idx") > 0): return "kv,idx"
+        return "idx"
+    def ram_for(sh_gb):
+        return max(4, min(12, int(0.6 * (avail - sh_gb) - 3.2)))   # the pinned state comes out of the same RAM
     def option(c, with_vision):
         kv = "q4_0" if c >= 32768 else "q8_0"
-        tier = tier_for(c, kv, with_vision)
-        short = predict(q, tier, ram, False); longd = predict(q, tier, ram, True)
+        sh = state_host_for(c, kv)
+        tier = tier_for(c, kv, sh)
+        shg = state_host_gb(c, kv, sh); ram = ram_for(shg)
+        short = predict(q, tier, ram, False, STATE_HOST_MS[sh]); longd = predict(q, tier, ram, True, STATE_HOST_MS[sh])
         return {"ctx": c, "kv": kv, "tier_gb": round(tier, 2), "blocks": short["blocks"], "state_gb": round(state_gb(c, kv), 2), "vision": with_vision,
+                "state_host": sh, "state_host_gb": round(shg, 2), "state_vram_gb": round(state_vram_gb(c, kv, sh), 2), "ram": ram,
                 "tok_s_short": short["tok_s"], "tok_s_long_doc": longd["tok_s"], "vram_served": short["vram_served"], "hit": short["hit"]}
     presets = []
     for pid, label, ctx, blurb in PRESETS:
         o = option(ctx, vision); note = ""
-        if o["tier_gb"] == 0 and vision and forced_vision is None:
-            alt = option(ctx, False)
-            if alt["tier_gb"] > 0: o = alt; note = "vision off: the projector's %.1f GB is what lets the expert tier fit" % model.get("mmproj_gb", 0.0)
+        if o["state_host"] != "none": note = "attention state in RAM (%s): %.1f GB of VRAM for the expert tier" % (o["state_host"], o["state_host_gb"])
         if o["tier_gb"] == 0:
             fallback = [option(c, vision) for c in CTX_STEPS if c < ctx]
             fallback = [f for f in fallback if f["tier_gb"] > 0]
@@ -170,15 +198,17 @@ def recommend(model, hw, preset="coding", vision=None):
                         "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": o["tok_s_short"], "tok_s_long_doc": o["tok_s_long_doc"], "vram_served": o["vram_served"]})
     if preset not in [p["id"] for p in presets]: preset = "coding"
     p = next(p for p in presets if p["id"] == preset)
-    vision = p["vision"]; mm_gb = (model.get("mmproj_gb", 0.0) + 0.128) if vision else 0.0
+    vision = p["vision"]; mm_gb = model.get("mmproj_gb", 0.0) if vision else 0.0
     options = [option(c, vision) for c in CTX_STEPS]
     chosen = next(o for o in options if o["ctx"] == p["ctx_actual"])
     return {
-        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": ram, "batch": batch, "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
+        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "batch": batch, "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
+        "state_host": chosen["state_host"],
         "mtp": False, "mtp_file": model.get("mtp"), "mtp_gb": model.get("mtp_gb", 0.0),
         "estimates": {"vram_tier_gb": chosen["tier_gb"], "vram_tier_blocks": chosen["blocks"], "state_gb": chosen["state_gb"], "dense_core_gb": core,
+                      "state_host_gb": chosen["state_host_gb"], "state_vram_gb": chosen["state_vram_gb"],
                       "mmproj_gb": round(mm_gb, 2),
                       "desktop_use_gb": round(desktop_use, 2), "decode_tps_short": chosen["tok_s_short"], "decode_tps_long_doc": chosen["tok_s_long_doc"],
                       "vram_served": chosen["vram_served"], "prefill_tps_long": 275 if q != "IQ1_S" else 0},
@@ -230,6 +260,7 @@ def start_server(model, s):
             if not model.get("mmproj"):
                 return {"error": "no mmproj-*.gguf next to this model: download mmproj-F16.gguf into its snapshot directory, or turn Vision off"}
             argv += ["--mmproj", model["mmproj"]]
+        if s.get("state_host") in ("idx", "kv", "kv,idx"): argv += ["--state-host", s["state_host"]]
         log = open(STATE["log"], "w")
         log.write("$ " + " ".join(argv) + "\n")
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
@@ -429,7 +460,8 @@ class H(http.server.BaseHTTPRequestHandler):
             models = scan_models(); i = int(q.get("model", 0))
             if not models: return self._json({"error": "no models"}, 404)
             v = q.get("vision", ""); vision = None if v == "" else v in ("1", "true")
-            return self._json(recommend(models[min(i, len(models) - 1)], hardware(), q.get("preset", "coding"), vision))
+            sh = urllib.parse.unquote(q.get("state_host", "")) or None
+            return self._json(recommend(models[min(i, len(models) - 1)], hardware(), q.get("preset", "coding"), vision, sh))
         if path == "/api/status": return self._json(status())
         if path == "/api/log": return self._json({"log": log_tail(400)})
         if path == "/api/selftest": return self._json({k: SELFTEST[k] for k in ("running", "step", "log", "result", "error")})

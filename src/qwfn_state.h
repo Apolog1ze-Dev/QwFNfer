@@ -30,6 +30,10 @@ struct state_config {
     ggml_type type_k  = GGML_TYPE_Q8_0;
     ggml_type type_v  = GGML_TYPE_Q8_0;
     ggml_type type_idx = GGML_TYPE_F16;   // indexer keys; pooled+normed before use
+    // Keep the indexer cache and/or the KV cache in pinned host memory (read by
+    // the device over PCIe) so their VRAM goes to the expert tier.
+    bool      idx_host = false;
+    bool      kv_host  = false;
 };
 
 class state {
@@ -70,6 +74,13 @@ private:
 
     ggml_context *        ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;
+    // The KV cache and/or the indexer key cache in pinned host memory instead
+    // (state_config::kv_host / idx_host); the device kernels read them over PCIe
+    // and the VRAM they occupied goes to the expert tier.
+    ggml_context *        ctx_h_ = nullptr;
+    ggml_backend_buffer_t buf_h_ = nullptr;
+    size_t                bytes_h_ = 0;
+    bool                  kv_host_ = false, idx_host_ = false;
 
     std::vector<ggml_tensor *> k_, v_, idx_, rs_, conv_;
     ggml_tensor * ple_conv_ = nullptr;

@@ -118,6 +118,14 @@ struct engine_config {
     // experts that are resident (gates renormalised), the misses' reads still
     // go out and land for next time. An approximation -- measure its NLL.
     bool      skip_miss = false;
+    // Attention-state placement. The indexer key cache and the KV cache can live
+    // in pinned host memory instead of VRAM: the device kernels read the rows a
+    // token needs over PCIe (measured on the doc replay at 131K: +0.35 ms/token
+    // for the indexer, +1.7 ms/token for the KV cache's 2,051-cell gathers) and
+    // the VRAM they held goes to the expert tier, ~4% of decode per GB at 131K
+    // and the difference between a tier and none at 256K. --state-host idx|kv,idx.
+    bool      idx_host = false;
+    bool      kv_host  = false;
     // Overlap the next layer's bulk expert read with this layer's upload and
     // compute during prefill. Costs a second host staging buffer (~1.8 GB),
     // taken before the RAM tier sizes itself so the memory guard sees it.
@@ -206,6 +214,12 @@ public:
     bool    mtp_loaded() const { return mtp_on_; }     // the head is resident (not with --skip-miss)
 
     void    reset();                       // clear state, rewind to position 0
+    // Lend the expert tier's dynamic VRAM buffer to a client -- the server,
+    // before it stages the vision projector for an image -- and take it back.
+    // A streamed prefill lends it anyway and returns it; eval() re-syncs the
+    // replayed graphs whenever the tier moved, so a lend is safe from anywhere.
+    void    vram_lend_begin();
+    void    vram_lend_end();
 
     // Substitute externally computed embeddings (vision) for the tokens at
     // absolute positions [pos, pos + n). The engine still takes token ids --
@@ -417,6 +431,8 @@ private:
     bool                  in_prefill_ = false;
     uint64_t              tier_epoch_seen_ = 0;
     bool prefill_enter(std::string & err);
+    void sync_tier_epoch();                // rebuild the replayed graphs if the tier moved
+    bool client_lent_ = false;             // vram_lend_begin() without a prefill since
     void prefill_leave();
     void save_work_set(work_set & ws) const;
     void load_work_set(const work_set & ws);

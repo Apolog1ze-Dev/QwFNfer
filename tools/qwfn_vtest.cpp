@@ -1,16 +1,24 @@
 // qwfn-vtest -- run the vision tower on one image and report the embeddings.
 #include "qwfn_vision.h"
 #include "ggml-backend.h"
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
 using namespace qwfn;
 
 int main(int argc, char ** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: qwfn-vtest <mmproj.gguf> <image> [--cpu]\n"); return 1; }
-    const bool use_gpu = !(argc > 3 && std::string(argv[3]) == "--cpu");
+    if (argc < 3) { fprintf(stderr, "usage: qwfn-vtest <mmproj.gguf> <image> [--cpu] [--host] [--reps N]\n"); return 1; }
+    bool use_gpu = true, host_weights = false; int reps = 2;
+    for (int i = 3; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--cpu") use_gpu = false;
+        else if (a == "--host") host_weights = true;   // weights in host memory, staged per encode
+        else if (a == "--reps" && i + 1 < argc) reps = atoi(argv[++i]);
+    }
     ggml_backend_load_all_from_path((std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin").c_str());
 
     ggml_backend_t be = nullptr;
@@ -25,7 +33,7 @@ int main(int argc, char ** argv) {
 
     std::string err;
     vision_encoder v;
-    if (!v.load(argv[1], be, ggml_backend_get_default_buffer_type(be), err)) {
+    if (!v.load(argv[1], be, ggml_backend_get_default_buffer_type(be), err, host_weights)) {
         fprintf(stderr, "load: %s\n", err.c_str()); return 1;
     }
     image_u8 img;
@@ -33,7 +41,14 @@ int main(int argc, char ** argv) {
     printf("image: %dx%d\n", img.nx, img.ny);
 
     std::vector<float> emb; int n_out = 0, gw = 0, gh = 0;
-    if (!v.encode(img, emb, n_out, gw, gh, err)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
+    // Encode twice: the first call pays one-time costs (graph allocation, CUDA warm-up).
+    double t_last = 0;
+    for (int r = 0; r < reps; r++) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!v.encode(img, emb, n_out, gw, gh, err)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
+        t_last = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        printf("encode %d: %.3f s\n", r, t_last);
+    }
 
     double sum = 0, sq = 0; float mx = 0; int nonfinite = 0;
     for (float x : emb) {

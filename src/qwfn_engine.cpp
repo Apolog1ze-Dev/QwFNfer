@@ -132,6 +132,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
     sc.n_ctx  = cfg.n_ctx;
     sc.type_k = cfg.type_k;
     sc.type_v = cfg.type_v;
+    sc.idx_host = cfg.idx_host;
+    sc.kv_host  = cfg.kv_host;
     if (!st_.init(&hp_, sc, w_.buft(), err)) return false;
     if (mtp_on_ || cfg.rollback_snapshots) {
         // Rollback snapshots for the MTP verify: per DeltaNet layer the state and
@@ -735,6 +737,11 @@ const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, 
     static const bool legacy_prefill = getenv("QWFN_LEGACY_PREFILL") != nullptr;
     const bool streamed = n_new > 1 && !as_decode;
     if (streamed && mtp_on_) mtp_kv_valid_ = false;   // the head has no rows for a streamed prefill (not yet built)
+    // A client lend (the server staging the vision projector) that no prefill
+    // followed: take the tier back before a decode, and rebuild whatever the
+    // lend invalidated either way.
+    if (!streamed && client_lent_) vram_lend_end();
+    if (!streamed) sync_tier_epoch();
     if (streamed && !prefill_enter(err)) return nullptr;
     bool ok = true;
     if (streamed && !legacy_prefill) {
@@ -999,14 +1006,31 @@ void engine::prefill_leave() {
     if (pwctx_) { ggml_free(pwctx_); pwctx_ = nullptr; }
     in_prefill_ = false;
     ec_.lend_end();
-    if (ec_.tier_epoch() != tier_epoch_seen_) {
-        // The dynamic tier moved: every replayed graph that folds an expert
-        // matmul over it holds stale pointers. Rebuild them all next token.
-        for (auto & lg : gA_) { if (lg.ga) ggml_gallocr_free(lg.ga); if (lg.ctx) ggml_free(lg.ctx); lg = layer_graph{}; }
-        for (auto & mg : gM_) { if (mg.ga) ggml_gallocr_free(mg.ga); if (mg.ctx) ggml_free(mg.ctx); mg = moe_graph{}; }
-        std::fill(gA_bucket_.begin(), gA_bucket_.end(), -1);
-        tier_epoch_seen_ = ec_.tier_epoch();
-    }
+    client_lent_ = false;
+    sync_tier_epoch();
+}
+
+void engine::sync_tier_epoch() {
+    if (ec_.tier_epoch() == tier_epoch_seen_) return;
+    // The dynamic tier moved: every replayed graph that folds an expert
+    // matmul over it holds stale pointers. Rebuild them all next token.
+    for (auto & lg : gA_) { if (lg.ga) ggml_gallocr_free(lg.ga); if (lg.ctx) ggml_free(lg.ctx); lg = layer_graph{}; }
+    for (auto & mg : gM_) { if (mg.ga) ggml_gallocr_free(mg.ga); if (mg.ctx) ggml_free(mg.ctx); mg = moe_graph{}; }
+    std::fill(gA_bucket_.begin(), gA_bucket_.end(), -1);
+    tier_epoch_seen_ = ec_.tier_epoch();
+}
+
+void engine::vram_lend_begin() {
+    if (in_prefill_) return;               // already lent, and the prefill returns it
+    ec_.lend_begin();
+    client_lent_ = true;
+}
+
+void engine::vram_lend_end() {
+    if (in_prefill_ || !client_lent_) return;
+    ec_.lend_end();
+    client_lent_ = false;
+    sync_tier_epoch();
 }
 
 // Layer-major prefill of T (<= n_batch) tokens: for every layer, graph A over
