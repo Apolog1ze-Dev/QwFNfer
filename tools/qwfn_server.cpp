@@ -260,6 +260,18 @@ static std::string tool_calls_key(const json & tool_calls) {
     return k;
 }
 
+// The reply text a client echoes back may differ from what the server kept in
+// trailing whitespace: a streamed reply emitted "OK\n\n" before its tool block
+// was recognised while parse_tool_calls() keeps the text trimmed, and clients
+// trim on their own. Matching modulo trailing whitespace is what keeps the
+// prefix continuation alive across a tool-calling turn.
+static bool same_reply_text(const std::string & a, const std::string & b) {
+    size_t na = a.size(), nb = b.size();
+    while (na > 0 && (a[na - 1] == '\n' || a[na - 1] == ' ' || a[na - 1] == '\r' || a[na - 1] == '\t')) na--;
+    while (nb > 0 && (b[nb - 1] == '\n' || b[nb - 1] == ' ' || b[nb - 1] == '\r' || b[nb - 1] == '\t')) nb--;
+    return na == nb && a.compare(0, na, b, 0, nb) == 0;
+}
+
 // Parse every complete <tool_call> block in `text`. Parameter values are typed
 // by the tool's schema (a "string" stays a string; anything else is parsed as
 // JSON when it parses). Returns the text before the first block.
@@ -854,7 +866,7 @@ int main(int argc, char ** argv) {
         if (nprev > 0 && !S.last_gen.empty() && messages.size() >= nprev + 2 &&
             std::equal(S.last_msgs.begin(), S.last_msgs.end(), messages.begin()) &&
             messages[nprev].value("role", "") == "assistant" &&
-            content_of(messages[nprev]).is_string() && content_of(messages[nprev]).get<std::string>() == S.last_content &&
+            content_of(messages[nprev]).is_string() && same_reply_text(content_of(messages[nprev]).get<std::string>(), S.last_content) &&
             tool_calls_key(messages[nprev].value("tool_calls", json::array())) == S.last_tool_key) {
             P.tok = S.last_prompt;
             P.tok.insert(P.tok.end(), S.last_gen.begin(), S.last_gen.end());
@@ -886,7 +898,7 @@ int main(int argc, char ** argv) {
                 const json tcs = messages[m].value("tool_calls", json::array());
                 // If this is verbatim the reply we just produced, replay the
                 // exact tokens so the engine can continue instead of re-prefilling.
-                if (!S.last_gen.empty() && text == S.last_content && tool_calls_key(tcs) == S.last_tool_key &&
+                if (!S.last_gen.empty() && same_reply_text(text, S.last_content) && tool_calls_key(tcs) == S.last_tool_key &&
                     (rc.empty() || rc == S.last_reasoning)) {
                     app(enc_sp("<|im_start|>assistant\n"));
                     app(enc_sp(S.last_thinking ? "<think>\n" : "<think>\n\n</think>\n\n"));
