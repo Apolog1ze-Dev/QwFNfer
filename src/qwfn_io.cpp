@@ -12,6 +12,10 @@
 
 namespace qwfn {
 
+static uint64_t g_dio_align = 512;
+uint64_t dio_align() { return g_dio_align; }
+void     set_dio_align(uint64_t a) { g_dio_align = a == QWFN_DIO_PAGE ? QWFN_DIO_PAGE : 512; }
+
 void * dio_alloc(size_t bytes) {
     void * p = nullptr;
     const size_t sz = dio_align_up(bytes);
@@ -73,6 +77,10 @@ bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_dept
         fds_.push_back(fd);
     }
 
+    // With a 512-byte layout a direct read of the exact window would be served
+    // buffered on a 4096-sector filesystem: the workers read a page-aligned
+    // window into their own buffer and copy the payload into the slot instead.
+    bounce_ = direct_ && dio_align() < QWFN_DIO_PAGE;
     if (be_ == backend::threads) {
         // pread is positional and thread-safe, so the shard fds are shared.
         const unsigned n = qd_ ? std::min(qd_, 32u) : 8u;
@@ -135,7 +143,7 @@ size_t io_engine::submit(const io_request * reqs, size_t n) {
                 uint64_t off = r.offset;
                 uint32_t len = r.nbytes;
                 if (direct_) { off = dio_align_down(r.offset); len = dio_padded_size(r.offset, r.nbytes); }
-                q_.push_back(job{ r.shard, off, len, r.dst, r.tag });
+                q_.push_back(job{ r.shard, off, len, r.dst, r.tag, r.offset, r.nbytes });
                 in_flight_++;
             }
         }
@@ -246,11 +254,42 @@ void io_engine::worker_loop() {
             q_.pop_front();
         }
         ssize_t got = 0;
-        while (got < (ssize_t) j.len) {
-            const ssize_t r = ::pread(fds_[j.shard], (char *) j.dst + got,
-                                      j.len - got, (off_t) (j.off + got));
-            if (r <= 0) break;
-            got += r;
+        if (bounce_) {
+            // The page-aligned window around the requested range, into this
+            // worker's buffer; the payload then goes where the 512-byte layout
+            // expects it. A window past the end of a shard reads short, which is
+            // fine as long as the payload arrived.
+            static thread_local uint8_t * scratch = nullptr;
+            static thread_local size_t    scratch_bytes = 0;
+            const uint64_t w0 = j.ooff & ~(QWFN_DIO_PAGE - 1);
+            const uint64_t w1 = (j.ooff + j.onb + QWFN_DIO_PAGE - 1) & ~(QWFN_DIO_PAGE - 1);
+            const size_t   wl = (size_t) (w1 - w0);
+            if (scratch_bytes < wl) {
+                if (scratch) dio_free(scratch);
+                scratch_bytes = wl + (1u << 20);
+                scratch = (uint8_t *) dio_alloc(scratch_bytes);
+            }
+            const ssize_t need = (ssize_t) (j.ooff - w0 + j.onb);
+            if (scratch) {
+                while (got < (ssize_t) wl) {
+                    const ssize_t r = ::pread(fds_[j.shard], scratch + got, wl - got, (off_t) (w0 + got));
+                    if (r <= 0) break;
+                    got += r;
+                }
+            }
+            if (got >= need) {
+                memcpy((char *) j.dst + dio_pad(j.ooff), scratch + (j.ooff - w0), j.onb);
+                got = (ssize_t) j.len;   // the caller's notion of a complete read
+            } else {
+                got = 0;
+            }
+        } else {
+            while (got < (ssize_t) j.len) {
+                const ssize_t r = ::pread(fds_[j.shard], (char *) j.dst + got,
+                                          j.len - got, (off_t) (j.off + got));
+                if (r <= 0) break;
+                got += r;
+            }
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);

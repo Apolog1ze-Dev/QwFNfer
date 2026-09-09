@@ -82,7 +82,7 @@ bool prefill_streamer::init(const model_index * mi, unsigned io_workers, bool io
         size_t tot = 0;
         for (int q = 0; q < EXPERT_NPARTS; q++) {
             const byte_range r = mi->expert_range(il, 0, (expert_part) q);
-            tot += dio_align_up((size_t) r.nbytes * mi->hp().n_expert + QWFN_DIO_ALIGN);
+            tot += dio_align_up((size_t) r.nbytes * mi->hp().n_expert + dio_align());
         }
         worst = std::max(worst, tot);
     }

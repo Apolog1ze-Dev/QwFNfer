@@ -47,9 +47,9 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
             const byte_range r0 = hot->expert_range(il, 0, (expert_part) q);
             const byte_range r1 = hot->expert_range(il, 1, (expert_part) q);
             if (!r0.valid()) { err = "missing expert tensor on layer " + std::to_string(il); return false; }
-            if (r1.valid() && ((r1.offset - r0.offset) % QWFN_DIO_ALIGN) != 0) {
-                err = "expert slice stride is not 512-byte aligned on layer " + std::to_string(il) +
-                      "; O_DIRECT fast path cannot be used";
+            if (r1.valid() && ((r1.offset - r0.offset) % dio_align()) != 0) {
+                err = "expert slice stride is not " + std::to_string(dio_align()) + "-byte aligned on layer " + std::to_string(il) +
+                      "; the direct I/O layout cannot be used";
                 return false;
             }
             const tensor_ref * t = hot->find("blk." + std::to_string(il) + "." +
@@ -67,7 +67,7 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                 if (il == 0 && getenv("QWFN_COLD_DEBUG"))
                     fprintf(stderr, "[cold-debug] layer 0 part %d: hot off %llu pay %u type %d | cold off %llu pad %u pay %u type %d (ct %s) nbytes %u/%u\n",
                             q, (unsigned long long) r0.offset, lp.part_pay[q], (int) lp.part_type[q],
-                            (unsigned long long) cr.offset, (unsigned) (cr.offset % QWFN_DIO_ALIGN), lp.cold_pay[q], (int) lp.cold_type[q], ct ? "found" : "MISSING",
+                            (unsigned long long) cr.offset, (unsigned) (cr.offset % dio_align()), lp.cold_pay[q], (int) lp.cold_type[q], ct ? "found" : "MISSING",
                             cr.nbytes, r0.nbytes);
                 if (dio_padded_size(cr.offset, cr.nbytes) > dio_padded_size(r0.offset, r0.nbytes)) {
                     err = "cold expert block is larger than the hot slot on layer " + std::to_string(il);

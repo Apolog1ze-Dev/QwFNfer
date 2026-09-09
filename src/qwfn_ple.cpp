@@ -14,11 +14,15 @@ bool ple_table::init(const model_index * mi, io_engine * io, size_t row_cache_by
     row_bytes_  = (uint32_t) ggml_row_size(t->type, t->ne[0]);
     n_rows_     = (uint64_t) t->ne[1];
     // Each cached row must be able to absorb O_DIRECT read-around slack.
-    slot_bytes_ = (uint32_t) dio_align_up(row_bytes_ + QWFN_DIO_ALIGN);
+    slot_bytes_ = (uint32_t) dio_align_up(row_bytes_ + dio_align());
 
     n_slots_ = row_cache_bytes / slot_bytes_;
     if (n_slots_ == 0) n_slots_ = 1;
-    pool_.assign(n_slots_ * (size_t) slot_bytes_, 0);
+    if (pool_) dio_free(pool_);
+    pool_bytes_ = n_slots_ * (size_t) slot_bytes_;
+    pool_ = (uint8_t *) dio_alloc(pool_bytes_);
+    if (!pool_) { err = "ple row cache allocation failed"; return false; }
+    memset(pool_, 0, pool_bytes_);
     slot_row_.assign(n_slots_, UINT64_MAX);
     slot_valid_.assign(n_slots_, 0);
     index_.reserve(n_slots_ * 2);
@@ -73,7 +77,7 @@ const uint8_t * ple_table::cached(uint64_t row) const {
     const uint32_t s = it->second;
     if (!slot_valid_[s] || slot_row_[s] != row) return nullptr;
     const uint64_t off = mi_->ple_row_range(row).offset;
-    return pool_.data() + (size_t) s * slot_bytes_ + io_->payload_offset(off);
+    return pool_ + (size_t) s * slot_bytes_ + io_->payload_offset(off);
 }
 
 uint8_t * ple_table::admit(uint64_t row) {
@@ -83,7 +87,7 @@ uint8_t * ple_table::admit(uint64_t row) {
     slot_row_[s]   = row;
     slot_valid_[s] = 0;          // becomes valid once the read completes
     index_[row]    = s;
-    return pool_.data() + (size_t) s * slot_bytes_;
+    return pool_ + (size_t) s * slot_bytes_;
 }
 
 bool ple_table::gather(const ple_rows & rows, const uint8_t ** out_rows) {

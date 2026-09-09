@@ -47,6 +47,10 @@ ple_rows ple_rows_for(const hparams & hp, const int32_t * tokens, int64_t n_toke
 
 class ple_table {
 public:
+    ple_table() = default;
+    ~ple_table() { if (pool_) dio_free(pool_); }
+    ple_table(const ple_table &) = delete;
+    ple_table & operator=(const ple_table &) = delete;
     bool init(const model_index * mi, io_engine * io, size_t row_cache_bytes, std::string & err);
 
     // Rows for the n-gram window ending at position i of `tokens`.
@@ -87,7 +91,8 @@ private:
 
     // Small direct-mapped cache of hot rows. Common trigrams are heavily
     // Zipfian, so even a few hundred MB removes most repeat lookups.
-    std::vector<uint8_t>                     pool_;
+    uint8_t *                                pool_ = nullptr;   // dio_alloc'd: page-aligned so the row reads are direct
+    size_t                                   pool_bytes_ = 0;
     std::vector<uint64_t>                    slot_row_;   // which row occupies each slot
     std::vector<uint8_t>                     slot_valid_;
     size_t                                   n_slots_ = 0;

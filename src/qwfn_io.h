@@ -24,12 +24,24 @@ struct io_uring;
 
 namespace qwfn {
 
-// Logical block size assumed for O_DIRECT alignment. NVMe reports 512; reads
-// must have offset, length and buffer address all aligned to this.
-static constexpr uint64_t QWFN_DIO_ALIGN = 512;
+// The alignment the RAM tier's slots and the prefill staging are laid out to.
+// A direct read needs offset, length and destination aligned to what the
+// FILESYSTEM requires, not the device: NVMe reports 512, but btrfs (sectorsize
+// 4096) serves anything not 4096-aligned through the page cache, silently, and
+// measured on 2026-09-09 every expert read of this engine was buffered. The
+// layout is therefore 4096 whenever every expert slice stride in the file is a
+// page multiple, so the payload sits at a fixed offset per part and the read
+// lands in place with no copy (the Q4 file); it is 512 otherwise (the Q3 file:
+// IQ3_XXS slices step by 512 mod 4096), and the thread backend then reads a
+// page-aligned window into a per-worker bounce buffer and copies the payload
+// into the slot -- still a direct read, no page cache. Set by the engine before
+// any layout is computed.
+uint64_t dio_align();
+void     set_dio_align(uint64_t a);
+static constexpr uint64_t QWFN_DIO_PAGE = 4096;
 
-inline uint64_t dio_align_down(uint64_t x) { return x & ~(QWFN_DIO_ALIGN - 1); }
-inline uint64_t dio_align_up  (uint64_t x) { return (x + QWFN_DIO_ALIGN - 1) & ~(QWFN_DIO_ALIGN - 1); }
+inline uint64_t dio_align_down(uint64_t x) { return x & ~(dio_align() - 1); }
+inline uint64_t dio_align_up  (uint64_t x) { return (x + dio_align() - 1) & ~(dio_align() - 1); }
 
 // Bytes of slack between the start of an aligned read and the requested data.
 inline uint32_t dio_pad(uint64_t offset) { return (uint32_t) (offset - dio_align_down(offset)); }
@@ -43,7 +55,7 @@ struct io_request {
     int      shard   = 0;        // index into the paths passed to init()
     uint64_t offset  = 0;        // logical byte offset of the wanted data
     uint32_t nbytes  = 0;        // logical size of the wanted data
-    void *   dst     = nullptr;  // QWFN_DIO_ALIGN-aligned, >= dio_padded_size() bytes
+    void *   dst     = nullptr;  // dio_align()-aligned, >= dio_padded_size() bytes
     uint64_t tag     = 0;        // returned verbatim on completion
 };
 
@@ -98,7 +110,7 @@ private:
     io_uring *       ring_ = nullptr;
 
     // --- thread-pool backend ---
-    struct job { int shard; uint64_t off; uint32_t len; void * dst; uint64_t tag; };
+    struct job { int shard; uint64_t off; uint32_t len; void * dst; uint64_t tag; uint64_t ooff; uint32_t onb; };   // ooff/onb: the requested range, for the bounce path
     std::vector<std::thread>  workers_;
     std::deque<job>           q_;
     std::deque<uint64_t>      done_;
@@ -108,6 +120,7 @@ private:
     void worker_loop();
     std::vector<int> fds_;
     bool             direct_ = true;
+    bool             bounce_ = false;   // direct reads through a page-aligned per-worker buffer (512-byte slot layout)
     size_t           in_flight_ = 0;
     unsigned         qd_ = 0;
     uint32_t         expect_[1024] = {};

@@ -72,6 +72,26 @@ bool engine::init(const model_index * hot, const model_index * cold,
         fprintf(stderr, "[qwfn] indexer top-k %u -> %u\n", hp_.idx_top_k, cfg.indexer_top_k);
         hp_.idx_top_k = cfg.indexer_top_k;
     }
+    // The direct I/O layout (see qwfn_io.h): page-aligned slots when every expert
+    // slice stride in the file is a page multiple, so reads land in place; else
+    // 512-byte slots behind page-aligned bounce reads. Decided before any tier
+    // or staging is laid out.
+    {
+        auto page_strides = [](const model_index * mi) {
+            if (!mi) return true;
+            for (uint32_t il = 0; il < mi->hp().n_layer; il++)
+                for (int q = 0; q < EXPERT_NPARTS; q++) {
+                    const byte_range a = mi->expert_range(il, 0, (expert_part) q);
+                    const byte_range b = mi->expert_range(il, 1, (expert_part) q);
+                    if (a.valid() && b.valid() && ((b.offset - a.offset) % QWFN_DIO_PAGE) != 0) return false;
+                }
+            return true;
+        };
+        const bool page = page_strides(hot) && page_strides(cold) && !getenv("QWFN_DIO_512");
+        set_dio_align(page ? QWFN_DIO_PAGE : 512);
+        fprintf(stderr, "[qwfn] direct I/O: %s\n", page ? "page-aligned slots, reads land in place"
+                                                     : "512-byte slots, page-aligned reads through a bounce buffer (slice strides are not page multiples)");
+    }
 
     if (!w_.init(hot, cfg.use_gpu, backend_dir, err)) return false;
     if (!w_.declare_dense_core(err)) return false;

@@ -1238,9 +1238,13 @@ int main(int argc, char ** argv) {
             {"generation", {{"n", t["predicted_n"]}, {"ms", t["predicted_ms"]}, {"tokens_per_second", t["predicted_per_second"]}}},
             {"context", {{"n_past", n_past}, {"n_ctx", S.n_ctx}}},
             {"totals", {{"requests", nr}, {"prompt_tokens", np}, {"prompt_tokens_per_second", tp > 0 ? np / tp : 0.0},
-                        {"generated_tokens", ng}, {"generated_tokens_per_second", tg > 0 ? ng / tg : 0.0}}},
+                        {"generated_tokens", ng}, {"generated_tokens_per_second", tg > 0 ? ng / tg : 0.0},
+                        {"prompt_seconds", tp}, {"generation_seconds", tg}}},
             {"expert_cache", {{"hit_rate", c.hit_rate()}, {"vram_served", c.gpu_rate()},
-                              {"bytes_from_disk", c.bytes_from_disk}}},
+                              {"bytes_from_disk", c.bytes_from_disk},
+                              // the raw counters, so a harness can difference two samples
+                              {"lookups", c.lookups}, {"hits", c.hits}, {"gpu_hits", c.gpu_hits},
+                              {"promotions", c.promotions}, {"pf_issued", c.pf_issued}, {"pf_used", c.pf_used}}},
             {"speculative", {{"pairs", npair}, {"accepted", nacc}, {"acceptance", npair ? (double) nacc / npair : 0.0}}},
             {"timings", t}};
     };
