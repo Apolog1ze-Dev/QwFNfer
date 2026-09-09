@@ -602,7 +602,7 @@ int main(int argc, char ** argv) {
           "      --host HOST     bind address (default 127.0.0.1)\n"
           "      --port N        port (default 8080)\n"
           "      --mmproj PATH   vision projector gguf; enables image input. Its weights stay in host memory and are\n"
-          "                      staged onto the GPU per image (~40 ms), so vision costs no VRAM at decode; --vision-vram keeps them resident\n"
+          "                      staged onto the GPU per image (~60 ms), so vision costs no VRAM at decode\n"
           "      --state-host V  attention state in pinned host memory: none (default) | idx | kv,idx. The VRAM it held goes to\n"
           "                      the expert tier; costs ~0.35 ms/token (idx) or ~2 ms/token (kv,idx) of PCIe reads\n"
           "      --alias NAME    model id reported by /v1/models\n"
@@ -624,7 +624,6 @@ int main(int argc, char ** argv) {
     }
 
     std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
-    bool vision_vram = false;
     int def_reasoning_budget = 0;
     int port = 8080;
     engine_config cfg;
@@ -672,7 +671,6 @@ int main(int argc, char ** argv) {
             cfg.kv_host  = v.find("kv")  != std::string::npos;
             continue;
         }
-        if (a == "--vision-vram") { vision_vram = true; continue; }   // keep the projector resident in VRAM (the old placement)
         if (a == "--mtp" && i + 1 < argc) { cfg.mtp_path = next(); cfg.rollback_snapshots = true; continue; }   // the nextn draft head: pairs verified by the trunk, exact
         if (a == "--kv" && i + 1 < argc) {
             std::string v = next();
@@ -696,22 +694,15 @@ int main(int argc, char ** argv) {
     // The vision projector is loaded onto the device AFTER the engine has sized
     // its expert tier from the free VRAM: reserve its size up front, or it comes
     // out of the decode reserve and the first CUDA graph instantiation fails.
-    // With the default placement the projector's weights live in host memory and
-    // are staged into the tier's lent buffer while an image is encoded, so
-    // nothing is reserved for them.
-    if (!mmproj_path.empty() && vision_vram) {
-        struct stat sb{};
-        const size_t mm = stat(mmproj_path.c_str(), &sb) == 0 ? (size_t) sb.st_size : (1024ull << 20);
-        cfg.vram_reserve = (cfg.vram_reserve ? cfg.vram_reserve : (768ull << 20)) + mm + (128ull << 20);
-        fprintf(stderr, "[qwfn-server] reserving %.0f MB of VRAM for the vision projector\n", mm / 1e6);
-    }
+    // The projector's weights live in host memory and are staged into the tier's
+    // lent buffer while an image is encoded, so nothing is reserved for them.
     if (!S.eng.init(&S.mi, nullptr, cfg,
                     std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", S.eng.memory_summary().c_str());
     if (!mmproj_path.empty()) {
-        if (!S.vis.load(mmproj_path, S.eng.backend(), S.eng.buft(), err, /*host_weights=*/!vision_vram)) {
+        if (!S.vis.load(mmproj_path, S.eng.backend(), S.eng.buft(), err)) {
             fprintf(stderr, "vision: %s\n", err.c_str()); return 1;
         }
         const auto ip = S.vb.encode("<|image_pad|>", false, true);
@@ -1120,7 +1111,7 @@ int main(int argc, char ** argv) {
                 {"reasoning_budget", S.def_reasoning_budget},
                 {"thinking", S.preset_think.to_json()}, {"non_thinking", S.preset_nothink.to_json()}}},
             {"skip_miss", cfg.skip_miss}, {"spec_block", cfg.spec_block}, {"mtp", S.eng.mtp_loaded()}, {"model_file", S.model_file},
-            {"vision", S.vis.loaded()}, {"vision_weights", S.vis.loaded() ? (S.vis.weights_on_host() ? "host" : "vram") : "off"},
+            {"vision", S.vis.loaded()}, {"vision_weights", S.vis.loaded() ? "host" : "off"},
             {"state_host", cfg.kv_host && cfg.idx_host ? "kv,idx" : cfg.kv_host ? "kv" : cfg.idx_host ? "idx" : "none"},
             {"total_slots", 1}};
     };

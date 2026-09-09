@@ -11,12 +11,11 @@
 using namespace qwfn;
 
 int main(int argc, char ** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: qwfn-vtest <mmproj.gguf> <image> [--cpu] [--host] [--reps N]\n"); return 1; }
-    bool use_gpu = true, host_weights = false; int reps = 2;
+    if (argc < 3) { fprintf(stderr, "usage: qwfn-vtest <mmproj.gguf> <image> [--cpu] [--reps N]\n"); return 1; }
+    bool use_gpu = true; int reps = 2;
     for (int i = 3; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--cpu") use_gpu = false;
-        else if (a == "--host") host_weights = true;   // weights in host memory, staged per encode
         else if (a == "--reps" && i + 1 < argc) reps = atoi(argv[++i]);
     }
     ggml_backend_load_all_from_path((std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin").c_str());
@@ -33,7 +32,7 @@ int main(int argc, char ** argv) {
 
     std::string err;
     vision_encoder v;
-    if (!v.load(argv[1], be, ggml_backend_get_default_buffer_type(be), err, host_weights)) {
+    if (!v.load(argv[1], be, ggml_backend_get_default_buffer_type(be), err)) {
         fprintf(stderr, "load: %s\n", err.c_str()); return 1;
     }
     image_u8 img;

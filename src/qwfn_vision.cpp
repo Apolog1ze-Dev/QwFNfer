@@ -119,7 +119,7 @@ ggml_tensor * vision_encoder::get(const std::string & name) const {
 }
 
 bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
-                          ggml_backend_buffer_type_t buft, std::string & err, bool host_weights) {
+                          ggml_backend_buffer_type_t buft, std::string & err) {
     backend_ = backend;
     buft_    = buft;
     stage_   = false;
@@ -181,11 +181,11 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
         ggml_set_name(dst, name);
     }
 
-    // The weights' home: the device, or pinned host memory when they are to be
-    // staged per image (host_weights). On a CPU backend the two are the same
-    // and nothing is staged.
+    // The weights' home is host memory, pinned when the backend offers it, and
+    // they are staged per image; on a CPU backend the host buffer is the
+    // compute buffer and nothing is staged.
     ggml_backend_buffer_type_t wbuft = buft_;
-    if (host_weights) {
+    {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft_);
         ggml_backend_buffer_type_t h = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
         if (h && h != buft_) { wbuft = h; stage_ = true; }

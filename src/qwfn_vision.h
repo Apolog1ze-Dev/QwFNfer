@@ -53,13 +53,14 @@ public:
     vision_encoder(const vision_encoder &) = delete;
     vision_encoder & operator=(const vision_encoder &) = delete;
 
-    // host_weights: keep the 0.9 GB of weights in (pinned) host memory and stage
-    // them onto the device only while an image is encoded, so the projector
-    // costs no VRAM at decode. The upload is ~40 ms per image; reading them
-    // over PCIe in place instead measured 0.40 -> 2.3 s per screenshot, so the
-    // staging is not optional. The caller makes room first (engine::vram_lend_begin).
+    // The 0.9 GB of weights live in pinned host memory and are staged onto the
+    // device only while an image is encoded, so the projector never costs VRAM
+    // at decode. The upload is ~60 ms per image; reading them over PCIe in place
+    // instead measured 0.40 -> 2.3 s per screenshot, so the staging is not
+    // optional. The caller makes room first (engine::vram_lend_begin). On a CPU
+    // backend the weights are simply in RAM and nothing is staged.
     bool load(const std::string & mmproj_path, ggml_backend_t backend,
-              ggml_backend_buffer_type_t buft, std::string & err, bool host_weights = false);
+              ggml_backend_buffer_type_t buft, std::string & err);
     bool weights_on_host() const { return stage_; }
 
     bool loaded() const { return ctx_ != nullptr; }

@@ -335,7 +335,10 @@ int main(int argc, char ** argv) {
         if (!img.load(path, e)) { printf("  %s\n", e.c_str()); return; }
         pending_image pi; pi.path = path;
         const auto t0 = clk::now();
-        if (!vis.encode(img, pi.emb, pi.n_tok, pi.gw, pi.gh, e)) { printf("  %s\n", e.c_str()); return; }
+        // The projector's weights are staged onto the device for the encode; the
+        // tier's dynamic buffer is where they go, as for the server.
+        if (vis.weights_on_host()) eng.vram_lend_begin();
+        if (!vis.encode(img, pi.emb, pi.n_tok, pi.gw, pi.gh, e)) { eng.vram_lend_end(); printf("  %s\n", e.c_str()); return; }
         printf("  attached %s  (%dx%d -> %dx%d grid, %d image tokens, %.2f s)\n",
                path.c_str(), img.nx, img.ny, pi.gw, pi.gh, pi.n_tok, since(t0));
         images.push_back(std::move(pi));
