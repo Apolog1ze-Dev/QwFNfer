@@ -118,6 +118,10 @@ struct engine_config {
     // experts that are resident (gates renormalised), the misses' reads still
     // go out and land for next time. An approximation -- measure its NLL.
     bool      skip_miss = false;
+    // Decode only: drop a routed expert whose normalised gate is below this and
+    // renormalise the rest in the router graph (0 = off). An approximation,
+    // priced with the replay NLL; the dropped experts are neither fetched nor computed.
+    float     gate_drop = 0.0f;
     // Attention-state placement. The indexer key cache and the KV cache can live
     // in pinned host memory instead of VRAM: the device kernels read the rows a
     // token needs over PCIe (measured on the doc replay at 131K: +0.35 ms/token
@@ -257,7 +261,7 @@ public:
     // and the synchronous GPU compute. Per-call input construction (mask,
     // QSA inputs, the device allocation for them) is t_inputs, once per token.
     double t_attn_build = 0, t_attn_compute = 0, t_inputs = 0;
-    uint64_t n_exp_gpu = 0, n_exp_cpu = 0, n_exp_skipped = 0;
+    uint64_t n_exp_gpu = 0, n_exp_cpu = 0, n_exp_skipped = 0, n_exp_dropped = 0;
     uint64_t pred_hits = 0, pred_total = 0;   // predicted-vs-actual expert overlap
     uint64_t pred2_hits = 0, pred2_total = 0; // same, for the two-ahead prediction
     // Prediction quality by rank and by confidence margin -- the gate's

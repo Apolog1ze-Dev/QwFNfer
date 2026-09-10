@@ -75,6 +75,7 @@ int main(int argc, char ** argv) {
         // this: token-by-token prefill is a different (equally valid) summation
         // order, and this model turns that into different tokens.
         if (a == "--prefill-decode-max" && i + 1 < argc) { cfg.prefill_decode_max = (uint32_t) atoi(next()); continue; }
+        if (a == "--gate-drop" && i + 1 < argc) { cfg.gate_drop = (float) atof(next()); continue; }
         if (a == "--vram-reserve" && i + 1 < argc) { cfg.vram_reserve = (size_t)(atof(next()) * 1e6); continue; }
         if (a == "--no-prefill-overlap") { cfg.prefill_overlap = false; continue; }
         if (a == "--save-replay" && i + 1 < argc) { save_replay = next(); continue; }
@@ -252,6 +253,8 @@ int main(int argc, char ** argv) {
     }
     if (nll_n) printf("replay NLL: %.4f per token (ppl %.2f) over %d tokens\n", nll_sum / nll_n, std::exp(nll_sum / nll_n), nll_n);
     if (eng.n_exp_skipped) printf("skipped experts: %llu (misses computed without)\n", (unsigned long long) eng.n_exp_skipped);
+    if (eng.n_exp_dropped) printf("dropped experts: %llu (gate below --gate-drop; %.1f%% of routed)\n", (unsigned long long) eng.n_exp_dropped,
+                                  100.0 * eng.n_exp_dropped / std::max<uint64_t>(1, eng.n_exp_dropped + eng.n_exp_gpu + eng.n_exp_cpu + eng.n_exp_skipped));
 
     const auto & s = eng.cache_stats();
     printf("expert cache: %.1f%% hit, %.1f%% from VRAM, %.2f GB from disk\n",

@@ -62,6 +62,8 @@ struct qsa_decode_inputs {
 
 class graph_builder {
 public:
+    // Router gate threshold (see engine_config::gate_drop); applied by moe_route when > 0.
+    float gate_drop = 0.0f;
     // `alt` is consulted for names `w` does not hold. The dense core lives in a
     // CUDA buffer while the PLE table stays mmap'd on the host, so a graph needs
     // to resolve tensors across both; ggml_backend_sched then places each op on

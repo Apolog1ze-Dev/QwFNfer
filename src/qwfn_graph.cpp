@@ -667,6 +667,15 @@ void graph_builder::moe_route(ggml_tensor * cur, int il, ggml_tensor ** sel, ggm
     weights_ = ggml_reshape_2d(ctx0, weights_, n_expert_used, T);
     ggml_tensor * denom = ggml_clamp(ctx0, ggml_sum_rows(ctx0, weights_), 6.103515625e-5f, INFINITY);
     weights_ = ggml_div(ctx0, weights_, denom);
+    if (gate_drop > 0.0f) {
+        // Gate-threshold dropping: zero every normalised gate below the threshold
+        // and renormalise what is left. The top gate of ten that sum to one is at
+        // least 0.1, so a threshold below that always keeps at least one expert.
+        ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, weights_, 1.0f, -gate_drop));   // 1 where w >= thr
+        weights_ = ggml_mul(ctx0, weights_, keep);
+        ggml_tensor * denom2 = ggml_clamp(ctx0, ggml_sum_rows(ctx0, weights_), 6.103515625e-5f, INFINITY);
+        weights_ = ggml_div(ctx0, weights_, denom2);
+    }
     weights_ = ggml_reshape_3d(ctx0, weights_, 1, n_expert_used, T);
     if (gf_) ggml_build_forward_expand(gf_, weights_);
 

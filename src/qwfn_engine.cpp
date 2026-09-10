@@ -1683,7 +1683,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
             ggml_tensor * cur2 = gb.hc_mix(r, il, /*ffn=*/true, &inject);
             ggml_tensor * sl = nullptr, * wt = nullptr;
+            gb.gate_drop = decode ? cfg_.gate_drop : 0.0f;
             gb.moe_route(cur2, il, &sl, &wt);
+            gb.gate_drop = 0.0f;
             ggml_tensor * sh = gb.shared_expert(cur2, il);
 
             ggml_tensor * pg_here = nullptr;
@@ -1919,6 +1921,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             int64_t n_u = 0;
             for (int64_t k = 0; k < U * T; k++) {
                 const uint32_t e = (uint32_t) sel_[k]; bool dup = false;
+                if (cfg_.gate_drop > 0.0f && wgt_[k] == 0.0f) { n_exp_dropped++; continue; }   // dropped by the router graph
                 for (int64_t q = 0; q < n_u; q++) if (ids_[q] == e) { dup = true; break; }
                 if (!dup) ids_[n_u++] = e;
             }
