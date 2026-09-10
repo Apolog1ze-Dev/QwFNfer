@@ -1,4 +1,5 @@
 #include "qwfn_engine.h"
+#include "ggml-impl.h"   // struct ggml_cgraph, for profile_layer_graph (truncating the node count)
 #include "qwfn_ple.h"
 
 #include <algorithm>
@@ -970,6 +971,60 @@ bool engine::dump_routers(const std::string & dir, std::string & err) {
     return true;
 }
 
+void engine::profile_layer_graph(uint32_t il, int reps) {
+    if (il >= gA_.size() || !gA_[il].gf) { fprintf(stderr, "[profile] layer %u: no cached decode graph\n", il); return; }
+    ggml_cgraph * gf = gA_[il].gf;
+    const int n = gf->n_nodes;
+    if (!ggml_gallocr_alloc_graph(gA_[il].ga, gf)) { fprintf(stderr, "[profile] layer %u: alloc failed\n", il); return; }
+    auto time_prefix = [&](int k) -> double {
+        gf->n_nodes = k;
+        double best = 1e9;
+        for (int r = 0; r < reps + 3; r++) {   // the first replays warm up / capture the CUDA graph of this prefix
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_backend_graph_compute(w_.backend(), gf);
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (r >= 3 && dt < best) best = dt;
+        }
+        gf->n_nodes = n;
+        return best;
+    };
+    fprintf(stderr, "[profile] layer %u (%s), cached for T=%d, %d nodes; graph truncated after each node, min of %d replays, per-node delta:\n",
+            il, hp_.is_attn_layer(il) ? "attention" : "recurrent", (int) gA_T_[il], n, reps);
+    std::vector<double> t(n + 1, 0.0);
+    for (int k = 1; k <= n; k++) t[k] = time_prefix(k);
+    int n_view = 0, n_small = 0; double t_small = 0, t_big = 0;
+    for (int k = 1; k <= n; k++) {
+        const double d = (t[k] - t[k - 1]) * 1e6;
+        const ggml_tensor * nd = gf->nodes[k - 1];
+        const bool view = nd->op == GGML_OP_NONE || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_VIEW || nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_TRANSPOSE;
+        if (view) n_view++; else if (d < 8.0) { n_small++; t_small += d; } else t_big += d;
+        if (d >= 8.0)
+            fprintf(stderr, "[profile]   %3d %-13s %-30s [%lld,%lld,%lld] src0=%-8s +%4.0f us  (cum %5.0f)\n", k, ggml_op_name(nd->op), nd->name,
+                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2],
+                    nd->src[0] ? ggml_type_name(nd->src[0]->type) : "-", d, t[k] * 1e6);
+    }
+    fprintf(stderr, "[profile]   full graph: %.0f us; %d view/no-op nodes, %d kernels under 8 us (%.0f us together), the rest %.0f us\n",
+            t[n] * 1e6, n_view, n_small, t_small, t_big);
+}
+
+void engine::profile_all_graphs() {
+    double sum_rec = 0, sum_attn = 0; int n_rec = 0, n_attn = 0;
+    for (uint32_t il = 0; il < gA_.size(); il++) {
+        if (!gA_[il].gf) continue;
+        if (!ggml_gallocr_alloc_graph(gA_[il].ga, gA_[il].gf)) continue;
+        double best = 1e9;
+        for (int r = 0; r < 13; r++) {
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_backend_graph_compute(w_.backend(), gA_[il].gf);
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (r >= 3 && dt < best) best = dt;
+        }
+        fprintf(stderr, "[profile] layer %2u %-9s T=%d %3d nodes: %4.0f us\n", il, hp_.is_attn_layer(il) ? "attention" : "recurrent", (int) gA_T_[il], ggml_graph_n_nodes(gA_[il].gf), best * 1e6);
+        if (hp_.is_attn_layer(il)) { sum_attn += best; n_attn++; } else { sum_rec += best; n_rec++; }
+    }
+    fprintf(stderr, "[profile] standalone sum: %d recurrent %.1f ms + %d attention %.1f ms = %.1f ms per step\n", n_rec, sum_rec * 1e3, n_attn, sum_attn * 1e3, (sum_rec + sum_attn) * 1e3);
+}
+
 void engine::dump_decode_token() {
     if (dump_dec_dir_.empty() || !t_xdec_) return;
     if (!routers_dec_dumped_) { std::string e; if (!dump_routers(dump_dec_dir_, e)) { fprintf(stderr, "[qwfn] %s\n", e.c_str()); dump_dec_dir_.clear(); return; } routers_dec_dumped_ = true; }
@@ -1738,11 +1793,28 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         if (replayable && gA_[il].gf) {
             ran_packed = gA_pack_[il] != 0;
             const auto ta0 = std::chrono::steady_clock::now();
-            if (!ggml_gallocr_alloc_graph(gA_[il].ga, gA_[il].gf)) { err = "replay alloc failed"; return false; }
-            if (ggml_backend_graph_compute(w_.backend(), gA_[il].gf) != GGML_STATUS_SUCCESS) {
+            // The allocator's pass re-assigns the same addresses every time for a
+            // cached graph (22 us a layer); once is enough. The CUDA backend then
+            // compares every node's properties on every replay (44-91 us a layer)
+            // unless the graph carries the uid it recorded: it does, set when cached.
+            if (!gA_[il].allocated) {
+                if (!ggml_gallocr_alloc_graph(gA_[il].ga, gA_[il].gf)) { err = "replay alloc failed"; return false; }
+                gA_[il].allocated = true;
+            }
+            const auto ta1 = std::chrono::steady_clock::now();
+            // Split the replay: the allocator's pass, the launch (the property check
+            // over every node and the graph submit), the wait for the device.
+            if (ggml_backend_graph_compute_async(w_.backend(), gA_[il].gf) != GGML_STATUS_SUCCESS) {
                 err = "replay compute failed"; return false;
             }
-            const double dtA = std::chrono::duration<double>(std::chrono::steady_clock::now() - ta0).count();
+            const auto ta2 = std::chrono::steady_clock::now();
+            ggml_backend_synchronize(w_.backend());
+            const auto ta3 = std::chrono::steady_clock::now();
+            t_replay_alloc  += std::chrono::duration<double>(ta1 - ta0).count();
+            t_replay_launch += std::chrono::duration<double>(ta2 - ta1).count();
+            t_replay_wait   += std::chrono::duration<double>(ta3 - ta2).count();
+            n_replay++;
+            const double dtA = std::chrono::duration<double>(ta3 - ta0).count();
             t_layerA += dtA;
             if (hp_.is_attn_layer(il)) { t_layerA_attn += dtA; n_layerA_attn++; }
             else                       { t_layerA_rec  += dtA; n_layerA_rec++;  }
@@ -1939,6 +2011,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_gallocr_t ga = ggml_gallocr_new(w_.buft());
                 if (ga && ggml_gallocr_alloc_graph(ga, g)) {
                     gA_[il].ctx = c; gA_[il].gf = g; gA_[il].ga = ga;
+                    // A nonzero uid unique to this build: the CUDA backend skips its
+                    // per-replay property walk while it sees the same uid, and a rebuilt
+                    // graph (new T or bucket) gets a new one.
+                    static uint64_t graph_uid = 0;
+                    g->uid = ++graph_uid;
                     gA_bucket_[il] = qd_.n_bucket; gA_T_[il] = (uint8_t) T; gA_pack_[il] = pack_ok;
                     cached = true;
                     if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {

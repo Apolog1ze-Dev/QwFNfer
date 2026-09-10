@@ -75,6 +75,7 @@ target_include_directories(qwfn_core PUBLIC
   "${LLAMA_CPP_ROOT}/vendor/stb"
   src
   "${LLAMA_CPP_ROOT}/ggml/include"
+  "${LLAMA_CPP_ROOT}/ggml/src"       # ggml-impl.h: the graph struct, for the per-node profiler only
   "${URING_INCLUDE_DIR}"
 )
 target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}")

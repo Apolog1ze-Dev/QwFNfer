@@ -285,6 +285,11 @@ public:
     void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 
     const expert_cache_stats & cache_stats() const { return ec_.stats(); }
+    // Instrument: time layer `il`'s cached decode graph truncated after each node
+    // (min of `reps` replays) and print the per-node deltas >= 8 us. Ends the session.
+    void profile_layer_graph(uint32_t il, int reps = 10);
+    void profile_all_graphs();   // every cached decode graph replayed standalone (min of 10): the step's device time without the loop
+    double t_replay_alloc = 0, t_replay_launch = 0, t_replay_wait = 0; uint64_t n_replay = 0;   // the cached decode graphs' replays, split
     uint64_t prefill_bytes_read()     const { return pf_.bytes_read; }       // expert bytes the streamed sweeps read
     uint64_t prefill_bytes_from_ram() const { return pf_.bytes_from_ram; }   // ...and took from the RAM tier instead
     expert_cache::census        ram_census()  const { return ec_.ram_census(); }
@@ -366,6 +371,7 @@ private:
     // its tensor addresses stay put between tokens, which is what lets ggml's
     // CUDA graph capture survive instead of being invalidated every layer.
     struct layer_graph {
+        bool allocated = false;   // the allocator's pass ran once for this cached graph; replays skip it
         ggml_context * ctx = nullptr;
         ggml_cgraph  * gf  = nullptr;
         ggml_gallocr_t ga  = nullptr;

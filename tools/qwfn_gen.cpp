@@ -320,6 +320,14 @@ int main(int argc, char ** argv) {
     }
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("\n\ndecode: %d tokens in %.2f s  (%.2f tok/s), n_past=%d\n", n_gen, dt, n_gen / dt, eng.n_past());
+    if (eng.n_replay)
+        printf("cached graph replays: %llu; per replay alloc %.0f us, launch %.0f us, wait %.0f us\n", (unsigned long long) eng.n_replay,
+               eng.t_replay_alloc / eng.n_replay * 1e6, eng.t_replay_launch / eng.n_replay * 1e6, eng.t_replay_wait / eng.n_replay * 1e6);
+    if (const char * pl = getenv("QWFN_PROFILE_LAYERS")) {   // "3,4,5": per-node timing of those layers' cached decode graphs; "all": every layer's whole graph
+        std::string s(pl); size_t p = 0;
+        if (s == "all") { eng.profile_all_graphs(); s.clear(); }
+        while (p < s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); if (q > p) eng.profile_layer_graph((uint32_t) atoi(s.substr(p, q - p).c_str())); p = q + 1; }
+    }
     if (!save_replay.empty()) {
         FILE * f = fopen(save_replay.c_str(), "wb");
         if (f) { for (size_t i = hist.size() - n_gen; i < hist.size(); i++) fprintf(f, "%d\n", hist[i]); fclose(f);
