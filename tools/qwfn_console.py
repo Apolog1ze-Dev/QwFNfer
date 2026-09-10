@@ -166,7 +166,14 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     # Measured 2026-09-10 (VRAM audit): the engine grows ~425 MB after init (48 cached
     # decode graphs 286 MB, the pool, per-call inputs); 512 ran the 131K doc replay, so
     # 768 with a desktop / 640 headless keeps a step of margin and gives the tier a step.
-    reserve_mb = 768 if hw["desktop_gpu"] else 640
+    reserve_base = 768 if hw["desktop_gpu"] else 640
+    # What decode allocates after the tier grows with the context (the attention
+    # graphs are shaped by the block bucket, flat to ~48K tokens then per 256 blocks,
+    # plus the CUDA pool and graph instantiations): measured 2026-09-10 at 101K, 805 MB
+    # ran out at the first token after a prefill and 1024 held; 768 held at 43K. The
+    # engine applies the same rule when no --reserve is given.
+    def reserve_for(c): return int(reserve_base + max(0, c // 1024 - 48) * 8)
+    reserve_mb = reserve_for(131072)   # the widest preset; per context below
     # The desktop's own VRAM use, measured now (minus any qwfn engine).
     used = hw["vram_used_mb"] / 1024.0
     eng_used = hw.get("qwfn_vram_mb", 0) / 1024.0
@@ -201,7 +208,7 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     HEAD_VRAM_GB = 0.35 if mtp_on else 0.0
     lend_gb = lend_for(2048)   # the smallest prefill buffer: below this there is no tier at all
     def tier_for(c, kv, sh):
-        t = vram - core - state_vram_gb(c, kv, sh) - reserve_mb / 1024 - desktop_use - OVERHEAD_GB - HEAD_VRAM_GB
+        t = vram - core - state_vram_gb(c, kv, sh) - reserve_for(c) / 1024 - desktop_use - OVERHEAD_GB - HEAD_VRAM_GB
         return t if t >= lend_gb + 0.1 else 0.0
     def state_host_for(c, kv):
         # Measured on the doc replay (Q4, 2026-09-09): the indexer move is a small clean
@@ -264,7 +271,7 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     options = [option(c, vision) for c in CTX_STEPS]
     chosen = next(o for o in options if o["ctx"] == p["ctx_actual"])
     return {
-        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "threads": chosen["threads"], "batch": chosen["batch"], "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
+        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "threads": chosen["threads"], "batch": chosen["batch"], "reserve": reserve_for(chosen["ctx"]), "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "state_host": chosen["state_host"],

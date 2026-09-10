@@ -55,6 +55,16 @@ struct engine_config {
     // graph holds several [n_kv, T] tensors; at 96M they needed a 1.3 GB
     // arena on top of the MoE chunk's and the tier had not left that free.
     uint64_t  ubatch_kv_product = 48ull << 20;
+    // The cache-batched prompt path (prompts up to prefill_decode_max) runs inside
+    // the decode reserve, not the lent prefill memory, and its attention work grows
+    // with tokens x context; it is also slower than the sweep once the context is
+    // long (495 tokens at 101K: 20 s batched in chunks against ~12 s streamed).
+    // A prompt takes the batched path only while tokens x context stays under this
+    // product: 12M is the old 96-token threshold at 131K, known to fit; at 10K a
+    // 512-token prompt still batches (measured 2x faster than the sweep there).
+    // Above it the prompt streams. Without the rule a 440-token tool result with an
+    // image at a long context asked for 440 MB and aborted the server (2026-09-10).
+    uint64_t  cbatch_kv_product = 12ull << 20;
     bool      reuse_graphs = true;   // replay the position-independent layer graphs
     bool      io_threads = true;
     unsigned  io_workers = 16;

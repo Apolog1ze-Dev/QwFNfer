@@ -63,8 +63,17 @@ engine::~engine() {
     if (hctx_) ggml_free(hctx_);
 }
 
+// ggml's default logger prints its DEBUG lines ("CUDA graph warmup complete",
+// "CUDA Graph id N reused" on every replay of a cached graph): thousands a
+// request in a server log. Keep INFO and above.
+static void qwfn_ggml_log(enum ggml_log_level level, const char * text, void * /*user*/) {
+    if (level == GGML_LOG_LEVEL_DEBUG) return;
+    fputs(text, stderr);
+}
+
 bool engine::init(const model_index * hot, const model_index * cold,
                   const engine_config & cfg, const std::string & backend_dir, std::string & err) {
+    ggml_log_set(qwfn_ggml_log, nullptr);
     mi_  = hot;
     cfg_ = cfg;
     hp_  = hot->hp();
@@ -486,7 +495,15 @@ bool engine::init(const model_index * hot, const model_index * cold,
         const size_t work_set  = (size_t) (2 * n_embd * hc + 6 * n_embd + hc + 3 * U + 5 + PH) * B * 4 + (64ull << 20);
         const size_t staging   = (cfg.prefill_on_gpu && cfg.use_gpu) ? prefill_streamer::device_bytes_for(hot) : 0;
         ec_cfg.lend_bytes   = staging + work_set + pf_graph + inputs + qsa_graph;
-        ec_cfg.vram_reserve = cfg.vram_reserve ? cfg.vram_reserve : (768ull << 20);   // decode graphs, buckets, scratch
+        // What decode allocates after the tier grows with the context: the attention
+        // graphs are shaped by the block bucket (flat up to ~48K tokens, then per
+        // 256 blocks), the CUDA pool with their temporaries, the head's graphs, and
+        // the CUDA graph instantiations. Measured at 101K: 805 MB ran out at the
+        // first token after the prefill (cudaGraphInstantiate), 1024 held; 768 held
+        // at 43K and 10K. 768 MB + 8 MB per 1K tokens above 48K: 1.4 GB at 131K.
+        const size_t ctx_k = (size_t) cfg.n_ctx / 1024;
+        const size_t auto_reserve = (768ull << 20) + (ctx_k > 48 ? (ctx_k - 48) * (8ull << 20) : 0);
+        ec_cfg.vram_reserve = cfg.vram_reserve ? cfg.vram_reserve : auto_reserve;
         fprintf(stderr, "[qwfn] prefill VRAM (dynamic, lent by the expert tier): %.2f GB; decode reserve %.0f MB\n",
                 ec_cfg.lend_bytes / 1e9, ec_cfg.vram_reserve / 1e6);
     }
@@ -797,7 +814,10 @@ const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, 
     // A short prefill is cheaper token by token: the streaming path's cost is
     // the whole expert set per layer regardless of T, so it only pays off once
     // T is large enough to amortise it.
-    const bool as_decode = n_new > 1 && n_new <= (int32_t) cfg_.prefill_decode_max;
+    static const char * ckv = getenv("QWFN_CBATCH_KV");   // 0 disables the product rule, for the record
+    const uint64_t cbatch_prod = ckv ? (uint64_t) atoll(ckv) : cfg_.cbatch_kv_product;
+    const bool as_decode = n_new > 1 && n_new <= (int32_t) cfg_.prefill_decode_max &&
+                           (cbatch_prod == 0 || (uint64_t) n_new * (uint64_t) std::max<int32_t>(n_past_, 1) <= cbatch_prod);
     // ... and, with a GPU, as ONE batch whose experts come through the cache.
     static const bool no_cbatch = getenv("QWFN_NO_CACHE_BATCH") != nullptr;
     const bool as_cbatch = as_decode && cfg_.cache_batched && scr_buf_ && !no_cbatch;   // cold-resident experts are re-read hot by fetch_batch
@@ -2030,7 +2050,14 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             }
             if (!cached) {
                 const auto tb = std::chrono::steady_clock::now();
-                if (!ggml_gallocr_alloc_graph(galloc_gpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                if (!ggml_gallocr_alloc_graph(galloc_gpu_, g)) {
+                    // Out of device memory for this graph: fail the request, not the process.
+                    err = "out of VRAM for a " + std::to_string(T) + "-token batch at " + std::to_string(n_past_) +
+                          " tokens of context (layer " + std::to_string(il) + "); lower the batch or raise the reserve";
+                    fprintf(stderr, "[qwfn] %s\n", err.c_str());
+                    ggml_free(c);
+                    return false;
+                }
                 const auto tc = std::chrono::steady_clock::now();
                 if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {
                     fprintf(stderr, "[qwfn] compute failed\n"); abort();
