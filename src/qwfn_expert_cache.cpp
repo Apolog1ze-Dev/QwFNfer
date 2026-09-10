@@ -319,6 +319,26 @@ void expert_cache::shutdown() {
     arena_bytes_ = 0;
 }
 
+// QWFN_READ_SPLIT=k: every block-part read is issued as k pieces (alignment-granular),
+// so one layer's burst sits deeper in the drive's queue. An experiment knob.
+static int read_split() {
+    static const int k = getenv("QWFN_READ_SPLIT") ? std::max(1, std::min(8, atoi(getenv("QWFN_READ_SPLIT")))) : 1;
+    return k;
+}
+template <class F> static void push_pieces(const io_request & r, F && push) {
+    const int k = read_split();
+    const uint64_t g = dio_align();
+    if (k <= 1 || r.nbytes < 2 * g) { push(r); return; }
+    const uint64_t piece = ((r.nbytes / k + g - 1) / g) * g;
+    for (uint64_t off = 0; off < r.nbytes; off += piece) {
+        io_request p = r;
+        p.offset = r.offset + off;
+        p.nbytes = (uint32_t) std::min<uint64_t>(piece, r.nbytes - off);
+        p.dst    = (uint8_t *) r.dst + off;
+        push(p);
+    }
+}
+
 int32_t expert_cache::find_slot(layer_pool & lp, uint32_t expert_id) const {
     const int32_t s = lp.expert_slot[expert_id];
     if (s < 0) return -1;
@@ -599,8 +619,8 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
     }
 
     // Up to n_expert_used experts x 3 parts in flight for this layer.
-    io_request reqs[64 * EXPERT_NPARTS];
-    bool       req_cold[64 * EXPERT_NPARTS];
+    io_request reqs[64 * EXPERT_NPARTS * 8];
+    bool       req_cold[64 * EXPERT_NPARTS * 8];
     uint32_t   miss_slot[64];
     uint32_t   miss_expert[64];
     size_t     n_req = 0, n_miss = 0;
@@ -743,9 +763,8 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         for (int q = 0; q < EXPERT_NPARTS; q++) {
             const byte_range br = src->expert_range(layer, e, (expert_part) q);
             if (!br.valid()) return false;
-            req_cold[n_req] = take_cold;
-            reqs[n_req++] = io_request{ br.shard, br.offset, br.nbytes,
-                                        base + lp.part_off[q], (uint64_t) n_miss };
+            push_pieces(io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], (uint64_t) n_miss },
+                        [&](const io_request & p) { req_cold[n_req] = take_cold; reqs[n_req++] = p; });
             st_.bytes_from_disk += br.nbytes;
         }
         fill_handle(lp, (uint32_t) v, out[i]);
@@ -769,7 +788,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
     // experts that were already resident. Hot and cold blocks live in different
     // files: each request goes to its file's engine, and fetch_end drains both.
     // (One engine for all of them read hot misses out of the cold shards.)
-    io_request hot_reqs[64 * EXPERT_NPARTS], cold_reqs[64 * EXPERT_NPARTS];
+    io_request hot_reqs[64 * EXPERT_NPARTS * 8], cold_reqs[64 * EXPERT_NPARTS * 8];
     size_t n_hot = 0, n_cold = 0;
     for (size_t k = 0; k < n_req; k++) (req_cold[k] ? cold_reqs[n_cold++] : hot_reqs[n_hot++]) = reqs[k];
     auto submit_all = [&](io_engine & eng, const io_request * rq, size_t n, size_t & inflight) {
@@ -1265,7 +1284,7 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
     // this bound should be unreachable (two sets of <= n_expert_used each).
     if (pf_pending_.size() > 4096) prefetch_settle();
 
-    io_request reqs[128 * EXPERT_NPARTS];
+    io_request reqs[128 * EXPERT_NPARTS * 8];
     size_t n_req = 0;
 
     for (uint32_t s = 0; s < n_sets; s++) {
@@ -1273,7 +1292,7 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
         if (layer >= blk_.size()) continue;
         layer_pool & lp = blk_[layer];
 
-        for (uint32_t i = 0; i < sets[s].n && n_req + EXPERT_NPARTS <= sizeof(reqs)/sizeof(reqs[0]); i++) {
+        for (uint32_t i = 0; i < sets[s].n && n_req + EXPERT_NPARTS * 8 <= sizeof(reqs)/sizeof(reqs[0]); i++) {
             const uint32_t e = sets[s].ids[i];
             if (e >= hot_->hp().n_expert) continue;
             if (lp.g_slots > 0 && lp.g_expert_slot[e] >= 0) continue;   // already in VRAM
@@ -1312,8 +1331,8 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
             for (int q = 0; q < EXPERT_NPARTS; q++) {
                 const byte_range br = (pf_cold ? cold_ : hot_)->expert_range(layer, e, (expert_part) q);
                 if (!br.valid()) continue;
-                reqs[n_req++] = io_request{ br.shard + (pf_cold ? (int) n_hot_shards_ : 0), br.offset, br.nbytes, base + lp.part_off[q], tag };
-                ent.remaining++;
+                push_pieces(io_request{ br.shard + (pf_cold ? (int) n_hot_shards_ : 0), br.offset, br.nbytes, base + lp.part_off[q], tag },
+                            [&](const io_request & p) { reqs[n_req++] = p; ent.remaining++; });
                 st_.bytes_from_disk += br.nbytes;
             }
             if (ent.remaining == 0) {   // nothing to read: mark it now
