@@ -209,11 +209,21 @@ public:
     const float * eval_decode(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err);
     const float * logits_pos(int i) const { return logits_.data() + (size_t) i * n_vocab_; }
     bool rollback(std::string & err);
+    // Layer 0's routing for the T tokens that end `hist` (the positions the next
+    // eval will take), computed exactly on the state as it stands, and their
+    // expert reads issued now. Every other layer is predicted a layer ahead; layer 0
+    // had nothing before it, so each token boundary paid a demand fetch (3-4.5 ms
+    // measured). Cheap and exact: layer 0's block on the current state IS what the
+    // next eval computes, only the state writes are suppressed.
+    bool spec_layer0(const int32_t * hist, int32_t n_hist, int32_t T, std::string & err);
+    double t_spec_l0 = 0; uint64_t n_spec_l0 = 0;
+    double t_mtp_pre = 0, t_mtp_moe = 0, t_mtp_post = 0;   // where a draft's time goes: dense half, CPU experts (with the transfers), second half + LM head
     // MTP head: run it over the last n positions of the sequence (their wide
     // residuals from the last eval) with the tokens that follow each, and keep
     // the last position's draft. mtp_ready() says whether the head can draft.
     bool    mtp_step(const int32_t * next_toks, int n, std::string & err);
     int32_t mtp_draft_id() const { return mtp_draft_; }
+    bool    mtp_on() const { return mtp_on_; }
     // The head's logits at the draft position, read back only when asked for
     // (the server samples the draft from them at temperature); nullptr otherwise.
     void          set_mtp_logits(bool on) { mtp_want_logits_ = on; }
@@ -242,6 +252,7 @@ public:
     // The vision tower shares the language model's backend and buffer type.
     ggml_backend_t             backend() const { return w_.backend(); }
     ggml_backend_buffer_type_t buft()    const { return w_.buft(); }
+    bool is_attn_layer(uint32_t il) const { return hp_.is_attn_layer(il); }
     // Device bytes held by the cached per-layer decode graphs' allocators (QWFN_VRAM_AUDIT).
     void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 
@@ -264,6 +275,12 @@ public:
     // QSA inputs, the device allocation for them) is t_inputs, once per token.
     double t_attn_build = 0, t_attn_compute = 0, t_inputs = 0;
     uint64_t n_exp_gpu = 0, n_exp_cpu = 0, n_exp_skipped = 0, n_exp_dropped = 0;
+    // Per-layer I/O wait profile of the decode loop (seconds summed over the run): the
+    // wait when a layer's fetch is issued (deferred misses, demand reads that had to
+    // block) and the wait at its end (reads still landing after the ready pass), and
+    // the reads that fetch issued itself (not the speculative ones for the next layer).
+    std::vector<double>   prof_io_begin, prof_io_end;
+    std::vector<uint64_t> prof_reads;
     uint64_t pred_hits = 0, pred_total = 0;   // predicted-vs-actual expert overlap
     uint64_t pred2_hits = 0, pred2_total = 0; // same, for the two-ahead prediction
     // Prediction quality by rank and by confidence margin -- the gate's

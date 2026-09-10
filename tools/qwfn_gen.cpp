@@ -197,6 +197,14 @@ int main(int argc, char ** argv) {
             if (replay.empty()) return argmax(l);
             return k < (int) replay.size() ? replay[k] : -1;
         };
+        // Layer 0's reads for the tokens the next eval will take, issued as soon as
+        // they are known: the bonus token before the head runs, the pair once it has.
+        auto spec_l0 = [&](const int32_t * toks, int n) {
+            if (!use_mtp) return;   // no lead without the head: the eval follows at once
+            for (int k = 0; k < n; k++) hist.push_back(toks[k]);
+            eng.spec_layer0(hist.data(), (int32_t) hist.size(), n, err);
+            for (int k = 0; k < n; k++) hist.pop_back();
+        };
         while (produced < n_gen) {
             const int32_t draft = use_mtp ? eng.mtp_draft_id() : -1;
             const bool room = produced + 1 < n_gen && (replay.empty() || i + 1 < (int) replay.size());
@@ -205,6 +213,7 @@ int main(int argc, char ** argv) {
                 const int32_t second = pair_test ? replay[i + 1]
                                      : rollback_test ? (int32_t) ((replay[i + 1] + (getenv("QWFN_RB_WRONG") ? atoi(getenv("QWFN_RB_WRONG")) : 1)) % eng.n_vocab())
                                      : draft;
+                { const int32_t two[2] = { next, second }; spec_l0(two, 2); }
                 hist.push_back(next); hist.push_back(second);
                 if (!eng.eval_decode(hist.data(), (int32_t) hist.size(), 2, err)) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
                 const float * l0 = eng.logits_pos(0), * l1 = eng.logits_pos(1);
@@ -219,6 +228,7 @@ int main(int argc, char ** argv) {
                     if (want_ppl && !replay.empty() && i + 2 < n_gen) score(l1, replay[i + 2]);
                     i += 2; sp_acc++;
                     if (next2 < 0) break;
+                    spec_l0(&next2, 1);
                     if (use_mtp) { const int32_t toks[2] = { second, next2 }; if (!eng.mtp_step(toks, 2, err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; } }
                     next = next2;
                 } else {
@@ -226,6 +236,7 @@ int main(int argc, char ** argv) {
                     hist.pop_back();
                     i += 1;
                     if (y < 0) break;
+                    spec_l0(&y, 1);
                     if (use_mtp && !eng.mtp_step(&y, 1, err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; }
                     next = y;
                 }
@@ -238,6 +249,7 @@ int main(int argc, char ** argv) {
                 if (want_ppl && !replay.empty() && i + 1 < n_gen) score(lg, replay[i + 1]);
                 i += 1;
                 if (y < 0) break;
+                spec_l0(&y, 1);
                 if (use_mtp && !eng.mtp_step(&y, 1, err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; }
                 next = y;
             }
@@ -254,6 +266,21 @@ int main(int argc, char ** argv) {
     }
     if (nll_n) printf("replay NLL: %.4f per token (ppl %.2f) over %d tokens\n", nll_sum / nll_n, std::exp(nll_sum / nll_n), nll_n);
     if (eng.n_exp_skipped) printf("skipped experts: %llu (misses computed without)\n", (unsigned long long) eng.n_exp_skipped);
+    if (eng.n_spec_l0) printf("layer-0 speculation: %llu calls, %.2f ms each\n", (unsigned long long) eng.n_spec_l0, 1e3 * eng.t_spec_l0 / eng.n_spec_l0);
+    if (eng.t_mtp_pre + eng.t_mtp_moe + eng.t_mtp_post > 0)
+        printf("head split: dense half %.2f s | CPU experts + transfers %.2f s | second half + LM head + argmax %.2f s\n", eng.t_mtp_pre, eng.t_mtp_moe, eng.t_mtp_post);
+    if (getenv("QWFN_IO_PROFILE") && !eng.prof_io_end.empty() && n_gen > 0) {
+        // Where the decode loop waits for reads, layer by layer, per decoded token.
+        printf("io profile (ms per token; begin = wait when the layer's fetch is issued, end = wait for its reads after the ready pass, reads = demand reads issued by the fetch):\n");
+        double tb = 0, te = 0; uint64_t tr = 0;
+        for (size_t il = 0; il < eng.prof_io_end.size(); il++) {
+            tb += eng.prof_io_begin[il]; te += eng.prof_io_end[il]; tr += eng.prof_reads[il];
+            printf("  L%-2zu %s begin %5.2f end %5.2f reads %5.2f%s", il, eng.is_attn_layer((uint32_t) il) ? "A" : "R",
+                   1e3 * eng.prof_io_begin[il] / n_gen, 1e3 * eng.prof_io_end[il] / n_gen, (double) eng.prof_reads[il] / n_gen, (il % 3 == 2) ? "\n" : " |");
+        }
+        printf("\n  total begin %.1f ms, end %.1f ms, %.1f demand reads per token; layer 0 begin %.2f ms\n",
+               1e3 * tb / n_gen, 1e3 * te / n_gen, (double) tr / n_gen, 1e3 * eng.prof_io_begin[0] / n_gen);
+    }
     if (getenv("QWFN_VRAM_AUDIT")) {
         size_t ab = 0, mb = 0; int ag = 0, mg = 0; eng.graph_buffer_bytes(ab, ag, mb, mg);
         printf("VRAM audit: cached decode graphs hold %.0f MB of activations in %d layer graphs (%.1f MB each), MoE graphs %.0f MB in %d\n",

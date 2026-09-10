@@ -110,6 +110,25 @@ struct sampler {
     std::mt19937 rng{0xC0FFEEu};
     std::vector<int32_t> gen;   // tokens generated so far, for the penalties
 
+    // The k largest logits, descending. A partial_sort over the whole vocabulary
+    // (248K entries) cost 1.5-3 ms per call and a sampled pair step makes three
+    // or four of them; instead two linear passes -- the max, then every logit
+    // within 40 temperatures of it (a relative probability of e^-40, nothing
+    // at float precision) -- and a partial_sort over the few that survive.
+    // Same k best, same order, whenever at least k survive; when fewer do,
+    // the ones left out had zero probability anyway.
+    void top_indices(const float * lg, int64_t n, int k, std::vector<int> & idx) const {
+        float mx = lg[0];
+        for (int64_t v = 1; v < n; v++) mx = std::max(mx, lg[v]);
+        const float margin = 40.0f * std::max(cfg.temp, 1e-3f);
+        const float floor_ = mx - margin;
+        idx.clear();
+        for (int64_t v = 0; v < n; v++) if (lg[v] >= floor_) idx.push_back((int) v);
+        const int kk = (int) std::min<size_t>((size_t) k, idx.size());
+        std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        idx.resize(kk);
+    }
+
     // The distribution pick() samples from -- penalties, top-k, temperature,
     // min-p, top-p -- as (token, probability) over the kept candidates. Empty
     // at temperature 0 (greedy: pick() takes the argmax).
@@ -133,11 +152,9 @@ struct sampler {
             }
             lg = pen.data();
         }
-        const int k = (int) std::min<int64_t>(cfg.top_k > 0 ? cfg.top_k : n, n);
-        std::vector<int> idx(n);
-        for (int64_t v = 0; v < n; v++) idx[v] = (int) v;
-        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-        idx.resize(k);
+        std::vector<int> idx;
+        top_indices(lg, n, (int) std::min<int64_t>(cfg.top_k > 0 ? cfg.top_k : n, n), idx);
+        const int k = (int) idx.size();
         const float mx = lg[idx[0]];
         std::vector<float> p(k);
         double sum = 0;
@@ -186,12 +203,9 @@ struct sampler {
             for (int64_t v = 1; v < n; v++) if (lg[v] > lg[best]) best = (int) v;
             return best;
         }
-        const int k = (int) std::min<int64_t>(cfg.top_k > 0 ? cfg.top_k : n, n);
-        std::vector<int> idx(n);
-        for (int64_t v = 0; v < n; v++) idx[v] = (int) v;
-        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                          [&](int a, int b) { return lg[a] > lg[b]; });
-        idx.resize(k);
+        std::vector<int> idx;
+        top_indices(lg, n, (int) std::min<int64_t>(cfg.top_k > 0 ? cfg.top_k : n, n), idx);
+        const int k = (int) idx.size();
         const float mx = lg[idx[0]];
         std::vector<float> p(k);
         double sum = 0;
@@ -1011,6 +1025,14 @@ int main(int argc, char ** argv) {
         int32_t tok = smp.pick(lg, S.eng.n_vocab());
         if (!S.eng.mtp_step(&tok, 1, e)) return false;
         bool tok_in = false; int32_t tok_next = -1;
+        // Layer 0's reads for the tokens the next eval will take, issued as soon as they
+        // are known (engine::spec_layer0): the bonus token before the head runs, the pair
+        // once drafted, a sampled token before its eval.
+        auto spec_l0 = [&](const int32_t * toks, int n, int T) {
+            for (int k = 0; k < n; k++) hist.push_back(toks[k]);
+            std::string se; S.eng.spec_layer0(hist.data(), (int32_t) hist.size(), T, se);
+            for (int k = 0; k < n; k++) hist.pop_back();
+        };
         for (; n < budget; n++) {
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.n_gen = n + 1; S.live.t_gen = since(td); S.live.n_past = S.eng.n_past(); }
             if (!tok_in) hist.push_back(tok);
@@ -1082,6 +1104,7 @@ int main(int argc, char ** argv) {
                 if (!qd.empty()) { draft = smp.sample(qd); q_d = sampler::prob_of(qd, draft); }
             }
             if (draft >= 0 && !S.vb.is_eog(draft) && n + 1 < budget && (int32_t) hist.size() + 2 <= (int32_t) S.n_ctx) {
+                spec_l0(&draft, 1, 2);
                 hist.push_back(draft);
                 if (!S.eng.eval_decode(hist.data(), (int32_t) hist.size(), 2, e)) return false;
                 const float * l0 = S.eng.logits_pos(0), * l1 = S.eng.logits_pos(1);
@@ -1108,6 +1131,7 @@ int main(int argc, char ** argv) {
                     R.n_accepted++;
                     smp.gen.push_back(draft);
                     tok_next = smp.pick(l1, S.eng.n_vocab());
+                    spec_l0(&tok_next, 1, 1);
                     const int32_t two[2] = { draft, tok_next };
                     if (!S.eng.mtp_step(two, 2, e)) return false;
                     tok = draft; tok_in = true;
@@ -1115,12 +1139,14 @@ int main(int argc, char ** argv) {
                     if (!S.eng.rollback(e)) return false;
                     hist.pop_back();
                     tok = y;
+                    spec_l0(&tok, 1, 1);
                     if (!S.eng.mtp_step(&tok, 1, e)) return false;
                 }
             } else {
                 lg = S.eng.eval(hist.data(), (int32_t) hist.size(), 1, e);
                 if (!lg) return false;
                 tok = smp.pick(lg, S.eng.n_vocab());
+                if (S.eng.mtp_on()) spec_l0(&tok, 1, 1);   // a lead only when the head runs next
                 if (!S.eng.mtp_step(&tok, 1, e)) return false;
             }
         }
