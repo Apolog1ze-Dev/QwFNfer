@@ -76,6 +76,7 @@ int main(int argc, char ** argv) {
         // order, and this model turns that into different tokens.
         if (a == "--prefill-decode-max" && i + 1 < argc) { cfg.prefill_decode_max = (uint32_t) atoi(next()); continue; }
         if (a == "--gate-drop" && i + 1 < argc) { cfg.gate_drop = (float) atof(next()); continue; }
+        if (a == "--prefill-chunk" && i + 1 < argc) { cfg.prefill_chunk = (uint32_t) atoi(next()); continue; }
         if (a == "--vram-reserve" && i + 1 < argc) { cfg.vram_reserve = (size_t)(atof(next()) * 1e6); continue; }
         if (a == "--no-prefill-overlap") { cfg.prefill_overlap = false; continue; }
         if (a == "--save-replay" && i + 1 < argc) { save_replay = next(); continue; }

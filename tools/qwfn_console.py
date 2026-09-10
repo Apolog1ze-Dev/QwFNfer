@@ -145,13 +145,30 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     vision = bool(vision and model.get("mmproj"))
     mm_gb = model.get("mmproj_gb", 0.0) if vision else 0.0   # host memory, not VRAM
     vram = hw["vram_total_mb"] / 1024.0
-    reserve_mb = 1024 if hw["desktop_gpu"] else 768
+    # Measured 2026-09-10 (VRAM audit): the engine grows ~425 MB after init (48 cached
+    # decode graphs 286 MB, the pool, per-call inputs); 512 ran the 131K doc replay, so
+    # 768 with a desktop / 640 headless keeps a step of margin and gives the tier a step.
+    reserve_mb = 768 if hw["desktop_gpu"] else 640
     # The desktop's own VRAM use, measured now (minus any qwfn engine).
     used = hw["vram_used_mb"] / 1024.0
     eng_used = hw.get("qwfn_vram_mb", 0) / 1024.0
     desktop_use = max(0.2, used - eng_used) if hw["desktop_gpu"] else 0.1
     avail = hw["ram_available_gb"] if not engines_running() else max(hw["ram_available_gb"], hw["ram_total_gb"] - 8.0)
-    batch = 4096 if vram >= 12 else 2048
+    # The prefill sweeps every expert once per batch and computes per token, so the
+    # batch is the prefill's speed: measured on a 43K document at 131K (2026-09-10),
+    # 4096 -> 300 tok/s, 8192 -> 479, 16384 -> 722 (compute-bound from there). What a
+    # batch costs is VRAM lent by the expert tier while a prompt streams -- 0.59 GB per
+    # 4096 tokens on top of the staging -- and the tier must keep more than that or it is
+    # disabled, so the batch is picked per context below: the largest whose lend leaves
+    # the tier at least a gigabyte. Decode is unchanged either way (harness, same session).
+    BATCH_LEND_GB = {2048: 3.9, 4096: 4.4, 8192: 4.98, 16384: 6.16}
+    PREFILL_TPS   = {2048: 240, 4096: 300, 8192: 479, 16384: 722}   # Q4 on this NVMe; Q3 reads 36% less per sweep
+    q3_adj = 0.27 if q == "Q3_K_XL" else 0.0
+    def lend_for(b): return BATCH_LEND_GB[b] - q3_adj
+    def batch_for(tier_gb):
+        for b in (16384, 8192, 4096, 2048):
+            if tier_gb - lend_for(b) >= 1.0: return b
+        return 2048
     forced_state = state_host if state_host in STATE_HOST_OPTIONS else None   # None: chosen per context below
     # What the engine does with the VRAM left after the dense core and the context's state:
     # it takes OVERHEAD_GB for its CUDA context, decode state and graph arenas (measured
@@ -160,9 +177,13 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     # that buffer is lent by the tier while a prompt streams. Below that it runs with no
     # VRAM tier at all: every expert comes from RAM or the NVMe, about 25% slower.
     OVERHEAD_GB = 1.2
-    lend_gb = (4.4 if batch >= 4096 else 3.9) - (0.27 if q == "Q3_K_XL" else 0.0)
+    # The draft head, on whenever the file is there: 0.1 GB dense + 0.23 GB of rollback
+    # snapshots on the device (a tier step), its 2.7 GB of experts in pinned RAM.
+    mtp_on = bool(model.get("mtp"))
+    HEAD_VRAM_GB = 0.35 if mtp_on else 0.0
+    lend_gb = lend_for(2048)   # the smallest prefill buffer: below this there is no tier at all
     def tier_for(c, kv, sh):
-        t = vram - core - state_vram_gb(c, kv, sh) - reserve_mb / 1024 - desktop_use - OVERHEAD_GB
+        t = vram - core - state_vram_gb(c, kv, sh) - reserve_mb / 1024 - desktop_use - OVERHEAD_GB - HEAD_VRAM_GB
         return t if t >= lend_gb + 0.1 else 0.0
     def state_host_for(c, kv):
         # Measured on the doc replay (Q4, 2026-09-09): the indexer move is a small clean
@@ -175,15 +196,20 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
         if c >= 131072 or (tier_for(c, kv, "idx") <= 0 and tier_for(c, kv, "kv,idx") > 0): return "kv,idx"
         return "idx"
     def ram_for(sh_gb):
-        return max(4, min(12, int(0.6 * (avail - sh_gb) - 3.2)))   # the pinned state comes out of the same RAM
+        # The pinned state comes out of the same RAM. The head's 2.7 GB of pinned experts
+        # is covered by the 0.6 factor: measured with the head at --ram 12 through a 43K
+        # prefill at 131K, MemAvailable never went below 7.5 GB (2026-09-10).
+        return max(4, min(12, int(0.6 * (avail - sh_gb) - 3.2)))
     def option(c, with_vision):
         kv = "q4_0" if c >= 32768 else "q8_0"
         sh = state_host_for(c, kv)
         tier = tier_for(c, kv, sh)
         shg = state_host_gb(c, kv, sh); ram = ram_for(shg)
         short = predict(q, tier, ram, False, STATE_HOST_MS[sh]); longd = predict(q, tier, ram, True, STATE_HOST_MS[sh])
+        b = batch_for(tier) if tier > 0 else 2048
         return {"ctx": c, "kv": kv, "tier_gb": round(tier, 2), "blocks": short["blocks"], "state_gb": round(state_gb(c, kv), 2), "vision": with_vision,
                 "state_host": sh, "state_host_gb": round(shg, 2), "state_vram_gb": round(state_vram_gb(c, kv, sh), 2), "ram": ram,
+                "batch": b, "lend_gb": round(lend_for(b), 2), "prefill_tps": PREFILL_TPS[b] if q != "IQ1_S" else 0,
                 "tok_s_short": short["tok_s"], "tok_s_long_doc": longd["tok_s"], "vram_served": short["vram_served"], "hit": short["hit"]}
     presets = []
     for pid, label, ctx, blurb in PRESETS:
@@ -195,23 +221,27 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
             if fallback: o = fallback[-1]; note = "no room for an expert tier at %dK on this GPU: %dK instead" % (ctx // 1024, o["ctx"] // 1024)
             else: note = "no room for a VRAM expert tier on this GPU: experts come from RAM and the NVMe"
         presets.append({"id": pid, "label": label, "blurb": blurb, "ctx": ctx, "fits": o["ctx"] == ctx, "note": note, "ctx_actual": o["ctx"], "kv": o["kv"], "vision": o["vision"],
-                        "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": o["tok_s_short"], "tok_s_long_doc": o["tok_s_long_doc"], "vram_served": o["vram_served"]})
+                        "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": o["tok_s_short"], "tok_s_long_doc": o["tok_s_long_doc"], "vram_served": o["vram_served"],
+                        "batch": o["batch"], "prefill_tps": o["prefill_tps"]})
     if preset not in [p["id"] for p in presets]: preset = "coding"
     p = next(p for p in presets if p["id"] == preset)
     vision = p["vision"]; mm_gb = model.get("mmproj_gb", 0.0) if vision else 0.0
     options = [option(c, vision) for c in CTX_STEPS]
     chosen = next(o for o in options if o["ctx"] == p["ctx_actual"])
     return {
-        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "batch": batch, "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
+        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "batch": chosen["batch"], "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "state_host": chosen["state_host"],
-        "mtp": False, "mtp_file": model.get("mtp"), "mtp_gb": model.get("mtp_gb", 0.0),
+        # The draft head, on when the file is there: measured through OpenCode on a coding
+        # task (2026-09-10) +12% decode on Q4 and +19% on Q3 at 95-96% acceptance, +7-8% on
+        # the replays; it costs a tier step and 2.7 GB of pinned RAM, both priced in.
+        "mtp": mtp_on, "mtp_file": model.get("mtp"), "mtp_gb": model.get("mtp_gb", 0.0),
         "estimates": {"vram_tier_gb": chosen["tier_gb"], "vram_tier_blocks": chosen["blocks"], "state_gb": chosen["state_gb"], "dense_core_gb": core,
                       "state_host_gb": chosen["state_host_gb"], "state_vram_gb": chosen["state_vram_gb"],
                       "mmproj_gb": round(mm_gb, 2),
                       "desktop_use_gb": round(desktop_use, 2), "decode_tps_short": chosen["tok_s_short"], "decode_tps_long_doc": chosen["tok_s_long_doc"],
-                      "vram_served": chosen["vram_served"], "prefill_tps_long": 275 if q != "IQ1_S" else 0},
+                      "vram_served": chosen["vram_served"], "prefill_tps_long": chosen["prefill_tps"], "lend_gb": chosen["lend_gb"]},
         "options": options, "presets": presets,
     }
 

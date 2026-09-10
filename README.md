@@ -35,6 +35,8 @@ Reference machine: RTX 4080 SUPER 16 GB, 30 GB RAM, one NVMe. 163,840-token cont
 | one 8,300-token answer at 160K context, sustained | 10.3 tok/s | not measured |
 | llama.cpp on the same machine and file | 1.4–2.2 tok/s chat, 3 tok/s prefill (Unsloth Studio's defaults) | 4.6–6.3 tok/s at long context |
 
+The prefill rows were measured with a batch of 4096. The console now picks the largest batch the expert tier can lend the memory for (16384 at 128K on 16 GB): the prefill streams every expert once per batch, so on a 43K-token document 4096 gives 300 tok/s, 8192 gives 479 and 16384 gives 720, with decode unchanged.
+
 The two options the console exposes, on the same Q4 file and settings:
 
 | UD-Q4_K_XL, 160K context | short chat | 155K-token document, decode |
