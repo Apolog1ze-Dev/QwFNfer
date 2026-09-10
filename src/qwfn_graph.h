@@ -112,7 +112,9 @@ public:
     // state snapshots and copies the one-token-back state into `rs`, the conv
     // history one token back into `conv`, and the PLE conv likewise. The engine
     // restores them when a verified draft is rejected.
-    void set_rollback(ggml_tensor * rs, ggml_tensor * conv) { rb_rs_ = rs; rb_conv_ = conv; }
+    // n_snap snapshots: slot s-1 holds the state s tokens back (s = 1..n_snap), so a
+    // step of T tokens can be rolled back to any of its first T-1 positions.
+    void set_rollback(ggml_tensor * rs, ggml_tensor * conv, int n_snap = 1) { rb_rs_ = rs; rb_conv_ = conv; rb_n_ = n_snap; }
     void set_rollback_ple(ggml_tensor * conv) { rb_ple_conv_ = conv; }
 
     // Fill pool_cache for blocks [0, n_whole) from the raw indexer cache -- after
@@ -226,7 +228,9 @@ public:
     void mtp_head_pre(ggml_tensor * h, ggml_tensor * emb, ggml_tensor * inp_pos, ggml_tensor * kq_mask,
                       const int sections[4], int il, ggml_tensor ** res_out, ggml_tensor ** cur_out,
                       ggml_tensor ** inject_out, ggml_tensor ** sel_out, ggml_tensor ** w_out, ggml_tensor ** sh_out);
-    ggml_tensor * mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il);
+    // hres_out: the head's wide residual after its MoE fold -- what stands in for the
+    // trunk's residual when the head drafts again from its own draft.
+    ggml_tensor * mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il, ggml_tensor ** hres_out = nullptr);
     // The head's KV rows for n prompt positions and nothing else: eh_proj, the
     // attention mixer and the K/V projections, written into the head's cache at
     // n_past. No mask, no attention output, no MoE, no LM head -- what a streamed
@@ -264,6 +268,7 @@ private:
     bool            gpu_fuse_ = false;
     ggml_tensor *   hc_mean_ = nullptr;
     ggml_tensor *   rb_rs_ = nullptr, * rb_conv_ = nullptr, * rb_ple_conv_ = nullptr;
+    int             rb_n_ = 1;
 };
 
 } // namespace qwfn

@@ -118,6 +118,9 @@ struct engine_config {
     // experts that are resident (gates renormalised), the misses' reads still
     // go out and land for next time. An approximation -- measure its NLL.
     bool      skip_miss = false;
+    // Drafts the head proposes per step (1..QWFN_MTP_MAX_DRAFTS): the trunk verifies
+    // them as one step of 1+k positions and rolls back to the last accepted one.
+    uint32_t  mtp_drafts = 1;
     // Decode only: drop a routed expert whose normalised gate is below this and
     // renormalise the rest in the router graph (0 = off). An approximation,
     // priced with the replay NLL; the dropped experts are neither fetched nor computed.
@@ -145,7 +148,12 @@ struct engine_config {
     // expert cache for the generation that follows instead of bypassing it.
     // This is the common case for a chat server: with prefix reuse, every turn
     // after the first feeds ~25 tokens.
-    uint32_t  prefill_decode_max = 96;
+    // Prompts up to this many new tokens take the cache-batched decode path (one batch,
+    // its experts through the tiers, misses into a bounce without admission) instead of
+    // the streamed sweep of every expert. Measured 2026-09-10 on Q4 at 131K: the sweep is
+    // a flat ~12 s, the batch path 7-10 s up to ~400 tokens and level with it at 500+; the
+    // larger decode buffers cost ~150 MB of VRAM.
+    uint32_t  prefill_decode_max = 512;
     // MemAvailable clamp on the expert RAM tier: frac of MemAvailable minus
     // headroom. The default is deliberately conservative for a desktop with
     // zram; raise ram_frac to trade the rest of the machine for hit rate.
@@ -208,7 +216,10 @@ public:
     // token at that position.
     const float * eval_decode(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err);
     const float * logits_pos(int i) const { return logits_.data() + (size_t) i * n_vocab_; }
-    bool rollback(std::string & err);
+    bool rollback(std::string & err) { return rollback_n(1, err); }
+    // Undo the last n_back positions of the last multi-token step (1..T-1).
+    bool rollback_n(int n_back, std::string & err);
+    static constexpr int MTP_MAX_DRAFTS = 3;
     // Layer 0's routing for the T tokens that end `hist` (the positions the next
     // eval will take), computed exactly on the state as it stands, and their
     // expert reads issued now. Every other layer is predicted a layer ahead; layer 0
@@ -223,11 +234,24 @@ public:
     // the last position's draft. mtp_ready() says whether the head can draft.
     bool    mtp_step(const int32_t * next_toks, int n, std::string & err);
     int32_t mtp_draft_id() const { return mtp_draft_; }
+    // A second draft, the token after the first: the head run once more from its own
+    // residual and the first draft's embedding (the standard chaining of an MTP
+    // module). mtp_draft2_id() holds it; the first draft stays in mtp_draft_id().
+    bool    mtp_draft_next(std::string & err, int32_t from_tok = -1);   // from_tok: chain from this token instead of the last draft (a sampled draft)
+    int32_t mtp_draft2_id() const { return mtp_draft2_; }
+    // The drafts of the current step, in order (mtp_draft_id() is the first), and
+    // each one's distribution when logits are wanted.
+    int           mtp_draft_count() const { return mtp_n_drafts_; }
+    int32_t       mtp_draft_k(int k) const { return k < mtp_n_drafts_ ? mtp_drafts_[k] : -1; }
+    const float * mtp_logits_k(int k) const { return k < mtp_n_drafts_ && mtp_have_logits_k_[k] ? mtp_logits_k_[k].data() : nullptr; }
+    // Extend the current step's drafts to k (each from the previous draft's residual).
+    bool          mtp_draft_more(int k, std::string & err);
     bool    mtp_on() const { return mtp_on_; }
     // The head's logits at the draft position, read back only when asked for
     // (the server samples the draft from them at temperature); nullptr otherwise.
     void          set_mtp_logits(bool on) { mtp_want_logits_ = on; }
     const float * mtp_logits() const { return mtp_have_logits_ ? mtp_logits_.data() : nullptr; }
+    const float * mtp_logits2() const { return mtp_have_logits2_ ? mtp_logits2_.data() : nullptr; }
     bool    mtp_ready() const { return mtp_on_ && mtp_have_h_ && mtp_kv_valid_; }
     bool    mtp_loaded() const { return mtp_on_; }     // the head is resident (not with --skip-miss)
 
@@ -346,9 +370,10 @@ private:
     // Per attention layer a cache of pooled block keys; shared static tables,
     // the block bias and the five per-token inputs. Allocated before the VRAM
     // tier so it is accounted for.
-    qsa_decode_inputs          qd_, qd2_;   // qd2_: the second position of a two-token decode step
+    qsa_decode_inputs          qd_, qdk_[MTP_MAX_DRAFTS];   // qdk_[k-1]: position k of a multi-token decode step (k = 1..)
     ggml_tensor *              inp_pos_one_ = nullptr;   // I32 [4*Bd]: per-position [p,p,p,0] for single-position attention calls
-    void qsa_decode_prepare2(int32_t n_past2);       // qd2_'s inputs, bias from qd_'s plus its own window; one bucket for both
+    void qsa_decode_prepare_k(int k, int32_t n_past_k);   // qdk_[k-1]'s inputs: the previous position's bias plus its own window
+    void qsa_decode_prepare2(int32_t n_past2) { qsa_decode_prepare_k(1, n_past2); }       // qd2_'s inputs, bias from qd_'s plus its own window; one bucket for both
     // Rollback snapshots (MTP): per DeltaNet layer the state and conv history as
     // they stood after the first token of a two-token step, and the PLE conv.
     ggml_context *             rbctx_ = nullptr;
@@ -356,6 +381,7 @@ private:
     std::vector<ggml_tensor *> rb_rs_, rb_conv_;
     ggml_tensor *              rb_ple_conv_ = nullptr;
     bool                       rb_valid_ = false;   // the snapshots describe the current state minus one token
+    int                        rb_depth_ = 0, rb_nsnap_ = 1;   // positions that can be rolled back after the last step; snapshots allocated
     std::vector<uint8_t>       gA_T_;               // per layer: the T the cached graph was built for
     ggml_tensor *              t_mtp_emb_ = nullptr;             // device [n_embd, Bd]: the head's next-token embeddings
     ggml_tensor *              h_mtp_tok_ = nullptr, * h_mtp_emb_ = nullptr;   // host: their gather
@@ -524,13 +550,19 @@ private:
     ggml_tensor * t_mtp_pos_ = nullptr;       // I32 [4*Bd]: the draft's positions
     ggml_tensor * t_mtp_mask_ = nullptr;      // F16 [2*(n_ctx+2)]: the two-row causal mask of a two-position draft, viewed [n_kv, 2]
     int64_t       mtp_h_rows_ = 0;            // rows of t_hlast_ the last eval filled
-    int32_t       mtp_draft_ = -1, mtp_draft_top_[3] = { -1, -1, -1 };
+    int32_t       mtp_draft_ = -1, mtp_draft_top_[3] = { -1, -1, -1 }, mtp_draft2_ = -1;
+    int32_t       mtp_drafts_[MTP_MAX_DRAFTS] = { -1, -1, -1 }; int mtp_n_drafts_ = 0;
+    std::vector<float> mtp_logits_k_[MTP_MAX_DRAFTS]; bool mtp_have_logits_k_[MTP_MAX_DRAFTS] = { false, false, false };
+    std::vector<float> mtp_logits2_; bool mtp_have_logits2_ = false;   // the second draft's distribution, when logits are wanted
     bool          mtp_want_logits_ = false, mtp_have_logits_ = false;
     std::vector<float> mtp_logits_;
     // Run the head for n positions starting at `pos`, reading rows h_row.. of
     // t_hlast_ and e_row.. of t_emb_; `actual` (may be null) are the tokens at
     // positions pos+2.. for scoring, n_actual of them.
-    bool mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_src, int64_t e_row, const int32_t * actual, int64_t n_actual, std::string & err);
+    bool mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_src, int64_t e_row, const int32_t * actual, int64_t n_actual, std::string & err,
+                   ggml_tensor * h_src = nullptr);
+    ggml_tensor * t_m_hres_ = nullptr;        // F32 [n_embd, hc, Bd]: the head's residual after its MoE fold, per drafted position
+    int64_t       mtp_hres_rows_ = 0, mtp_last_pos_ = -1;   // rows the last draft filled; the last position it drafted
     ggml_tensor * t_sh_ = nullptr, * t_pg_ = nullptr, * t_pc_ = nullptr, * t_ple_ = nullptr;
     ggml_tensor * inp_tok_ = nullptr, * inp_pos_ = nullptr, * inp_ple_ = nullptr;
     // persistent, host side

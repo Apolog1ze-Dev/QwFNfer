@@ -27,7 +27,8 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> prompt, replay;
     std::string cold_path, save_replay;   // --save-replay FILE: the generated ids, one per line, for a later --replay-file
     bool want_ppl = false;   // with --replay-file: mean NLL of the replayed tokens (a quality number)
-    bool pair_test = false, rollback_test = false;   // exercise the two-token decode step without the head
+    bool pair_test = false, rollback_test = false;   // exercise the multi-token decode step without the head
+    int  multi_test = 2;                              // tokens per step for --multi-test / --rollback-test
     int n_gen = 16;
     engine_config cfg;
     cfg.n_ctx = 4096; cfg.n_batch = 128; cfg.ram_bytes = 8e9; cfg.vram_bytes = 0;
@@ -69,7 +70,9 @@ int main(int argc, char ** argv) {
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
         if (a == "--mtp" && i + 1 < argc) { cfg.mtp_path = next(); cfg.rollback_snapshots = true; continue; }
         if (a == "--pair-test") { pair_test = true; continue; }          // decode the replay two tokens per step
-        if (a == "--rollback-test") { rollback_test = true; cfg.rollback_snapshots = true; continue; }  // every token as the first of a pair with a wrong second, then roll back
+        if (a == "--multi-test" && i + 1 < argc) { pair_test = true; multi_test = atoi(next()); cfg.mtp_drafts = (uint32_t) std::max(1, multi_test - 1); continue; }   // K tokens per step from the replay
+        if (a == "--mtp-drafts" && i + 1 < argc) { cfg.mtp_drafts = (uint32_t) std::max(1, std::min(3, atoi(next()))); continue; }
+        if (a == "--rollback-test") { rollback_test = true; cfg.rollback_snapshots = true; if (cfg.mtp_drafts < (uint32_t) std::max(1, multi_test - 1)) cfg.mtp_drafts = (uint32_t) std::max(1, multi_test - 1); continue; }  // every token as the first of a pair with a wrong second, then roll back
         if (a == "--ram-frac" && i + 1 < argc) { cfg.ram_frac = atof(next()); continue; }
         // 0 forces the batched prefill path at every size. Reference runs want
         // this: token-by-token prefill is a different (equally valid) summation
@@ -170,6 +173,7 @@ int main(int argc, char ** argv) {
     const bool use_mtp = !cfg.mtp_path.empty() && !getenv("QWFN_MTP_NOVERIFY");   // NOVERIFY: the head loaded (its VRAM taken) but the plain loop
     if ((pair_test || rollback_test) && replay.empty()) { fprintf(stderr, "--pair-test / --rollback-test need --replay-file\n"); return 1; }
     uint64_t sp_steps = 0, sp_acc = 0, sp_single = 0;
+    std::vector<uint64_t> sp_accepted_at(engine::MTP_MAX_DRAFTS + 1, 0);   // verify steps that kept exactly j drafts
     if (!use_mtp && !pair_test && !rollback_test) {
         for (int i = 0; i < n_gen; i++) {
             int best = 0;
@@ -197,6 +201,20 @@ int main(int argc, char ** argv) {
             if (replay.empty()) return argmax(l);
             return k < (int) replay.size() ? replay[k] : -1;
         };
+        // QWFN_MTP_DRAFT2_TEST=1: after every draft, draft once more from the head's
+        // own residual and score both against the replay -- the second draft's
+        // accuracy given the first was right is what a longer draft would earn.
+        static const bool draft2_test = getenv("QWFN_MTP_DRAFT2_TEST") != nullptr;
+        uint64_t d2_n1 = 0, d2_hit1 = 0, d2_n2 = 0, d2_hit2 = 0;
+        auto draft2_probe = [&](int idx_next) {   // idx_next: replay index of the token that follows the drafted-from position
+            if (!draft2_test || !use_mtp || replay.empty()) return;
+            const int32_t d1 = eng.mtp_draft_id();
+            if (d1 < 0 || idx_next + 1 >= (int) replay.size()) return;
+            if (!eng.mtp_draft_next(err)) { fprintf(stderr, "\ndraft2: %s\n", err.c_str()); return; }
+            const int32_t d2 = eng.mtp_draft2_id();
+            d2_n1++;
+            if (d1 == replay[idx_next]) { d2_hit1++; d2_n2++; if (d2 == replay[idx_next + 1]) d2_hit2++; }
+        };
         // Layer 0's reads for the tokens the next eval will take, issued as soon as
         // they are known: the bonus token before the head runs, the pair once it has.
         auto spec_l0 = [&](const int32_t * toks, int n) {
@@ -205,42 +223,32 @@ int main(int argc, char ** argv) {
             eng.spec_layer0(hist.data(), (int32_t) hist.size(), n, err);
             for (int k = 0; k < n; k++) hist.pop_back();
         };
+        // The verify step: a token and K drafts (the head's, or the replay's for the
+        // tests), evaluated as one step of K+1 positions; the trunk's pick after each
+        // position decides how many drafts stand, the rest is rolled back.
+        std::vector<int32_t> drafts; drafts.reserve(engine::MTP_MAX_DRAFTS);
+        const int rb_at = getenv("QWFN_RB_AT") ? atoi(getenv("QWFN_RB_AT")) : 1;   // --rollback-test: the draft that is wrong (1-based)
         while (produced < n_gen) {
-            const int32_t draft = use_mtp ? eng.mtp_draft_id() : -1;
-            const bool room = produced + 1 < n_gen && (replay.empty() || i + 1 < (int) replay.size());
-            const bool pair = room && (pair_test || rollback_test || draft >= 0);
-            if (pair) {
-                const int32_t second = pair_test ? replay[i + 1]
-                                     : rollback_test ? (int32_t) ((replay[i + 1] + (getenv("QWFN_RB_WRONG") ? atoi(getenv("QWFN_RB_WRONG")) : 1)) % eng.n_vocab())
-                                     : draft;
-                { const int32_t two[2] = { next, second }; spec_l0(two, 2); }
-                hist.push_back(next); hist.push_back(second);
-                if (!eng.eval_decode(hist.data(), (int32_t) hist.size(), 2, err)) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
-                const float * l0 = eng.logits_pos(0), * l1 = eng.logits_pos(1);
-                printf(" %d", next); fflush(stdout); produced++;
-                const int32_t y = next_after(l0, i + 1);
-                if (want_ppl && !replay.empty() && i + 1 < n_gen) score(l0, replay[i + 1]);
-                sp_steps++;
-                const bool accept = pair_test ? true : rollback_test ? false : (y == second);
-                if (accept) {
-                    printf(" %d", second); fflush(stdout); produced++;
-                    const int32_t next2 = next_after(l1, i + 2);
-                    if (want_ppl && !replay.empty() && i + 2 < n_gen) score(l1, replay[i + 2]);
-                    i += 2; sp_acc++;
-                    if (next2 < 0) break;
-                    spec_l0(&next2, 1);
-                    if (use_mtp) { const int32_t toks[2] = { second, next2 }; if (!eng.mtp_step(toks, 2, err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; } }
-                    next = next2;
-                } else {
-                    if (!eng.rollback(err)) { fprintf(stderr, "\nrollback: %s\n", err.c_str()); return 1; }
-                    hist.pop_back();
-                    i += 1;
-                    if (y < 0) break;
-                    spec_l0(&y, 1);
-                    if (use_mtp && !eng.mtp_step(&y, 1, err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; }
-                    next = y;
+            drafts.clear();
+            int K = 0;
+            if (pair_test || rollback_test) {
+                K = std::max(1, multi_test - 1);
+                for (int k = 1; k <= K; k++) {
+                    if (i + k >= (int) replay.size()) break;
+                    const int32_t d = (rollback_test && k == rb_at)
+                        ? (int32_t) ((replay[i + k] + (getenv("QWFN_RB_WRONG") ? atoi(getenv("QWFN_RB_WRONG")) : 1)) % eng.n_vocab())
+                        : replay[i + k];
+                    drafts.push_back(d);
                 }
-            } else {
+            } else if (use_mtp && eng.mtp_draft_id() >= 0) {
+                if (!eng.mtp_draft_more((int) cfg.mtp_drafts, err)) { fprintf(stderr, "\ndraft: %s\n", err.c_str()); return 1; }
+                for (int k = 0; k < eng.mtp_draft_count(); k++) drafts.push_back(eng.mtp_draft_k(k));
+            }
+            // Room for the drafts: within the requested count and the replay.
+            while (!drafts.empty() && (produced + (int) drafts.size() >= n_gen || (!replay.empty() && i + (int) drafts.size() >= (int) replay.size())))
+                drafts.pop_back();
+            K = (int) drafts.size();
+            if (K == 0) {
                 hist.push_back(next);
                 lg = eng.eval_decode(hist.data(), (int32_t) hist.size(), 1, err);
                 if (!lg) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
@@ -252,9 +260,47 @@ int main(int argc, char ** argv) {
                 spec_l0(&y, 1);
                 if (use_mtp && !eng.mtp_step(&y, 1, err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; }
                 next = y;
+                continue;
             }
+            {
+                std::vector<int32_t> step; step.push_back(next); for (int32_t d : drafts) step.push_back(d);
+                spec_l0(step.data(), (int) step.size());
+                for (int32_t s : step) hist.push_back(s);
+            }
+            if (!eng.eval_decode(hist.data(), (int32_t) hist.size(), K + 1, err)) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
+            printf(" %d", next); fflush(stdout); produced++;
+            int j = 0; int32_t y = -1;
+            for (j = 0; j < K; j++) {
+                const float * lj = eng.logits_pos(j);
+                y = next_after(lj, i + 1 + j);
+                if (want_ppl && !replay.empty() && i + 1 + j < n_gen) score(lj, replay[i + 1 + j]);
+                const bool ok = rollback_test ? (j + 1 != rb_at) : pair_test ? true : (y == drafts[j]);
+                if (!ok) break;
+                printf(" %d", drafts[j]); fflush(stdout); produced++;
+            }
+            sp_steps++; sp_acc += j; sp_accepted_at[j]++;
+            std::vector<int32_t> fed(drafts.begin(), drafts.begin() + j);
+            if (j == K) {
+                const float * lK = eng.logits_pos(K);
+                y = next_after(lK, i + 1 + K);
+                if (want_ppl && !replay.empty() && i + 1 + K < n_gen) score(lK, replay[i + 1 + K]);
+                i += K + 1;
+            } else {
+                if (!eng.rollback_n(K - j, err)) { fprintf(stderr, "\nrollback: %s\n", err.c_str()); return 1; }
+                hist.resize(hist.size() - (size_t) (K - j));
+                i += j + 1;
+            }
+            if (y < 0) break;
+            fed.push_back(y);
+            spec_l0(&y, 1);
+            if (use_mtp && !eng.mtp_step(fed.data(), (int) fed.size(), err)) { fprintf(stderr, "\nmtp: %s\n", err.c_str()); return 1; }
+            next = y;
         }
         n_gen = produced;
+        if (draft2_test && d2_n1)
+            printf("\ndraft-2 probe: first draft right %llu of %llu (%.1f%%); second draft right %llu of %llu when the first was (%.1f%%)\n",
+                   (unsigned long long) d2_hit1, (unsigned long long) d2_n1, 100.0 * d2_hit1 / d2_n1,
+                   (unsigned long long) d2_hit2, (unsigned long long) d2_n2, d2_n2 ? 100.0 * d2_hit2 / d2_n2 : 0.0);
     }
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("\n\ndecode: %d tokens in %.2f s  (%.2f tok/s), n_past=%d\n", n_gen, dt, n_gen / dt, eng.n_past());
@@ -314,6 +360,11 @@ int main(int argc, char ** argv) {
            (unsigned long long) s.pf_issued, (unsigned long long) s.pf_used,
            s.pf_issued ? 100.0 * s.pf_used / s.pf_issued : 0.0,
            (unsigned long long) s.pf_wasted);
+    if (sp_steps) {
+        printf("verify steps by drafts kept:");
+        for (size_t j = 0; j < sp_accepted_at.size(); j++) if (sp_accepted_at[j]) printf(" %zu:%llu", j, (unsigned long long) sp_accepted_at[j]);
+        printf("  (tokens per step %.2f)\n", (double) (sp_steps + sp_acc) / sp_steps);
+    }
     if (sp_steps || sp_single)
         printf("speculative: %llu pair steps, %llu accepted (%.1f%%), %llu single steps, %llu rollbacks (%.3f s), head %.2f s\n",
                (unsigned long long) sp_steps, (unsigned long long) sp_acc, sp_steps ? 100.0 * sp_acc / sp_steps : 0.0,

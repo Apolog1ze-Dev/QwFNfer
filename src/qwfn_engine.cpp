@@ -163,12 +163,14 @@ bool engine::init(const model_index * hot, const model_index * cold,
         rb_rs_.assign(hp_.n_layer, nullptr); rb_conv_.assign(hp_.n_layer, nullptr);
         const int64_t hv = hp_.ssm_d_state, nvh = hp_.ssm_dt_rank;
         const int64_t conv_dim = 2 * (int64_t) hp_.ssm_n_group * hp_.ssm_d_state + (int64_t) hp_.ssm_dt_rank * hp_.ssm_d_state;
+        // One snapshot per draft the step may carry: slot s-1 is the state s tokens back.
+        rb_nsnap_ = (int) std::max<uint32_t>(1, std::min<uint32_t>(cfg.mtp_drafts, (uint32_t) MTP_MAX_DRAFTS));
         for (uint32_t il = 0; il < hp_.n_layer; il++) {
             if (hp_.is_attn_layer(il)) continue;
-            rb_rs_[il]   = ggml_new_tensor_3d(rbctx_, GGML_TYPE_F32, hv, hv, nvh);
-            rb_conv_[il] = ggml_new_tensor_2d(rbctx_, GGML_TYPE_F32, hp_.ssm_d_conv - 1, conv_dim);
+            rb_rs_[il]   = ggml_new_tensor_4d(rbctx_, GGML_TYPE_F32, hv, hv, nvh, rb_nsnap_);
+            rb_conv_[il] = ggml_new_tensor_3d(rbctx_, GGML_TYPE_F32, hp_.ssm_d_conv - 1, conv_dim, rb_nsnap_);
         }
-        rb_ple_conv_ = ggml_new_tensor_2d(rbctx_, GGML_TYPE_F32, (int64_t) (hp_.ple_conv_kernel - 1) * hp_.ple_ngram_size, (int64_t) hp_.hc_count * hp_.n_embd);
+        rb_ple_conv_ = ggml_new_tensor_3d(rbctx_, GGML_TYPE_F32, (int64_t) (hp_.ple_conv_kernel - 1) * hp_.ple_ngram_size, (int64_t) hp_.hc_count * hp_.n_embd, rb_nsnap_);
         rbbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(rbctx_, w_.buft());
         if (!rbbuf_) { err = "no device memory for the rollback snapshots"; return false; }
     }
@@ -251,10 +253,11 @@ bool engine::init(const model_index * hot, const model_index * cold,
             hp_.hc_inject_prescaled = true;
         }
     }
-    pack_n_ = 2 * (n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX);   // room for a two-token step
+    constexpr int64_t MAXT = 1 + MTP_MAX_DRAFTS;   // positions of the longest verify step
+    pack_n_ = MAXT * (n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX);   // room for a multi-token step
     if ((int64_t) Bd * n_embd >= pack_n_ && cfg.use_gpu && !getenv("QWFN_NO_PACK")) {
         t_pack_ = ggml_view_1d(wctx_, t_cur_, pack_n_, 0);
-        pack_host_.resize(pack_n_); pred_next_.resize(2 * QWFN_SPEC_MAX); scores_next_.resize(2 * QWFN_SPEC_MAX);
+        pack_host_.resize(pack_n_); pred_next_.resize(MAXT * QWFN_SPEC_MAX); scores_next_.resize(MAXT * QWFN_SPEC_MAX);
     }
     gA_pack_.assign(hp_.n_layer, 0);
     gA_T_.assign(hp_.n_layer, 0);
@@ -279,8 +282,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 cfg.spec_margin > 0.0f ? (std::to_string(cfg.spec_margin) + (cfg.spec_gate_inflight ? " when >= " + std::to_string(cfg.spec_gate_inflight) + " reads in flight" : "")).c_str() : "off");
     }
     t_w_      = ggml_new_tensor_2d(wctx_, GGML_TYPE_F32, U, Bd);
-    t_gids_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, U, 2);
-    t_gw_     = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, 1, U, 2);
+    t_gids_   = ggml_new_tensor_2d(wctx_, GGML_TYPE_I32, U, 1 + MTP_MAX_DRAFTS);
+    t_gw_     = ggml_new_tensor_3d(wctx_, GGML_TYPE_F32, 1, U, 1 + MTP_MAX_DRAFTS);
     inp_tok_  = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, Bd);
     inp_pos_  = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, Bd * 4);
     inp_pos_one_ = ggml_new_tensor_1d(wctx_, GGML_TYPE_I32, Bd * 4);
@@ -299,6 +302,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         t_m_w_      = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, U, Bd);
         t_m_sh_     = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, n_embd, Bd);
         t_m_pc_     = ggml_new_tensor_2d(mctx_, GGML_TYPE_F32, n_embd, Bd);
+        t_m_hres_   = ggml_new_tensor_3d(mctx_, GGML_TYPE_F32, n_embd, hc, Bd);
         mbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(mctx_, w_.buft());
         if (!mbuf_) { err = "no device memory for the head's work set"; return false; }
         ggml_init_params hp2{}; hp2.mem_size = ggml_tensor_overhead() * 8; hp2.no_alloc = true;
@@ -323,7 +327,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     h_tok_     = ggml_new_tensor_1d(hctx_, GGML_TYPE_I32, B);
     h_emb_     = ggml_new_tensor_2d(hctx_, GGML_TYPE_F32, n_embd, B);
     if (mtp_on_) { h_mtp_tok_ = ggml_new_tensor_1d(hctx_, GGML_TYPE_I32, B); h_mtp_emb_ = ggml_new_tensor_2d(hctx_, GGML_TYPE_F32, n_embd, B); }
-    h_wd_ = ggml_new_tensor_3d(hctx_, GGML_TYPE_F32, n_embd, 2 * U, 2);
+    h_wd_ = ggml_new_tensor_3d(hctx_, GGML_TYPE_F32, n_embd, (1 + MTP_MAX_DRAFTS) * U, 1 + MTP_MAX_DRAFTS);
     hbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(hctx_, wh_.buft());
     if (!hbuf_) { err = "failed to allocate engine host buffer"; return false; }
 
@@ -334,8 +338,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
         if (hb) {
             ggml_init_params pp{}; pp.mem_size = ggml_tensor_overhead() * 8; pp.no_alloc = true;
             pctx_    = ggml_init(pp);
-            p_gids_  = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, 2 * U);
-            p_gw_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, 2 * U);
+            p_gids_  = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, (1 + MTP_MAX_DRAFTS) * U);
+            p_gw_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, (1 + MTP_MAX_DRAFTS) * U);
             p_vslot_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, hp_.n_expert);
             p_vmask_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, hp_.n_expert);
             p_pc_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, 2 * n_embd);
@@ -369,15 +373,17 @@ bool engine::init(const model_index * hot, const model_index * cold,
         qd_.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
         qd_.blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
         qd_.npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
-        // The second position of a two-token decode step: its own per-token
+        // The later positions of a multi-token decode step: their own per-token
         // inputs and bias; the block tables and pooled keys are shared.
-        qd2_ = qd_;
-        qd2_.bias       = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, NBmax);
-        qd2_.write_idx  = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
-        qd2_.member_idx = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, r);
-        qd2_.blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
-        qd2_.blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
-        qd2_.npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
+        for (int k = 0; k < MTP_MAX_DRAFTS; k++) {
+            qdk_[k] = qd_;
+            qdk_[k].bias       = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, NBmax);
+            qdk_[k].write_idx  = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
+            qdk_[k].member_idx = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, r);
+            qdk_[k].blk_pos    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 4);
+            qdk_[k].blk_idx    = ggml_new_tensor_1d(qctx_, GGML_TYPE_I32, 1);
+            qdk_[k].npast_f    = ggml_new_tensor_1d(qctx_, GGML_TYPE_F32, 1);
+        }
         qbuf_ = ggml_backend_alloc_ctx_tensors_from_buft(qctx_, w_.buft());
         if (!qbuf_) {
             fprintf(stderr, "[qwfn] no device memory for the decode QSA state; decode attention scans the whole context\n");
@@ -392,10 +398,10 @@ bool engine::init(const model_index * hot, const model_index * cold,
             ggml_backend_tensor_set(qd_.cell_pos, cp.data(), 0, cp.size() * 4);
             std::vector<float> ninf(NBmax, -INFINITY);
             ggml_backend_tensor_set(qd_.bias, ninf.data(), 0, ninf.size() * 4);
-            ggml_backend_tensor_set(qd2_.bias, ninf.data(), 0, ninf.size() * 4);
+            for (int k = 0; k < MTP_MAX_DRAFTS; k++) ggml_backend_tensor_set(qdk_[k].bias, ninf.data(), 0, ninf.size() * 4);
             qd_.ratio    = qsa_ratio_;
             qd_.k_blocks = (int64_t) ((hp_.idx_top_k + r - 1) + r - 1) / r;   // ceil(width / r)
-            qd2_.ratio = qd_.ratio; qd2_.k_blocks = qd_.k_blocks;
+            for (int k = 0; k < MTP_MAX_DRAFTS; k++) { qdk_[k].ratio = qd_.ratio; qdk_[k].k_blocks = qd_.k_blocks; }
             fprintf(stderr, "[qwfn] decode QSA state: %.1f MB (pooled block keys for %lld blocks, %lld kept)\n",
                     ggml_backend_buffer_get_size(qbuf_) / 1e6, (long long) NBmax, (long long) qd_.k_blocks);
         }
@@ -491,7 +497,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // Experts promoted to VRAM during a layer's fetch were not resident when
     // that layer's graph ran: the next graph computes them from the tier by
     // slot (at most max_promotions_per_layer of them), the "late fold".
-    n_late_ = moe_in_graph_ ? 2 * (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : 0;   // room for a pair's doubled budget
+    n_late_ = moe_in_graph_ ? (1 + MTP_MAX_DRAFTS) * (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : 0;   // room for a multi-token step's budget
     // Before the tier sizes itself from the free VRAM: the heads' 123 MB must come out of the tier, not the decode reserve.
     if (!cfg.predictor_path.empty() && !load_predictor(cfg.predictor_path, err)) return false;
     if (!ec_.init(hot, cold, ec_cfg, err)) return false;
@@ -544,7 +550,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // The legacy per-ubatch prefill's device twins and the prefill MoE
     // allocator are created per prefill (prefill_enter) and freed after.
 
-    logits_.resize((size_t) n_vocab_ * 2);   // both positions of a decoded pair
+    logits_.resize((size_t) n_vocab_ * (1 + MTP_MAX_DRAFTS));   // every position of a verify step
     xfer_.resize((size_t) n_embd * B);
     zeros_.assign((size_t) n_embd * B, 0.0f);
     sel_.resize((size_t) U * B);
@@ -1445,7 +1451,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // Unit-test hook: the batched path must reduce exactly to the decode path
     // at T == 1, so forcing it there checks the permutation logic in isolation.
     static const bool force_batched = getenv("QWFN_FORCE_BATCHED") != nullptr;
-    const bool decode = (T == 1 || (force_decode && T == 2)) && !force_batched;   // a pair: the MTP verify step
+    const bool decode = (T == 1 || (force_decode && T <= 1 + MTP_MAX_DRAFTS)) && !force_batched;   // a verify step: a token and its drafts
     if (mtp_on_ && T > 1 && !force_decode && n_past > 0 && mtp_kv_valid_) {
         // A later turn: the head's row for the last decoded position pairs its
         // wide residual (still in t_hlast_) with this batch's first token.
@@ -1560,8 +1566,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     for (int64_t i = 0; i < T; i++)
         pos[i] = pos[T + i] = pos[2 * T + i] = (int32_t) (n_past + i);
     ggml_backend_tensor_set(inp_pos_, pos.data(), 0, pos.size() * 4);
-    if (inp_pos_one_ && T <= 2) {   // [p, p, p, 0] per position, for single-position attention calls
-        int32_t p1[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    if (inp_pos_one_ && T <= 1 + MTP_MAX_DRAFTS) {   // [p, p, p, 0] per position, for single-position attention calls
+        int32_t p1[4 * (1 + MTP_MAX_DRAFTS)] = { 0 };
         for (int64_t i = 0; i < T; i++) p1[i * 4] = p1[i * 4 + 1] = p1[i * 4 + 2] = (int32_t) (n_past + i);
         ggml_backend_tensor_set(inp_pos_one_, p1, 0, (size_t) T * 4 * sizeof(int32_t));
     }
@@ -1594,7 +1600,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
     if (use_qd) qsa_decode_prepare((int32_t) n_past);
 
-    if (use_qd && T == 2) qsa_decode_prepare2((int32_t) n_past + 1);
+    if (use_qd && decode) for (int64_t k = 1; k < T; k++) qsa_decode_prepare_k((int) k, (int32_t) (n_past + k));
     if (!use_qd) {
         std::vector<uint16_t> m((size_t) n_kv * T, f16_of(-INFINITY));
         for (int64_t i = 0; i < T; i++)
@@ -1682,7 +1688,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
     int cur_res = 0;
     bool pending = false;
-    std::vector<expert_handle> eh(2 * U);   // a pair's union of experts
+    std::vector<expert_handle> eh((size_t) (1 + MTP_MAX_DRAFTS) * U);   // a step's union of experts
     pred_.clear();
     pred2_a_.clear();
     pred2_b_.clear();
@@ -1740,19 +1746,23 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
             graph_builder gb(c, &hp_, &w_); gb.bind(&st_, g, n_past);
             gb.set_gpu_fusion(w_.on_gpu() && !getenv("QWFN_NO_FUSE"), t_hcmean_);
-            if (T == 2 && rbbuf_) { gb.set_rollback(rb_rs_[il], rb_conv_[il]); gb.set_rollback_ple(rb_ple_conv_); }
+            if (T >= 2 && rbbuf_) { gb.set_rollback(rb_rs_[il], rb_conv_[il], rb_nsnap_); gb.set_rollback_ple(rb_ple_conv_); }
             // Decode attention for the layer's T positions: one call, or for a
             // pair two chained calls so the second reads through the first's writes.
             auto attn_dec = [&](graph_builder & gbx, ggml_tensor * x, uint32_t l) -> ggml_tensor * {
                 qd_.pool_cache = pool_cache_[l];
                 if (T == 1) return gbx.sparse_attn_decode(x, vpos(c), sections, (int) l, qd_);
-                qd2_.pool_cache = pool_cache_[l];
+                // T positions as T chained calls: each reads through the writes of the ones before.
                 graph_builder::qsa_chain ch;
-                ggml_tensor * x0 = ggml_view_2d(c, x, n_embd, 1, x->nb[1], 0);
-                ggml_tensor * x1 = ggml_view_2d(c, x, n_embd, 1, x->nb[1], x->nb[1]);
-                ggml_tensor * o0 = gbx.sparse_attn_decode(x0, ggml_view_1d(c, inp_pos_one_, 4, 0), sections, (int) l, qd_, &ch);
-                ggml_tensor * o1 = gbx.sparse_attn_decode(x1, ggml_view_1d(c, inp_pos_one_, 4, 4 * sizeof(int32_t)), sections, (int) l, qd2_, &ch);
-                return ggml_concat(c, o0, o1, 1);
+                ggml_tensor * out = nullptr;
+                for (int64_t k = 0; k < T; k++) {
+                    qsa_decode_inputs & q = k == 0 ? qd_ : qdk_[k - 1];
+                    q.pool_cache = pool_cache_[l];
+                    ggml_tensor * xk = ggml_view_2d(c, x, n_embd, 1, x->nb[1], (size_t) k * x->nb[1]);
+                    ggml_tensor * ok = gbx.sparse_attn_decode(xk, ggml_view_1d(c, inp_pos_one_, 4, (size_t) k * 4 * sizeof(int32_t)), sections, (int) l, q, &ch);
+                    out = out ? ggml_concat(c, out, ok, 1) : ok;
+                }
+                return out;
             };
 
             ggml_tensor * r = vres(c, cur_res);
@@ -2463,9 +2473,12 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             std::vector<uint32_t> uniq;
             for (uint32_t e = 0; e < hp_.n_expert; e++) if (cnt[e]) uniq.push_back(e);
 
+            // Misses land in the prefill's idle host staging, not in the RAM tier.
+            size_t bounce_bytes = 0; uint8_t * bounce = pf_.host_scratch(bounce_bytes);
+            const uint32_t bounce_slots = bounce && ec_.block_bytes(il) ? (uint32_t) std::min<size_t>(1u << 16, bounce_bytes / ec_.block_bytes(il)) : 0;
             const uint32_t chunk = std::max<uint32_t>(1, std::min<uint32_t>(
                     std::min<uint32_t>(scr_slots_, cfg_.cache_batch_chunk),
-                    std::max<uint32_t>(1, ec_.ram_tier(il).n_slots / 2)));
+                    bounce_slots ? bounce_slots : std::max<uint32_t>(1, ec_.ram_tier(il).n_slots / 2)));
             ggml_backend_tensor_set(t_pg_, zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
 
             size_t slice[EXPERT_NPARTS];
@@ -2520,7 +2533,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             for (size_t c0 = 0; c0 < uniq.size(); c0 += chunk) {
                 const uint32_t n = (uint32_t) std::min<size_t>(chunk, uniq.size() - c0);
                 const auto ti = std::chrono::steady_clock::now();
-                if (!ec_.fetch(il, uniq.data() + c0, n, ch.data())) {
+                const bool fetched = bounce_slots ? ec_.fetch_batch(il, uniq.data() + c0, n, ch.data(), bounce, bounce_bytes)
+                                                  : ec_.fetch(il, uniq.data() + c0, n, ch.data());
+                if (!fetched) {
                     err = "expert fetch failed"; if (ibuf) ggml_backend_buffer_free(ibuf); if (ictx) ggml_free(ictx); return false;
                 }
                 t_io += std::chrono::duration<double>(std::chrono::steady_clock::now() - ti).count();
@@ -2808,8 +2823,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         }
         if (mtp_on_)   // the wide residual of every position, for the draft head
             ggml_build_forward_expand(g, ggml_cpy(c, r, ggml_view_3d(c, t_hlast_, n_embd, hc, T, t_hlast_->nb[1], t_hlast_->nb[2], 0)));
-        // Logits for the final position -- or for both of a decoded pair.
-        const int64_t n_out = (decode && T <= 2) ? T : 1;
+        // Logits for the final position -- or for every position of a verify step.
+        const int64_t n_out = decode ? T : 1;
         if (n_out == 1) r = ggml_view_3d(c, r, n_embd, hc, 1, r->nb[1], r->nb[2], (size_t) (T - 1) * r->nb[2]);
         ggml_tensor * o = gb.hc_mix(r, -1, false, nullptr);
         ggml_tensor * logits = ggml_mul_mat(c, w_.get("output.weight"), o);
@@ -2828,10 +2843,19 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // whose target is inside the prompt are scored. A later turn's batch
             // needs the row before it as well (mtp_gap_ below, run before the
             // trunk replaced the wide residual of the last decoded position).
-            if (!mtp_draft(n_past, T - 1, 0, t_emb_, 1, hist + (n_hist - T) + 2, T - 2, err)) return false;
+            // In chunks: the head materialises [n_vocab, n] logits to score its drafts,
+            // 1 MB per position, and a 500-token batch (prefill_decode_max) would ask for
+            // half a gigabyte of device memory in one graph.
+            constexpr int64_t HC = 64;
+            for (int64_t off = 0; off < T - 1; off += HC) {
+                const int64_t n = std::min<int64_t>(HC, T - 1 - off);
+                const int64_t n_act = std::max<int64_t>(0, std::min<int64_t>(n, T - 2 - off));
+                if (!mtp_draft(n_past + off, n, off, t_emb_, 1 + off, hist + (n_hist - T) + 2 + off, n_act, err)) return false;
+            }
         }
     }
-    rb_valid_ = force_decode && T == 2 && rbbuf_ != nullptr;
+    rb_depth_ = (force_decode && T >= 2 && rbbuf_ != nullptr) ? (int) std::min<int64_t>(T - 1, rb_nsnap_) : 0;
+    rb_valid_ = rb_depth_ > 0;
     if (ibuf) ggml_backend_buffer_free(ibuf);
     if (ictx) ggml_free(ictx);
     n_past_ += T;
@@ -2842,8 +2866,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 }
 
 bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_src, int64_t e_row,
-                       const int32_t * actual, int64_t n_actual, std::string & err) {
+                       const int32_t * actual, int64_t n_actual, std::string & err, ggml_tensor * h_src) {
     const auto t0 = std::chrono::steady_clock::now();
+    if (!h_src) h_src = t_hlast_;
+    mtp_draft2_ = -1;
     const int64_t n_embd = hp_.n_embd, hc = hp_.hc_count;
     {
         std::vector<int32_t> p((size_t) 4 * n, 0);
@@ -2881,7 +2907,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
             ggml_backend_tensor_set(mask, m.data(), 0, m.size() * 2);
         }
     }
-    ggml_tensor * h = ggml_view_3d(c, t_hlast_, n_embd, hc, n, t_hlast_->nb[1], t_hlast_->nb[2], (size_t) h_row * t_hlast_->nb[2]);
+    ggml_tensor * h = ggml_view_3d(c, h_src, n_embd, hc, n, h_src->nb[1], h_src->nb[2], (size_t) h_row * h_src->nb[2]);
     ggml_tensor * e = ggml_view_2d(c, e_src, n_embd, n, e_src->nb[1], (size_t) e_row * e_src->nb[1]);
     ggml_tensor * pv = ggml_view_1d(c, t_mtp_pos_, 4 * n, 0);
     int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1], hp_.mrope_sections[2], hp_.mrope_sections[3] };
@@ -2941,10 +2967,13 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
         graph_builder gb3(c, &hpm_, &wm_, &w_); gb3.bind(&st_mtp_, g, pos);
         ggml_tensor * res3 = ggml_view_3d(c, t_m_res_, n_embd, hc, n, t_m_res_->nb[1], t_m_res_->nb[2], 0);
         ggml_tensor * moe3 = ggml_add(c, v(t_m_sh_), v(t_m_pc_));
-        logits = gb3.mtp_head_post(res3, moe3, v(t_m_inject_), il);
+        ggml_tensor * hres = nullptr;
+        logits = gb3.mtp_head_post(res3, moe3, v(t_m_inject_), il, &hres);
         am = ggml_argmax(c, logits);
         ggml_set_output(am);
         ggml_build_forward_expand(g, am);
+        // Kept for a second draft from the head's own residual (mtp_draft_next).
+        if (!actual) ggml_build_forward_expand(g, ggml_cpy(c, hres, ggml_view_3d(c, t_m_hres_, n_embd, hc, n, t_m_hres_->nb[1], t_m_hres_->nb[2], 0)));
         run_on(g, true);
         t_mtp_post += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq2).count();
     }
@@ -2967,6 +2996,7 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
             mtp_draft_top_[0] = top[j]; mtp_draft_top_[1] = mtp_draft_top_[2] = -1;
         }
     }
+    if (!actual) { mtp_hres_rows_ = n; mtp_last_pos_ = pos + n - 1; }
     if (mbuf) ggml_backend_buffer_free(mbuf);
     if (mctx) ggml_free(mctx);
     ggml_free(c);
@@ -2974,7 +3004,51 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
     return true;
 }
 
-void engine::qsa_decode_prepare2(int32_t n_past2) {
+bool engine::mtp_draft_next(std::string & err, int32_t from_tok) {
+    mtp_draft2_ = -1;
+    if (!mtp_ready() || !mtp_experts_host_ || mtp_draft_ < 0 || mtp_hres_rows_ < 1 || !t_m_hres_) return true;
+    const int64_t n_embd = hp_.n_embd;
+    const int32_t d1 = mtp_draft_;
+    const int32_t dlast = from_tok >= 0 ? from_tok : mtp_n_drafts_ >= 1 ? mtp_drafts_[mtp_n_drafts_ - 1] : d1;   // chain from the last draft, or the caller's
+    // That draft's embedding, gathered on the host like mtp_step's.
+    ggml_backend_tensor_set(h_mtp_tok_, &dlast, 0, sizeof(int32_t));
+    {
+        ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false); ip.no_alloc = true;
+        ggml_context * c = ggml_init(ip);
+        ggml_cgraph *  g = ggml_new_graph_custom(c, 8, false);
+        ggml_tensor * te = ggml_get_rows(c, wh_.get("token_embd.weight"), ggml_view_1d(c, h_mtp_tok_, 1, 0));
+        ggml_build_forward_expand(g, ggml_cpy(c, te, ggml_view_2d(c, h_mtp_emb_, n_embd, 1, h_mtp_emb_->nb[1], 0)));
+        run_on(g, false);
+        ggml_free(c);
+    }
+    ggml_backend_tensor_get(h_mtp_emb_, xfer_.data(), 0, (size_t) n_embd * sizeof(float));
+    ggml_backend_tensor_set(t_mtp_emb_, xfer_.data(), 0, (size_t) n_embd * sizeof(float));
+    // The head at the position after its last draft, its own residual for that
+    // position as the hidden input. Its cache row there is speculative and is
+    // rewritten by the next mtp_step before anything real attends to it.
+    const int64_t pos2 = mtp_last_pos_ + 1, hrow = mtp_hres_rows_ - 1;
+    const bool want = mtp_want_logits_;
+    std::vector<float> keep;
+    if (want && mtp_have_logits_) keep = mtp_logits_;   // the first draft's distribution, restored below
+    if (!mtp_draft(pos2, 1, hrow, t_mtp_emb_, 0, nullptr, 0, err, t_m_hres_)) return false;
+    mtp_draft2_ = mtp_draft_;
+    mtp_draft_  = d1;
+    mtp_hres_rows_ = 1; mtp_last_pos_ = pos2;
+    if (want) { mtp_logits2_ = mtp_logits_; mtp_have_logits2_ = mtp_have_logits_; if (!keep.empty()) { mtp_logits_ = keep; mtp_have_logits_ = true; } }
+    if (from_tok >= 0 && mtp_n_drafts_ >= 1 && mtp_n_drafts_ < MTP_MAX_DRAFTS) {
+        // The caller replaced the last draft by its sample; record the chained one after it.
+        mtp_drafts_[mtp_n_drafts_ - 1] = from_tok;
+        const int j = mtp_n_drafts_;
+        mtp_drafts_[j] = mtp_draft2_; mtp_n_drafts_ = j + 1;
+        mtp_have_logits_k_[j] = mtp_have_logits2_;
+        if (mtp_have_logits2_) mtp_logits_k_[j] = mtp_logits2_;
+    }
+    return true;
+}
+
+void engine::qsa_decode_prepare_k(int k, int32_t n_past2) {
+    qsa_decode_inputs & qd2_ = qdk_[k - 1];
+    const qsa_decode_inputs & qprev = k == 1 ? qd_ : qdk_[k - 2];
     const int64_t r     = qsa_ratio_;
     const int64_t NBmax = qd_.bias->ne[0];
     const int32_t b_last = n_past2 / (int32_t) r;
@@ -2989,8 +3063,8 @@ void engine::qsa_decode_prepare2(int32_t n_past2) {
     ggml_backend_tensor_set(qd2_.blk_idx, &b_last, 0, 4);
     const float nf = (float) n_past2;
     ggml_backend_tensor_set(qd2_.npast_f, &nf, 0, 4);
-    // The first position's bias, then this position's window on top of it.
-    ggml_backend_tensor_copy(qd_.bias, qd2_.bias);
+    // The previous position's bias, then this position's window on top of it.
+    ggml_backend_tensor_copy(qprev.bias, qd2_.bias);
     float win[3]; int64_t b0 = std::max<int64_t>(0, b_last - 1), n = 0;
     for (int64_t b = b0; b <= b_last + 1 && b < NBmax; b++, n++)
         win[n] = b < n_bid ? 0.0f : (b == b_last ? 1e9f : -INFINITY);
@@ -2999,43 +3073,56 @@ void engine::qsa_decode_prepare2(int32_t n_past2) {
     int64_t NB = ((b_last + 1 + 255) / 256) * 256;
     NB = std::max<int64_t>(NB, 768);
     NB = std::min<int64_t>(NB, NBmax);
-    qd_.n_bucket = qd2_.n_bucket = std::max(qd_.n_bucket, NB);
-    qd2_.k_blocks = qd_.k_blocks = std::min<int64_t>(qd_.k_blocks, qd_.n_bucket);
+    qd_.n_bucket = std::max(qd_.n_bucket, NB);
+    qd_.k_blocks = std::min<int64_t>(qd_.k_blocks, qd_.n_bucket);
+    for (int j = 0; j < MTP_MAX_DRAFTS; j++) { qdk_[j].n_bucket = qd_.n_bucket; qdk_[j].k_blocks = qd_.k_blocks; }
 }
 
 const float * engine::eval_decode(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err) {
-    if (n_new < 1 || n_new > 2) { err = "eval_decode: one or two tokens"; return nullptr; }
+    if (n_new < 1 || n_new > 1 + MTP_MAX_DRAFTS) { err = "eval_decode: a token and at most " + std::to_string(MTP_MAX_DRAFTS) + " drafts"; return nullptr; }
     if (n_past_ + n_new > (int32_t) cfg_.n_ctx) { err = "context exhausted"; return nullptr; }
-    if (n_new == 2 && cfg_.skip_miss) { err = "eval_decode: a pair and --skip-miss do not combine"; return nullptr; }
-    ec_.set_max_promotions(cfg_.promote_per_layer * (uint32_t) n_new);   // a pair looks up ~1.7x the experts per layer
+    if (n_new >= 2 && cfg_.skip_miss) { err = "eval_decode: a verified step and --skip-miss do not combine"; return nullptr; }
+    ec_.set_max_promotions(cfg_.promote_per_layer * (uint32_t) n_new);   // a step of n positions looks up more experts per layer
     const bool ok = eval_batch(hist, n_hist, n_new, err, /*cache_batched=*/false, /*force_decode=*/true);
     ec_.set_max_promotions(cfg_.promote_per_layer);
     if (!ok) return nullptr;
     return logits_.data() + (size_t) (n_new - 1) * n_vocab_;
 }
 
-bool engine::rollback(std::string & err) {
-    if (!rb_valid_) { err = "rollback: no snapshot of the state one token back"; return false; }
+bool engine::rollback_n(int n_back, std::string & err) {
+    if (n_back < 1 || n_back > rb_depth_) { err = "rollback: no snapshot of the state " + std::to_string(n_back) + " tokens back"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
+    // Slot n_back-1 of every snapshot, as views (same backend: a device copy).
+    ggml_init_params vp{}; vp.mem_size = ggml_tensor_overhead() * (2 * hp_.n_layer + 4); vp.no_alloc = true;
+    ggml_context * vc = ggml_init(vp);
+    const size_t s = (size_t) (n_back - 1);
     for (uint32_t il = 0; il < hp_.n_layer; il++) {
         if (!rb_rs_[il]) continue;
-        ggml_backend_tensor_copy(rb_rs_[il],   st_.rs_state(il));
-        ggml_backend_tensor_copy(rb_conv_[il], st_.rs_conv(il));
+        ggml_tensor * rs = ggml_view_3d(vc, rb_rs_[il], rb_rs_[il]->ne[0], rb_rs_[il]->ne[1], rb_rs_[il]->ne[2], rb_rs_[il]->nb[1], rb_rs_[il]->nb[2], s * rb_rs_[il]->nb[3]);
+        ggml_tensor * cv = ggml_view_2d(vc, rb_conv_[il], rb_conv_[il]->ne[0], rb_conv_[il]->ne[1], rb_conv_[il]->nb[1], s * rb_conv_[il]->nb[2]);
+        ggml_backend_view_init(rs); ggml_backend_view_init(cv);   // a view made outside an allocator has no buffer of its own
+        ggml_backend_tensor_copy(rs, st_.rs_state(il));
+        ggml_backend_tensor_copy(cv, st_.rs_conv(il));
     }
-    if (rb_ple_conv_) ggml_backend_tensor_copy(rb_ple_conv_, st_.ple_conv());
-    // The KV, indexer and pooled-key rows the second position wrote are rewritten
-    // by the next token at that position; the bias window is recomputed per token.
-    n_past_ -= 1;
-    rb_valid_ = false;
-    mtp_h_rows_ = std::max<int64_t>(1, mtp_h_rows_ - 1);
+    if (rb_ple_conv_) {
+        ggml_tensor * pc = ggml_view_2d(vc, rb_ple_conv_, rb_ple_conv_->ne[0], rb_ple_conv_->ne[1], rb_ple_conv_->nb[1], s * rb_ple_conv_->nb[2]);
+        ggml_backend_view_init(pc);
+        ggml_backend_tensor_copy(pc, st_.ple_conv());
+    }
+    ggml_free(vc);
+    // The KV, indexer and pooled-key rows the undone positions wrote are rewritten
+    // by the next tokens at those positions; the bias window is recomputed per token.
+    n_past_ -= n_back;
+    rb_valid_ = false; rb_depth_ = 0;
+    mtp_h_rows_ = std::max<int64_t>(1, mtp_h_rows_ - n_back);
     n_rollback++;
     t_rollback += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 
 bool engine::mtp_step(const int32_t * next_toks, int n, std::string & err) {
-    mtp_draft_ = -1;
-    if (!mtp_ready() || n < 1 || n > 2 || mtp_h_rows_ < n || n_past_ < n) return true;
+    mtp_draft_ = -1; mtp_n_drafts_ = 0;
+    if (!mtp_ready() || n < 1 || n > 1 + MTP_MAX_DRAFTS || mtp_h_rows_ < n || n_past_ < n) return true;
     const int64_t n_embd = hp_.n_embd;
     // The embeddings of the tokens that follow each position, gathered on the host.
     ggml_backend_tensor_set(h_mtp_tok_, next_toks, 0, (size_t) n * sizeof(int32_t));
@@ -3050,7 +3137,25 @@ bool engine::mtp_step(const int32_t * next_toks, int n, std::string & err) {
     }
     ggml_backend_tensor_get(h_mtp_emb_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
     ggml_backend_tensor_set(t_mtp_emb_, xfer_.data(), 0, (size_t) n * n_embd * sizeof(float));
-    return mtp_draft(n_past_ - n, n, mtp_h_rows_ - n, t_mtp_emb_, 0, nullptr, 0, err);
+    if (!mtp_draft(n_past_ - n, n, mtp_h_rows_ - n, t_mtp_emb_, 0, nullptr, 0, err)) return false;
+    if (mtp_draft_ >= 0) {
+        mtp_drafts_[0] = mtp_draft_; mtp_n_drafts_ = 1;
+        mtp_have_logits_k_[0] = mtp_have_logits_;
+        if (mtp_have_logits_) mtp_logits_k_[0] = mtp_logits_;
+    }
+    return true;
+}
+
+bool engine::mtp_draft_more(int k, std::string & err) {
+    while (mtp_n_drafts_ >= 1 && mtp_n_drafts_ < std::min(k, MTP_MAX_DRAFTS)) {
+        if (!mtp_draft_next(err)) return false;
+        if (mtp_draft2_ < 0) break;
+        const int j = mtp_n_drafts_;
+        mtp_drafts_[j] = mtp_draft2_; mtp_n_drafts_ = j + 1;
+        mtp_have_logits_k_[j] = mtp_have_logits2_;
+        if (mtp_have_logits2_) mtp_logits_k_[j] = mtp_logits2_;
+    }
+    return true;
 }
 
 // Confidence-margin buckets for the prediction statistics: router logit

@@ -55,6 +55,9 @@ public:
 
     // Device bytes the staging needs for this model (the largest layer + slack).
     static size_t device_bytes_for(const model_index * mi);
+    // The first host staging buffer, idle between prefills: a page-aligned, pinned
+    // bounce area other readers may borrow while no prefill runs.
+    uint8_t * host_scratch(size_t & bytes) const { bytes = hb_[0].p ? stage_bytes_ : 0; return hb_[0].p; }
     // The device staging is allocated on the first load_layer() after init or
     // release_device(), and release_device() frees it: it only needs to exist
     // while a prefill runs, and the expert VRAM tier has the memory otherwise.

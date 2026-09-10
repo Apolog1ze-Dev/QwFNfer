@@ -739,6 +739,71 @@ bool expert_cache::read_block_now(layer_pool & lp, uint32_t layer, int32_t slot,
     return true;
 }
 
+bool expert_cache::fetch_batch(uint32_t layer, const uint32_t * expert_ids, uint32_t n, expert_handle * out,
+                               uint8_t * bounce, size_t bounce_bytes) {
+    if (layer >= blk_.size()) return false;
+    layer_pool & lp = blk_[layer];
+    if (!bounce || bounce_bytes < (size_t) n * lp.block_bytes) return false;
+    std::vector<io_request> reqs; reqs.reserve((size_t) n * EXPERT_NPARTS);
+    uint32_t n_miss = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t e = expert_ids[i];
+        out[i] = expert_handle{};
+        if (e >= hot_->hp().n_expert) return false;
+        if (vram_buf_ && lp.g_slots > 0 && !lp.g_lent) {
+            const int32_t gs = lp.g_expert_slot[e];
+            if (gs >= 0 && lp.g_valid[gs] && lp.g_slot_expert[gs] == (uint16_t) e) { fill_gpu_handle(lp, (uint32_t) gs, out[i]); continue; }
+        }
+        {
+            const int32_t s = lp.expert_slot[e];
+            if (s >= 0 && lp.slot_expert[s] == (uint16_t) e && lp.slot_valid[s] && !lp.slot_cold[s]) { fill_handle(lp, (uint32_t) s, out[i]); continue; }
+        }
+        // An empty RAM slot takes the block (a fresh session's tier fills with the
+        // prompt's experts, as it should); a full tier is left alone and the block
+        // goes to the bounce. Never an eviction, never a frequency count.
+        int32_t adopt = -1;
+        {
+            static thread_local uint64_t rng = 0x9E3779B97F4A7C15ull;
+            for (int k = 0; k < 16 && lp.n_slots > 0; k++) {
+                const uint32_t s = (uint32_t) (xorshift(rng) % lp.n_slots);
+                if (lp.slot_expert[s] == SLOT_EMPTY && !lp.slot_pinned[s]) { adopt = (int32_t) s; break; }
+            }
+        }
+        uint8_t * base = adopt >= 0 ? slot_ptr(lp, (uint32_t) adopt) : bounce + (size_t) n_miss * lp.block_bytes;
+        if (adopt < 0) n_miss++;
+        for (int q = 0; q < EXPERT_NPARTS; q++) {
+            const byte_range br = hot_->expert_range(layer, e, (expert_part) q);
+            if (!br.valid()) return false;
+            reqs.push_back(io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 });
+            out[i].part[q] = base + lp.part_off[q] + lp.part_pay[q];
+            out[i].type[q] = lp.part_type[q];
+            st_.bytes_from_disk += br.nbytes;
+        }
+        out[i].buffer = adopt >= 0 ? arena_buf_ : nullptr; out[i].on_gpu = false; out[i].from_cold = false; out[i].slot = adopt;
+        if (adopt >= 0) {
+            lp.slot_expert[adopt] = (uint16_t) e; lp.slot_valid[adopt] = 1; lp.slot_freq[adopt] = 1;
+            lp.slot_used[adopt] = ++tick_; lp.slot_cold[adopt] = 0; lp.slot_speculative[adopt] = 0;
+            lp.expert_slot[e] = adopt;
+        }
+    }
+    st_.batch_lookups += n; st_.batch_misses += n_miss;
+    // Every miss's reads, a window at a time.
+    size_t submitted = 0, reaped = 0; uint64_t tags[256];
+    while (submitted < reqs.size() || reaped < reqs.size()) {
+        if (submitted < reqs.size()) {
+            const size_t k = io_hot_.submit(reqs.data() + submitted, std::min<size_t>(64, reqs.size() - submitted));
+            submitted += k;
+            if (k > 0 && submitted < reqs.size()) continue;
+        }
+        const size_t got = io_hot_.reap(tags, 256, reaped < submitted ? 1 : 0);
+        if (got == 0 && reaped < submitted) return false;
+        reaped += got;
+        if (submitted == reqs.size() && reaped == reqs.size()) break;
+    }
+    st_.n_reads += reqs.size();
+    return true;
+}
+
 bool expert_cache::settle_pending(const uint32_t * expert_ids, uint32_t n, bool * ready) {
     if (pending_.empty()) return true;
     const auto tw = std::chrono::steady_clock::now();

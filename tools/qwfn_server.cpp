@@ -571,7 +571,7 @@ struct live_stats {
     double t_prompt = 0, t_gen = 0;          // seconds, the current or last request
     double t_prompt_total = 0, t_gen_total = 0;
     long long n_prompt_total = 0, n_gen_total = 0, n_requests = 0;
-    long long n_pairs_total = 0, n_accepted_total = 0;   // the draft head's pairs
+    long long n_pairs_total = 0, n_accepted_total = 0, n_drafted_total = 0;   // the draft head's verify steps, drafts accepted, drafts proposed
     int    n_past = 0;
     json timings() {   // llama.cpp's field names
         std::lock_guard<std::mutex> lk(mu);
@@ -590,6 +590,7 @@ struct pending_img { std::vector<float> emb; int n_tok = 0; };
 
 struct server {
     model_index    mi;
+    uint32_t       mtp_drafts = 1;   // --mtp-drafts: the most drafts a verify step carries
     engine         eng;
     qwfn::vocab    vb;
     vision_encoder vis;
@@ -748,6 +749,7 @@ int main(int argc, char ** argv) {
         // prefill, whose cost is a full expert sweep (~12 s on Q4) whatever T is.
         if (a == "--prefill-decode-max" && i + 1 < argc) { cfg.prefill_decode_max = (uint32_t) atoi(argv[++i]); continue; }
         if (a == "--gate-drop" && i + 1 < argc) { cfg.gate_drop = (float) atof(argv[++i]); continue; }
+        if (a == "--mtp-drafts" && i + 1 < argc) { cfg.mtp_drafts = (uint32_t) std::max(1, std::min(3, atoi(argv[++i]))); continue; }
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
         if (a == "--state-host" && i + 1 < argc) {   // none | idx | kv | kv,idx
             std::string v = next();
@@ -768,7 +770,7 @@ int main(int argc, char ** argv) {
     if (!effort_valid(def_effort)) { fprintf(stderr, "--think must be xhigh|medium|low|off\n"); return 1; }
 
     server S;
-    S.n_ctx = cfg.n_ctx; S.n_batch = cfg.n_batch; S.def_effort = def_effort; S.def_reasoning_budget = def_reasoning_budget;
+    S.n_ctx = cfg.n_ctx; S.n_batch = cfg.n_batch; S.mtp_drafts = cfg.mtp_drafts; S.def_effort = def_effort; S.def_reasoning_budget = def_reasoning_budget;
     S.model_file = argv[1];
     std::string err;
 
@@ -942,7 +944,7 @@ int main(int argc, char ** argv) {
     struct gen_result {
         std::string reasoning, content, finish = "stop";
         int n_prompt = 0, n_gen = 0;
-        int n_pairs = 0, n_accepted = 0;     // speculative pairs verified, and how many held
+        int n_pairs = 0, n_accepted = 0, n_drafted = 0;     // verify steps, drafts accepted, drafts proposed
         double t_prompt = 0, t_gen = 0;
         bool reasoning_budget_hit = false;
     };
@@ -1025,6 +1027,25 @@ int main(int argc, char ** argv) {
         int32_t tok = smp.pick(lg, S.eng.n_vocab());
         if (!S.eng.mtp_step(&tok, 1, e)) return false;
         bool tok_in = false; int32_t tok_next = -1;
+        std::vector<int32_t> evald;   // accepted drafts still to emit (already evaluated), after `tok`
+        // Draft length: the head's acceptance per draft position, tracked as running
+        // means; a position is drafted while the chance that everything before it
+        // and it are accepted beats what the extra position costs the step (~0.4 of
+        // a single-token step, measured). Capped by --mtp-drafts.
+        static float acc_at[engine::MTP_MAX_DRAFTS] = { 0.85f, 0.80f, 0.75f };
+        static const float draft_cost = getenv("QWFN_DRAFT_COST") ? (float) atof(getenv("QWFN_DRAFT_COST")) : 0.7f;   // measured: a position costs ~0.6 of a single-token step, more as the queue deepens
+        auto drafts_wanted = [&]() {
+            // The k that maximises expected tokens per unit of step cost: tokens(k) =
+            // 1 + a1 + a1 a2 + ... , cost(k) = 1 + k * draft_cost.
+            const int cap = (int) std::min<uint32_t>(S.mtp_drafts, (uint32_t) engine::MTP_MAX_DRAFTS);
+            int best = 1; float best_rate = 0.0f, tokens = 1.0f, p = 1.0f;
+            for (int k = 1; k <= cap; k++) {
+                p *= acc_at[k - 1]; tokens += p;
+                const float rate = tokens / (1.0f + (float) k * draft_cost);
+                if (rate > best_rate) { best_rate = rate; best = k; }
+            }
+            return best;
+        };
         // Layer 0's reads for the tokens the next eval will take, issued as soon as they
         // are known (engine::spec_layer0): the bonus token before the head runs, the pair
         // once drafted, a sampled token before its eval.
@@ -1087,7 +1108,10 @@ int main(int argc, char ** argv) {
 
             if ((int32_t) hist.size() + 1 > (int32_t) S.n_ctx) { R.finish = "length"; n++; break; }
             if (on_tick) on_tick();
-            if (tok_in) { tok = tok_next; tok_in = false; continue; }   // already evaluated with its predecessor
+            if (tok_in) {   // already evaluated with its predecessor: the next accepted draft, then the token after them
+                if (!evald.empty()) { tok = evald.front(); evald.erase(evald.begin()); continue; }
+                tok = tok_next; tok_in = false; continue;
+            }
             // The draft: the head's argmax when sampling is greedy; at temperature,
             // a sample from the head's own distribution under the request's
             // sampler (speculative sampling: accept with probability
@@ -1096,52 +1120,80 @@ int main(int argc, char ** argv) {
             // Sampling the draft rather than taking its argmax is what keeps the
             // acceptance near the greedy rate when the trunk itself is sampled.
             static const bool argmax_draft = getenv("QWFN_MTP_ARGMAX_DRAFT") != nullptr;   // the old rule, for A/B
-            int32_t draft = S.eng.mtp_draft_id();
-            float q_d = 1.0f;
-            const float * hl = S.eng.mtp_logits();
-            if (draft >= 0 && hl && smp.cfg.temp > 0.0f && !argmax_draft) {
-                const auto qd = smp.dist(hl, S.eng.n_vocab());
-                if (!qd.empty()) { draft = smp.sample(qd); q_d = sampler::prob_of(qd, draft); }
-            }
-            if (draft >= 0 && !S.vb.is_eog(draft) && n + 1 < budget && (int32_t) hist.size() + 2 <= (int32_t) S.n_ctx) {
-                spec_l0(&draft, 1, 2);
-                hist.push_back(draft);
-                if (!S.eng.eval_decode(hist.data(), (int32_t) hist.size(), 2, e)) return false;
-                const float * l0 = S.eng.logits_pos(0), * l1 = S.eng.logits_pos(1);
-                R.n_pairs++;
-                bool accept; int32_t y = -1;
-                if (smp.cfg.temp <= 0.0f || argmax_draft || q_d >= 1.0f) {
-                    y = smp.pick(l0, S.eng.n_vocab());
-                    accept = y == draft;
+            // The drafts of this step. Greedy: the head's argmax chain. At temperature:
+            // each draft sampled from the head's distribution under the request's
+            // sampler, the next one chained from that sample, so the acceptance test
+            // below sees the distribution the draft was drawn from.
+            const bool sampled = smp.cfg.temp > 0.0f && !argmax_draft && S.eng.mtp_logits() != nullptr;
+            std::vector<int32_t> drafts; std::vector<std::vector<std::pair<int32_t, float>>> qs;
+            if (S.eng.mtp_draft_id() >= 0) {
+                const int want = drafts_wanted();
+                if (!sampled) {
+                    if (!S.eng.mtp_draft_more(want, e)) return false;
+                    for (int k = 0; k < S.eng.mtp_draft_count(); k++) drafts.push_back(S.eng.mtp_draft_k(k));
                 } else {
-                    const auto pd = smp.dist(l0, S.eng.n_vocab());
-                    const float p_d = sampler::prob_of(pd, draft);
-                    std::uniform_real_distribution<double> U(0.0, 1.0);
-                    accept = p_d >= q_d || U(smp.rng) < (double) p_d / (double) q_d;
-                    if (!accept) {
-                        // The residual max(0, p - q), normalised, over p's candidates.
-                        const auto qd = smp.dist(hl, S.eng.n_vocab());
-                        std::vector<std::pair<int32_t, float>> res; double sum = 0;
-                        for (const auto & [t, p] : pd) { const float r = p - sampler::prob_of(qd, t); if (r > 0) { res.emplace_back(t, r); sum += r; } }
-                        if (res.empty() || sum <= 0) y = smp.sample(pd);
-                        else { for (auto & [t, r] : res) r = (float) (r / sum); y = smp.sample(res); }
+                    for (int k = 0; k < want; k++) {
+                        const float * hl = S.eng.mtp_logits_k(k);
+                        if (!hl) break;
+                        auto qd = smp.dist(hl, S.eng.n_vocab());
+                        if (qd.empty()) break;
+                        const int32_t d = smp.sample(qd);
+                        drafts.push_back(d); qs.push_back(std::move(qd));
+                        if (k + 1 < want && !S.eng.mtp_draft_next(e, d)) return false;
                     }
                 }
-                if (accept) {
-                    R.n_accepted++;
-                    smp.gen.push_back(draft);
-                    tok_next = smp.pick(l1, S.eng.n_vocab());
-                    spec_l0(&tok_next, 1, 1);
-                    const int32_t two[2] = { draft, tok_next };
-                    if (!S.eng.mtp_step(two, 2, e)) return false;
-                    tok = draft; tok_in = true;
-                } else {
-                    if (!S.eng.rollback(e)) return false;
-                    hist.pop_back();
-                    tok = y;
-                    spec_l0(&tok, 1, 1);
-                    if (!S.eng.mtp_step(&tok, 1, e)) return false;
+                // No draft past an end-of-generation token, the budget or the context.
+                for (size_t k = 0; k < drafts.size(); k++) if (S.vb.is_eog(drafts[k])) { drafts.resize(k); qs.resize(std::min(qs.size(), k)); break; }
+                while (!drafts.empty() && (n + (int) drafts.size() >= budget || (int32_t) hist.size() + 1 + (int32_t) drafts.size() > (int32_t) S.n_ctx)) { drafts.pop_back(); if (qs.size() > drafts.size()) qs.pop_back(); }
+            }
+            const int K = (int) drafts.size();
+            if (K > 0) {
+                {
+                    std::vector<int32_t> step(drafts);
+                    spec_l0(step.data(), K, K + 1);
                 }
+                for (int32_t d : drafts) hist.push_back(d);
+                if (!S.eng.eval_decode(hist.data(), (int32_t) hist.size(), K + 1, e)) return false;
+                R.n_pairs++; R.n_drafted += K;
+                // Verify position by position: accept draft j against the trunk's logits at
+                // position j; the first rejection ends the step with a token drawn there.
+                int j = 0; int32_t y = -1;
+                std::uniform_real_distribution<double> U(0.0, 1.0);
+                for (j = 0; j < K; j++) {
+                    const float * lj = S.eng.logits_pos(j);
+                    bool accept;
+                    if (!sampled || j >= (int) qs.size()) {
+                        y = smp.pick(lj, S.eng.n_vocab());
+                        accept = y == drafts[j];
+                    } else {
+                        const auto pd = smp.dist(lj, S.eng.n_vocab());
+                        const float p_d = sampler::prob_of(pd, drafts[j]), q_d = sampler::prob_of(qs[j], drafts[j]);
+                        accept = q_d <= 0.0f || p_d >= q_d || U(smp.rng) < (double) p_d / (double) q_d;
+                        if (!accept) {
+                            // The residual max(0, p - q), normalised, over p's candidates.
+                            std::vector<std::pair<int32_t, float>> res; double sum = 0;
+                            for (const auto & [t, p] : pd) { const float r = p - sampler::prob_of(qs[j], t); if (r > 0) { res.emplace_back(t, r); sum += r; } }
+                            if (res.empty() || sum <= 0) y = smp.sample(pd);
+                            else { for (auto & [t, r] : res) r = (float) (r / sum); y = smp.sample(res); }
+                        }
+                    }
+                    acc_at[j] += 0.05f * ((accept ? 1.0f : 0.0f) - acc_at[j]);
+                    if (!accept) break;
+                    R.n_accepted++;
+                    smp.gen.push_back(drafts[j]);
+                }
+                std::vector<int32_t> fed(drafts.begin(), drafts.begin() + j);
+                if (j == K) {
+                    y = smp.pick(S.eng.logits_pos(K), S.eng.n_vocab());
+                } else {
+                    if (!S.eng.rollback_n(K - j, e)) return false;
+                    hist.resize(hist.size() - (size_t) (K - j));
+                }
+                fed.push_back(y);
+                spec_l0(&y, 1, 1);
+                if (!S.eng.mtp_step(fed.data(), (int) fed.size(), e)) return false;
+                if (j > 0) { tok = drafts[0]; evald.assign(drafts.begin() + 1, drafts.begin() + j); tok_next = y; tok_in = true; }
+                else       { tok = y; }
             } else {
                 lg = S.eng.eval(hist.data(), (int32_t) hist.size(), 1, e);
                 if (!lg) return false;
@@ -1155,7 +1207,7 @@ int main(int argc, char ** argv) {
         R.n_gen = n;
         { std::lock_guard<std::mutex> lk(S.live.mu); S.live.busy = false; S.live.n_gen = n; S.live.t_gen = R.t_gen;
           S.live.n_prompt_total += R.n_prompt; S.live.t_prompt_total += R.t_prompt; S.live.n_gen_total += n; S.live.t_gen_total += R.t_gen; S.live.n_past = S.eng.n_past();
-          S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; }
+          S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; S.live.n_drafted_total += R.n_drafted; }
 
         // Close the turn so the next request can continue from here. The sampled
         // end-of-turn token was appended but never evaluated, so the engine's
@@ -1271,10 +1323,10 @@ int main(int argc, char ** argv) {
     auto stats_json = [&]() {
         json t = S.live.timings();
         const auto & c = S.eng.cache_stats();   // racy reads of plain counters: a monitor, not a ledger
-        long long np, ng, nr, npair, nacc; double tp, tg; bool busy; int n_past;
+        long long np, ng, nr, npair, nacc, ndraft; double tp, tg; bool busy; int n_past;
         { std::lock_guard<std::mutex> lk(S.live.mu); np = S.live.n_prompt_total; ng = S.live.n_gen_total; nr = S.live.n_requests;
           tp = S.live.t_prompt_total; tg = S.live.t_gen_total; busy = S.live.busy; n_past = S.live.n_past;
-          npair = S.live.n_pairs_total; nacc = S.live.n_accepted_total; }
+          npair = S.live.n_pairs_total; nacc = S.live.n_accepted_total; ndraft = S.live.n_drafted_total; }
         return json{
             {"busy", busy},
             {"prompt", {{"n", t["prompt_n"]}, {"ms", t["prompt_ms"]}, {"tokens_per_second", t["prompt_per_second"]}}},
@@ -1288,7 +1340,8 @@ int main(int argc, char ** argv) {
                               // the raw counters, so a harness can difference two samples
                               {"lookups", c.lookups}, {"hits", c.hits}, {"gpu_hits", c.gpu_hits},
                               {"promotions", c.promotions}, {"pf_issued", c.pf_issued}, {"pf_used", c.pf_used}}},
-            {"speculative", {{"pairs", npair}, {"accepted", nacc}, {"acceptance", npair ? (double) nacc / npair : 0.0}}},
+            {"speculative", {{"pairs", npair}, {"accepted", nacc}, {"drafted", ndraft}, {"acceptance", ndraft ? (double) nacc / ndraft : 0.0},
+                             {"tokens_per_step", npair ? (double) (npair + nacc) / npair : 1.0}}},
             {"timings", t}};
     };
     svr.Get("/stats", [&](const httplib::Request &, httplib::Response & res) {
@@ -1652,7 +1705,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "[qwfn-server] %s: prompt %d tok %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s%s\n",
                             id.c_str(), R.n_prompt, R.t_prompt > 0 ? R.n_prompt / R.t_prompt : 0.0, R.n_gen, R.reasoning.size(),
                             R.reasoning_budget_hit ? ", budget hit" : "", R.t_gen, R.t_gen > 0 ? R.n_gen / R.t_gen : 0.0, R.finish.c_str(),
-                            R.n_pairs ? (" | drafts: " + std::to_string(R.n_accepted) + " of " + std::to_string(R.n_pairs) + " pairs accepted").c_str() : "");
+                            R.n_pairs ? (" | drafts: " + std::to_string(R.n_accepted) + " of " + std::to_string(R.n_drafted) + " accepted over " + std::to_string(R.n_pairs) + " steps").c_str() : "");
                 }
                 if (!ok) {
                     S.last_msgs = json();

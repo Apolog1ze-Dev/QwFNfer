@@ -73,6 +73,7 @@ struct expert_cache_stats {
     uint64_t pf_wasted  = 0;    // evicted or replaced before use
     uint64_t ram_released = 0;  // RAM slots freed once the block reached VRAM
     uint64_t upgrades   = 0;    // cold blocks refetched at full precision on reuse
+    uint64_t batch_lookups = 0, batch_misses = 0;   // prompt-batch experts served without admission, and the ones read for it
     uint64_t warm_admitted = 0; // blocks copied into the RAM tier from a prefill's staging
     uint64_t warm_promoted = 0; // of those, pushed on to VRAM
     double   t_warm     = 0;
@@ -185,6 +186,14 @@ public:
         uint32_t         n     = 0;
     };
     void prefetch_begin(const pf_set * sets, uint32_t n_sets);
+    // A prompt batch's experts, without touching the tiers' bookkeeping: resident
+    // ones (VRAM, then RAM) are handed out as they are, the rest are read straight
+    // into `bounce` (page-aligned, >= n * block_bytes(layer)), one block per miss.
+    // No admission, no eviction, no frequency counts -- a prompt's experts are not
+    // evidence about the decode that follows, and reading them into the RAM tier
+    // used to churn it (hit rate 95 -> 87% measured).
+    bool   fetch_batch(uint32_t layer, const uint32_t * expert_ids, uint32_t n, expert_handle * out,
+                       uint8_t * bounce, size_t bounce_bytes);
     void prefetch_begin(uint32_t layer, const uint32_t * expert_ids, uint32_t n) {
         pf_set s{layer, expert_ids, n};
         prefetch_begin(&s, 1);

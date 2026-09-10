@@ -126,11 +126,16 @@ ggml_tensor * graph_builder::conv_with_history(ggml_tensor * state_row, ggml_ten
     ggml_tensor * tail = ggml_view_2d(ctx0, padded, hist, channels,
             padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist));
     if (persist_) ggml_build_forward_expand(gf_, ggml_cpy(ctx0, tail, state_row));   // cpy handles the strided source
-    // Rollback: the history as it stood after the token before the last one.
-    if (persist_ && rb_row && padded->ne[0] - hist >= 2) {
-        ggml_tensor * tail1 = ggml_view_2d(ctx0, padded, hist, channels,
-                padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist - 1));
-        ggml_build_forward_expand(gf_, ggml_cpy(ctx0, tail1, rb_row));
+    // Rollback: the history as it stood s tokens back, for s = 1..rb_n_ (slot s-1 of rb_row).
+    if (persist_ && rb_row) {
+        const int64_t T = padded->ne[0] - hist;
+        const int64_t n_snap = std::min<int64_t>(T - 1, rb_row->ne[2] > 0 ? std::min<int64_t>(rb_n_, rb_row->ne[2]) : rb_n_);
+        for (int64_t s = 1; s <= n_snap; s++) {
+            ggml_tensor * tails = ggml_view_2d(ctx0, padded, hist, channels,
+                    padded->nb[1], ggml_row_size(padded->type, padded->ne[0] - hist - s));
+            ggml_tensor * dst = ggml_view_2d(ctx0, rb_row, hist, channels, rb_row->nb[1], (size_t) (s - 1) * rb_row->nb[2]);
+            ggml_build_forward_expand(gf_, ggml_cpy(ctx0, tails, dst));
+        }
     }
 
     return padded;
@@ -183,7 +188,10 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
     // The fused op broadcasts the 16 k-heads across the 48 v-heads itself. K
     // state snapshots follow the scores in its output, most recent first: with
     // two tokens and a rollback target, slot 1 is the state after the first.
-    const int K = (persist_ && rb_rs_ && T >= 2) ? 2 : 1;
+    // K state snapshots follow the scores in the kernel's output, most recent
+    // first: slot s is the state s tokens back, which is what a rollback to any of
+    // the step's first T-1 positions needs.
+    const int K = (persist_ && rb_rs_ && T >= 2) ? (int) std::min<int64_t>(T, rb_n_ + 1) : 1;
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, beta, s0, K);
 
     ggml_tensor * out = ggml_view_4d(ctx0, result, head_v, n_v_heads, T, 1,
@@ -204,13 +212,14 @@ ggml_tensor * graph_builder::deltanet(ggml_tensor * cur, int il) {
         ggml_tensor * dst = ggml_view_3d(ctx0, st_->rs_state(il), D, 1, 1,
                                          ggml_row_size(GGML_TYPE_F32, D), ggml_row_size(GGML_TYPE_F32, D), 0);
         ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s1, dst));
-        if (K == 2) {
-            ggml_tensor * s2 = ggml_view_4d(ctx0, result, head_v, head_v, n_v_heads, 1,
+        for (int s = 1; s < K; s++) {
+            ggml_tensor * ss = ggml_view_4d(ctx0, result, head_v, head_v, n_v_heads, 1,
                     ggml_row_size(result->type, head_v),
                     ggml_row_size(result->type, head_v * head_v),
                     ggml_row_size(result->type, head_v * head_v * n_v_heads),
-                    ggml_row_size(result->type, head_v * n_v_heads * T) + ggml_row_size(result->type, D));
-            ggml_build_forward_expand(gf_, ggml_cpy(ctx0, s2, rb_rs_));
+                    ggml_row_size(result->type, head_v * n_v_heads * T) + (size_t) s * ggml_row_size(result->type, D));
+            ggml_tensor * rdst = ggml_view_3d(ctx0, rb_rs_, head_v, head_v, n_v_heads, rb_rs_->nb[1], rb_rs_->nb[2], (size_t) (s - 1) * rb_rs_->nb[3]);
+            ggml_build_forward_expand(gf_, ggml_cpy(ctx0, ss, rdst));
         }
     }
 
@@ -742,8 +751,9 @@ ggml_tensor * graph_builder::mtp_head(ggml_tensor * h, ggml_tensor * emb, ggml_t
     return mtp_head_post(res, cur, inject, il);
 }
 
-ggml_tensor * graph_builder::mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il) {
+ggml_tensor * graph_builder::mtp_head_post(ggml_tensor * res, ggml_tensor * moe_out, ggml_tensor * inject, int il, ggml_tensor ** hres_out) {
     res = hc_combine(res, moe_out, inject);
+    if (hres_out) *hres_out = res;
     // The head's own mixer collapses the streams and doubles as the output norm.
     ggml_tensor * o = hc_mix_w(res, Wl(il, "nextn.hc_head_norm.weight"), Wl(il, "nextn.hc_head_down.weight"),
                                Wl(il, "nextn.hc_head_up.weight"), nullptr, nullptr);
