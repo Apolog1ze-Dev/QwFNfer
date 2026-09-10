@@ -174,6 +174,20 @@ int main(int argc, char ** argv) {
     if ((pair_test || rollback_test) && replay.empty()) { fprintf(stderr, "--pair-test / --rollback-test need --replay-file\n"); return 1; }
     uint64_t sp_steps = 0, sp_acc = 0, sp_single = 0;
     std::vector<uint64_t> sp_accepted_at(engine::MTP_MAX_DRAFTS + 1, 0);   // verify steps that kept exactly j drafts
+    // Decode progress by segment (QWFN_SEGMENTS=N): tok/s and the tiers' share over
+    // each N tokens, to see how long the decode after a prompt takes to warm up.
+    const int seg_n = getenv("QWFN_SEGMENTS") ? atoi(getenv("QWFN_SEGMENTS")) : 0;
+    int seg_next = seg_n; auto seg_t = t0; expert_cache_stats seg_st = eng.cache_stats();
+    auto segment = [&](int done) {
+        if (seg_n <= 0 || done < seg_next) return;
+        const auto now = std::chrono::steady_clock::now(); const expert_cache_stats & s = eng.cache_stats();
+        const double dts = std::chrono::duration<double>(now - seg_t).count();
+        const uint64_t lk = s.lookups - seg_st.lookups, gh = s.gpu_hits - seg_st.gpu_hits, hh = s.hits - seg_st.hits;
+        fprintf(stderr, "[segment] tokens %d-%d: %.2f tok/s, %.1f%% from VRAM, %.1f%% hit, %.2f GB read\n",
+                seg_next - seg_n, done, (done - (seg_next - seg_n)) / dts, 100.0 * gh / std::max<uint64_t>(1, lk),
+                100.0 * hh / std::max<uint64_t>(1, lk), (s.bytes_from_disk - seg_st.bytes_from_disk) / 1e9);
+        seg_t = now; seg_st = s; seg_next += seg_n;
+    };
     if (!use_mtp && !pair_test && !rollback_test) {
         for (int i = 0; i < n_gen; i++) {
             int best = 0;
@@ -182,6 +196,7 @@ int main(int argc, char ** argv) {
             printf(" %d", best);
             fflush(stdout);
             hist.push_back(best);
+            segment(i + 1);
             lg = eng.eval(hist.data(), (int32_t) hist.size(), 1, err);
             if (!lg) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
         }
@@ -290,6 +305,7 @@ int main(int argc, char ** argv) {
                 hist.resize(hist.size() - (size_t) (K - j));
                 i += j + 1;
             }
+            segment(i);
             if (y < 0) break;
             fed.push_back(y);
             spec_l0(&y, 1);
@@ -432,5 +448,8 @@ int main(int argc, char ** argv) {
     if (s.warm_admitted || s.warm_promoted)
         printf("cache warm-up from prefill: %llu blocks into RAM, %llu on to VRAM, %.2f s\n",
                (unsigned long long) s.warm_admitted, (unsigned long long) s.warm_promoted, eng.t_warm);
+    if (eng.prefill_bytes_read() || eng.prefill_bytes_from_ram())
+        printf("streamed sweeps: %.2f GB of experts read, %.2f GB taken from the RAM tier\n",
+               eng.prefill_bytes_read() / 1e9, eng.prefill_bytes_from_ram() / 1e9);
     return 0;
 }

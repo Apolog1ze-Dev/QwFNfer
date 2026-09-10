@@ -285,6 +285,8 @@ public:
     void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 
     const expert_cache_stats & cache_stats() const { return ec_.stats(); }
+    uint64_t prefill_bytes_read()     const { return pf_.bytes_read; }       // expert bytes the streamed sweeps read
+    uint64_t prefill_bytes_from_ram() const { return pf_.bytes_from_ram; }   // ...and took from the RAM tier instead
     expert_cache::census        ram_census()  const { return ec_.ram_census(); }
     const io_engine &          cache_io()    const { return ec_.io(); }
     std::string memory_summary() const;

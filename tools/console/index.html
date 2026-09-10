@@ -108,6 +108,7 @@
               <label><span class="lbl">Context (tokens) <span class="tip" data-tip="The most tokens one conversation can hold, prompt and answer together. The attention state for it is allocated in VRAM up front and comes out of the expert tier, so a larger context leaves fewer experts on the GPU and decodes a little slower; the table below shows the cost of every step on this machine. The presets set it.">?</span></span><select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
               <label><span class="lbl">KV cache <span class="tip" data-tip="Storage type of the attention cache. q4_0 takes a quarter of f16 for no measurable difference in the answers and is what every measurement used; it is the choice from 32K up. q8_0 and f16 spend more VRAM per token of context.">?</span></span><select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
               <label><span class="lbl">RAM tier (GB) <span class="tip" data-tip="Pinned host memory for the expert cache behind the VRAM tier: what the memory available right now leaves after the server's other host memory (~4 GB, plus the draft head's 2.7 GB of pinned experts and the context state kept in RAM) and a 3.5 GB floor. It is a real lever: measured at 131K, 10.5 to 16 GB was +16% decode in chat and +19% on a long document, about 3% per GB; 19 GB ran the machine out of memory.">?</span></span><input id="ram" type="number" min="2" max="64"></label>
+              <label><span class="lbl">CPU threads <span class="tip" data-tip="Threads for the experts served from the RAM tier (the GPU runs the rest). Measured 2026-09-10 on an 8-core / 16-thread CPU at 131K: 4 threads 15.2 tok/s, 6 15.5, 8 15.6, 12 15.2, 16 11.5, since SMT threads starve the drive reader and the graph thread. The default is the physical core count.">?</span></span><input id="threads" type="number" min="1" max="128"></label>
               <label><span class="lbl">Batch <span class="tip" data-tip="Tokens per prefill batch. The prefill streams every expert once per batch and computes per token, so a bigger batch is a faster prefill: on a 43K document 4096 gives ~300 tok/s, 8192 ~480, 16384 ~720. A batch borrows VRAM from the expert tier only while a prompt streams (about 0.6 GB per 4096 tokens on top of the staging), so the recommendation picks the largest that leaves the tier a gigabyte; decode speed is the same either way.">?</span></span><select id="batch"><option>2048</option><option>4096</option><option>8192</option><option>16384</option></select></label>
               <label><span class="lbl">VRAM reserve (MB) <span class="tip" data-tip="VRAM kept free after the expert tier is sized, for the engine's own graphs and pool (measured ~425 MB): 768 MB when a desktop shares the GPU (what it uses right now is subtracted as well), 640 MB on a headless card. Every 128 MB is a few expert blocks; raise it if the desktop stutters or the log shows allocation failures.">?</span></span><input id="reserve" type="number" min="256" max="4096" step="128"></label>
               <label><span class="lbl">Port <span class="tip" data-tip="The server's port. Clients use http://127.0.0.1:PORT/v1 with any API key.">?</span></span><input id="port" type="number" min="1024" max="65535"></label>
@@ -262,7 +263,7 @@ function renderPlan() {
     `<b>${shName}</b>${o && o.state_host_gb ? ' (' + o.state_host_gb + ' GB)' : ''} · vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
 }
 function applyOption(o) {
-  $('ctx').value = o.ctx; $('kv').value = o.kv; if (o.state_host) $('state_host').value = o.state_host; if (o.ram) $('ram').value = o.ram;
+  $('ctx').value = o.ctx; $('kv').value = o.kv; if (o.state_host) $('state_host').value = o.state_host; if (o.ram) $('ram').value = o.ram; if (o.threads) $('threads').value = o.threads;
   $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>prefill batch <b>${o.batch}</b>${o.prefill_tps ? ` (~${o.prefill_tps} tok/s on a long document; lends ${o.lend_gb} GB of the tier while a prompt streams)` : ''}</span><span>KV + state <b>${o.state_vram_gb !== undefined ? o.state_vram_gb : o.state_gb} GB</b> in VRAM${o.state_host_gb ? ` + <b>${o.state_host_gb} GB</b> in RAM` : ''}</span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b> in RAM, staged per image</span>` : ''}<span>predicted decode <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
   document.querySelectorAll('#options tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.ctx === o.ctx));
   renderPlan();
@@ -272,7 +273,7 @@ let stateChoice = null;    // null: chosen per context by the presets
 async function loadReco() {
   const r = await api('/api/recommend?model=' + selected + '&preset=' + (presetId === 'custom' ? 'coding' : presetId) + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0')) + '&state_host=' + encodeURIComponent(stateChoice === null ? '' : stateChoice)); reco = r;
   if (presetId !== 'custom') presetId = r.preset;
-  ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
+  ['ctx','kv','ram','threads','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
   $('skip_miss').value = String(r.skip_miss);
   if (r.spec_block !== undefined) $('spec_block').value = String(r.spec_block);
   const von = $('vision').options[0];
@@ -291,11 +292,11 @@ async function loadReco() {
   applyOption(r.options.find(o => o.ctx === r.ctx) || r.options[r.options.length - 1]);
 }
 $('ctx').onchange = () => { presetId = 'custom'; renderPresets(); const o = currentOption(); if (o) applyOption(o); else renderPlan(); };
-['kv','ram','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { if (k === 'kv') { presetId = 'custom'; renderPresets(); } renderPlan(); }));
+['kv','ram','threads','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { if (k === 'kv') { presetId = 'custom'; renderPresets(); } renderPlan(); }));
 $('vision').onchange = () => { visionChoice = $('vision').value === 'true'; loadReco(); };
 $('state_host').onchange = () => { stateChoice = $('state_host').value; loadReco(); };
 function settings() {
-  return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, batch: +$('batch').value, reserve: +$('reserve').value,
+  return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, threads: +$('threads').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
            spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true',
            state_host: $('state_host').value, preset: presetId };
@@ -396,7 +397,7 @@ async function poll() {
     if (s.settings && s.settings.preset && s.settings.preset !== presetId) { presetId = s.settings.preset; reload = true; }
     if (i >= 0 && i !== selected) { selected = i; renderModels(); reload = true; }
     if (reload) await loadReco();   // the running preset's own options (its context, and its vision choice)
-    if (s.settings) { ['ctx','kv','ram','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); $('state_host').value = s.settings.state_host || 'none'; renderPlan(); }
+    if (s.settings) { ['ctx','kv','ram','threads','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); $('state_host').value = s.settings.state_host || 'none'; renderPlan(); }
   }
   if (s.selftest_running && !stTimer) pollSelftest();
   const chatable = s.state === 'ready' || s.state === 'busy';

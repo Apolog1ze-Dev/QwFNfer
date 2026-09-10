@@ -25,6 +25,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -69,7 +70,13 @@ public:
 
     // Start reading `layer` into the spare buffer on the reader thread. No-op
     // if it is already staged, already being read, or overlap is off.
-    void prefetch_layer(uint32_t layer);
+    // `from_ram`: take the slices the RAM tier holds from it instead of the file
+    // (only for a read that completes inside this prefill: the tier is stable
+    // then; the wrap-around read of layer 0 for the next turn outlives it).
+    void prefetch_layer(uint32_t layer, bool from_ram = false);
+    // Who answers "what does the RAM tier hold of this layer" (main thread).
+    using resident_source = std::function<void(uint32_t layer, std::vector<ram_slice> &)>;
+    void set_resident_source(resident_source f) { res_src_ = std::move(f); }
 
     // Where expert `e`'s part landed. Valid until the next load_layer().
     const uint8_t * part_ptr(uint32_t e, expert_part part) const;
@@ -88,6 +95,7 @@ public:
     double   t_read = 0;      // caller-visible wait for reads (hidden reads cost ~0)
     double   t_upload = 0;
     uint64_t bytes_read = 0;
+    uint64_t bytes_from_ram = 0;   // expert bytes copied from the RAM tier instead of read
 
 private:
     // One host staging buffer plus the layer it holds. The per-part layout
@@ -107,6 +115,7 @@ private:
         size_t    part_pad[EXPERT_NPARTS] = {0, 0, 0};
         size_t    slice[EXPERT_NPARTS]    = {0, 0, 0};
         ggml_type ptype[EXPERT_NPARTS]    = {GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32};
+        std::vector<ram_slice> residents;        // what to copy from the RAM tier (set before the read starts)
     };
 
     // The actual read: fills b's data and layout for `layer`. Reader thread
@@ -115,7 +124,9 @@ private:
     void reader_loop();
     // Queue `layer` for the reader and return the buffer it will land in, or
     // nullptr if it is already staged or in flight. Caller holds m_.
-    hbuf * enqueue_locked(uint32_t layer);
+    hbuf * enqueue_locked(uint32_t layer, bool from_ram);
+    void   fill_residents(hbuf & b, uint32_t layer, bool from_ram);
+    resident_source res_src_;
 
     const model_index * mi_ = nullptr;
     io_engine           io_;

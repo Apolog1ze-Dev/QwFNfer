@@ -34,6 +34,7 @@ if [ ! -s "$PROMPT" ]; then
     case "$SCEN" in
         short) ./build/qwfn-tok "$MODEL" --chat "Explain in three sentences why mixture-of-experts models are cheaper to run than dense models with the same parameter count." > "$PROMPT" ;;
         doc)   ./build/qwfn-tok "$MODEL" --chat "Using only the attached engineering log and roadmap, name the two largest remaining decode costs on the Q4 file and say what the roadmap proposes for each." --file docs/ENGINEERING.md --file ROADMAP.md > "$PROMPT" ;;
+        mid)   ./build/qwfn-tok "$MODEL" --chat "Using only the attached excerpt of the engineering log, list every measured decode cost it names with its size, then say which one you would attack first and why." --file bench/replay/mid.txt > "$PROMPT" ;;   # ~1,500 tokens: a tool result's size, above the batch path's 512
         code)  ./build/qwfn-tok "$MODEL" --chat "Write a Python module with a class LRUCache(capacity) offering get(key) and put(key, value) in O(1) using a doubly linked list and a dict, plus a small unittest suite covering eviction order, update-on-access and capacity 1. Code only, no explanations." --think off > "$PROMPT" ;;
         *) echo "unknown SCENARIO $SCEN" >&2; exit 1 ;;
     esac

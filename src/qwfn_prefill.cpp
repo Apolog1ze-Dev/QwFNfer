@@ -177,6 +177,8 @@ bool prefill_streamer::read_into(hbuf & b, uint32_t layer, std::string & err) {
 
     size_t off = 0;
     std::vector<io_request> reqs;
+    struct copy_job { uint8_t * dst; const uint8_t * src; size_t n; };
+    std::vector<copy_job> copies;
     for (int q = 0; q < EXPERT_NPARTS; q++) {
         const byte_range r0 = mi_->expert_range(layer, 0, (expert_part) q);
         if (!r0.valid()) { err = "missing expert tensor"; return false; }
@@ -205,13 +207,30 @@ bool prefill_streamer::read_into(hbuf & b, uint32_t layer, std::string & err) {
                         ? "OK" : "*** MISMATCH ***");
         }
 
-        for (size_t p = 0; p < span; p += CHUNK) {
-            const size_t len = std::min(CHUNK, span - p);
-            reqs.push_back(io_request{ r0.shard, begin + p, (uint32_t) len,
-                                       b.p + off + p, 0 });
+        // Slices the RAM tier holds are copied from it (below, while the reads
+        // are in flight) and split the sequential range into runs of missing
+        // experts; each run is read in CHUNK pieces from its aligned edges. An
+        // aligned edge may re-read the fringe of a held slice: the same bytes.
+        std::vector<const uint8_t *> held(n_expert, nullptr);
+        for (const ram_slice & r : b.residents) if (r.expert < n_expert) held[r.expert] = r.part[q];
+        for (uint32_t e = 0; e < n_expert; ) {
+            if (held[e]) {
+                copies.push_back(copy_job{ b.p + off + b.part_pad[q] + (size_t) e * r0.nbytes, held[e], r0.nbytes });
+                bytes_from_ram += r0.nbytes;
+                e++; continue;
+            }
+            uint32_t e2 = e + 1;
+            while (e2 < n_expert && !held[e2]) e2++;
+            const uint64_t rs = r0.offset + (uint64_t) e * r0.nbytes, re = r0.offset + (uint64_t) e2 * r0.nbytes;
+            const uint64_t a0 = dio_align_down(rs), a1 = std::min<uint64_t>(dio_align_up(re), begin + span);
+            for (uint64_t p = a0; p < a1; p += CHUNK) {
+                const size_t len = (size_t) std::min<uint64_t>(CHUNK, a1 - p);
+                reqs.push_back(io_request{ r0.shard, p, (uint32_t) len, b.p + off + (size_t) (p - begin), 0 });
+            }
+            bytes_read += a1 - a0;
+            e = e2;
         }
         off += span;
-        bytes_read += span;
     }
 
     // Keep the device busy: submit a window, drain, refill.
@@ -223,16 +242,20 @@ bool prefill_streamer::read_into(hbuf & b, uint32_t layer, std::string & err) {
     // truncated chunk leaves the previous layer's experts in that slice of the
     // staging and the MoE computes on them -- fluent, wrong, and unrepeatable.
     const uint64_t err0 = io_.stat_errors;
+    // The tier's slices are copied while the first window of reads is in flight.
+    size_t ci = 0;
     while (done < reqs.size()) {
         while (i < reqs.size() && io_.in_flight() < WINDOW) {
             const size_t k = io_.submit(&reqs[i], std::min(WINDOW - io_.in_flight(), reqs.size() - i));
             if (k == 0) break;
             i += k;
         }
+        if (ci < copies.size()) { const copy_job & c = copies[ci++]; memcpy(c.dst, c.src, c.n); continue; }
         const size_t got = io_.reap(tags, 256, 1);
         if (got == 0) { err = "prefill expert read failed"; return false; }
         done += got;
     }
+    for (; ci < copies.size(); ci++) memcpy(copies[ci].dst, copies[ci].src, copies[ci].n);
     if (io_.stat_errors != err0) { err = "prefill expert read short or failed"; return false; }
     return true;
 }
@@ -261,7 +284,12 @@ void prefill_streamer::reader_loop() {
     }
 }
 
-prefill_streamer::hbuf * prefill_streamer::enqueue_locked(uint32_t layer) {
+void prefill_streamer::fill_residents(hbuf & b, uint32_t layer, bool from_ram) {
+    b.residents.clear();
+    if (from_ram && res_src_) res_src_(layer, b.residents);
+}
+
+prefill_streamer::hbuf * prefill_streamer::enqueue_locked(uint32_t layer, bool from_ram) {
     // Already staged or already the target of a queued/running read?
     for (auto & b : hb_)
         if (b.layer == (int32_t) layer) return &b;
@@ -273,13 +301,14 @@ prefill_streamer::hbuf * prefill_streamer::enqueue_locked(uint32_t layer) {
     hb_[t].layer  = (int32_t) layer;
     hb_[t].ready  = false;
     hb_[t].failed = false;
+    fill_residents(hb_[t], layer, from_ram);
     want_layer_ = (int32_t) layer;
     want_buf_   = t;
     cv_.notify_all();
     return &hb_[t];
 }
 
-void prefill_streamer::prefetch_layer(uint32_t layer) {
+void prefill_streamer::prefetch_layer(uint32_t layer, bool from_ram) {
     if (!overlap_) return;
     std::lock_guard<std::mutex> lk(m_);
     if (stop_) return;
@@ -291,6 +320,7 @@ void prefill_streamer::prefetch_layer(uint32_t layer) {
     hb_[t].layer  = (int32_t) layer;
     hb_[t].ready  = false;
     hb_[t].failed = false;
+    fill_residents(hb_[t], layer, from_ram);
     want_layer_ = (int32_t) layer;
     want_buf_   = t;
     cv_.notify_all();
@@ -307,12 +337,13 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
         if (b.layer != (int32_t) layer || !b.ready) {
             b.layer = (int32_t) layer;
             b.ready = false;
+            fill_residents(b, layer, true);
             if (!read_into(b, layer, err)) { b.layer = -1; return false; }
             b.ready = true;
         }
     } else {
         std::unique_lock<std::mutex> lk(m_);
-        hbuf * b = enqueue_locked(layer);
+        hbuf * b = enqueue_locked(layer, true);   // a load runs inside a prefill: the tier is stable
         idx = (int) (b - hb_);
         cv_.wait(lk, [&] { return (b->ready || b->failed) && b->layer == (int32_t) layer; });
         if (b->failed) { err = reader_err_; b->layer = -1; return false; }

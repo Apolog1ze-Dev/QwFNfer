@@ -528,6 +528,10 @@ bool engine::init(const model_index * hot, const model_index * cold,
     if (!pf_.init(hot, cfg.io_workers, cfg.io_threads,
                   cfg.prefill_on_gpu ? w_.buft() : nullptr,
                   cfg.prefill_on_gpu ? w_.backend() : nullptr, cfg.prefill_overlap, err)) return false;
+    // The streamed sweep takes the slices the RAM tier holds from it instead of
+    // the file (QWFN_SWEEP_FILE_ONLY=1 reads everything, for comparison).
+    if (!getenv("QWFN_SWEEP_FILE_ONLY"))
+        pf_.set_resident_source([this](uint32_t layer, std::vector<ram_slice> & out) { ec_.ram_resident_slices(layer, out); });
 
     gA_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
@@ -1339,7 +1343,7 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
         const auto tr0 = std::chrono::steady_clock::now();
         if (!pf_.load_layer(il, err)) return false;
         t_pf_read += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
-        pf_.prefetch_layer((il + 1) % hp_.n_layer);
+        pf_.prefetch_layer((il + 1) % hp_.n_layer, il + 1 < hp_.n_layer);
         const bool on_gpu = pf_.on_device();
         const tier_view staged = pf_.staged_tier();
         for (int64_t off = 0; off < T; off += Tm) {
@@ -2655,7 +2659,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // reader thread while this layer uploads and computes. Wrapping to
             // layer 0 at the end covers the next ubatch -- and, after the last
             // one, the next turn's prefill.
-            pf_.prefetch_layer((il + 1) % hp_.n_layer);
+            pf_.prefetch_layer((il + 1) % hp_.n_layer, il + 1 < hp_.n_layer);   // the wrap to layer 0 outlives this prefill: file only
 
             const bool moe_on_gpu = pf_.on_device();
             ggml_tensor * mh_in  = moe_on_gpu ? d_cur_     : h_cur_;

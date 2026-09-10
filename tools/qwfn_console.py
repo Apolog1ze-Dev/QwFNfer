@@ -84,6 +84,15 @@ def hardware():
         hw["ram_available_gb"] = round(mi.get("MemAvailable", 0) / 1048576, 1)
     except Exception:
         pass
+    # Physical cores: the thread count the CPU experts want (see the threads field).
+    try:
+        cores = set()
+        for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
+            pkg = p.replace("core_id", "physical_package_id")
+            cores.add((open(pkg).read().strip() if os.path.exists(pkg) else "0", open(p).read().strip()))
+        hw["cpu_cores"] = len(cores) or hw["cpu_threads"]
+    except Exception:
+        hw["cpu_cores"] = hw["cpu_threads"]
     return hw
 
 # ---- settings: a cost model fitted to the reference machine's measurements ----
@@ -215,7 +224,11 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     # before this compared 10.4 with 10.7 GB (docs/ENGINEERING.md, 2026-09-10).
     PROCESS_HOST_GB = 8.0 - 2.7 - state_host_gb(131072, "q4_0", "kv,idx")
     HEAD_HOST_GB = 2.7 if mtp_on else 0.0
-    FREE_FLOOR_GB = 3.5
+    # The floor covers what starts after the server: with 3.5 GB, a coding session
+    # through OpenCode (its language servers load after the first tool call) went
+    # down to 1.9 GB free and the server stalled on its own /stats. 5 GB: the
+    # same session kept 3.4 GB at a 13 GB arena when the tooling was lighter.
+    FREE_FLOOR_GB = 5.0
     def ram_for(sh_gb):
         return max(4, int(avail - sh_gb - PROCESS_HOST_GB - HEAD_HOST_GB - FREE_FLOOR_GB))
     def option(c, with_vision):
@@ -227,6 +240,10 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
         b = batch_for(tier) if tier > 0 else 2048
         return {"ctx": c, "kv": kv, "tier_gb": round(tier, 2), "blocks": short["blocks"], "state_gb": round(state_gb(c, kv), 2), "vision": with_vision,
                 "state_host": sh, "state_host_gb": round(shg, 2), "state_vram_gb": round(state_vram_gb(c, kv, sh), 2), "ram": ram,
+                # Threads for the CPU-served experts: the physical core count. Measured 2026-09-10
+                # on 8 cores / 16 threads at 131K: 4 -> 15.2 tok/s, 6 -> 15.5, 8 -> 15.6, 12 -> 15.2,
+                # 16 -> 11.5 (SMT threads starve the reader and the graph thread).
+                "threads": max(1, int(hw.get("cpu_cores") or hw.get("cpu_threads") or 8)),
                 "batch": b, "lend_gb": round(lend_for(b), 2), "prefill_tps": PREFILL_TPS[b] if q != "IQ1_S" else 0,
                 "tok_s_short": short["tok_s"], "tok_s_long_doc": longd["tok_s"], "vram_served": short["vram_served"], "hit": short["hit"]}
     presets = []
@@ -247,7 +264,7 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
     options = [option(c, vision) for c in CTX_STEPS]
     chosen = next(o for o in options if o["ctx"] == p["ctx_actual"])
     return {
-        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "batch": chosen["batch"], "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
+        "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "threads": chosen["threads"], "batch": chosen["batch"], "reserve": reserve_mb, "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "state_host": chosen["state_host"],
@@ -295,7 +312,8 @@ def start_server(model, s):
         # --ram-frac 0.85 keeps the engine's own MemAvailable clamp (a backstop for the
         # command line, 0.75 by default) above the size computed here, which is the
         # measured one; with the default clamp the tier came out at 10 GB whatever was asked.
-        argv = [SERVER_BIN, model["path"], "--ram", str(int(s["ram"])), "--ram-frac", "0.85", "--ctx", str(int(s["ctx"])), "--batch", str(int(s["batch"])),
+        argv = [SERVER_BIN, model["path"], "--ram", str(int(s["ram"])), "--ram-frac", "0.85", "--threads", str(int(s.get("threads") or 8)),
+                "--ctx", str(int(s["ctx"])), "--batch", str(int(s["batch"])),
                 "--kv", s["kv"], "--reserve", str(int(s["reserve"])), "--think", s["think"], "--think-budget", str(int(s["think_budget"])),
                 "--port", str(int(s["port"]))]
         if s.get("skip_miss"): argv.append("--skip-miss")

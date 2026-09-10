@@ -53,6 +53,10 @@ struct expert_handle {
 // The VRAM tier is laid out this way natively (natural row stride, contiguous);
 // the RAM arena keeps its interleaved gate|up|down blocks and is viewed with a
 // per-slot byte stride, which the CPU kernels address in bytes.
+// One expert's payloads in the RAM tier, for a reader that can take them
+// instead of the file's bytes (the streamed prefill).
+struct ram_slice { uint32_t expert; const uint8_t * part[EXPERT_NPARTS]; };
+
 struct tier_view {
     uint8_t *             part[EXPERT_NPARTS]   = {nullptr, nullptr, nullptr};   // slot 0 of each part
     size_t                stride[EXPERT_NPARTS] = {0, 0, 0};                     // slot-to-slot, bytes
@@ -224,6 +228,9 @@ public:
     // refill a block the copy engine may still be reading.
     void settle_promotions();
     bool arena_pinned() const { return arena_pinned_; }
+    // Every valid, hot block of `layer` in the RAM tier, with its payload pointers.
+    // Main thread only; the pointers hold while nothing admits into that layer.
+    void ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out) const;
 
     // The VRAM tier is two buffers: a permanent one and a dynamic one of
     // lend_bytes that holds expert slots during decode and is FREED for the

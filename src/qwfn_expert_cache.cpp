@@ -987,6 +987,21 @@ void expert_cache::prefetch(uint32_t layer, const uint32_t * expert_ids, uint32_
     }
 }
 
+void expert_cache::ram_resident_slices(uint32_t layer, std::vector<ram_slice> & out) const {
+    out.clear();
+    if (layer >= blk_.size()) return;
+    const layer_pool & lp = blk_[layer];
+    for (uint32_t s = 0; s < lp.n_slots; s++) {
+        if (!lp.slot_valid[s] || lp.slot_cold[s] || lp.slot_expert[s] == SLOT_EMPTY) continue;
+        const uint16_t e = lp.slot_expert[s];
+        if (e >= lp.expert_slot.size() || lp.expert_slot[e] != (int32_t) s) continue;   // an orphan
+        ram_slice r; r.expert = e;
+        const uint8_t * base = lp.base + (size_t) s * lp.block_bytes;
+        for (int q = 0; q < EXPERT_NPARTS; q++) r.part[q] = base + lp.part_off[q] + lp.part_pay[q];
+        out.push_back(r);
+    }
+}
+
 void expert_cache::settle_promotions() {
     if (pending_release_.empty()) return;
     if (cfg_.vram_backend) ggml_backend_synchronize(cfg_.vram_backend);
