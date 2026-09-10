@@ -729,6 +729,10 @@ int main(int argc, char ** argv) {
         if (a == "--spec-margin" && i + 1 < argc) { cfg.spec_margin = (float) atof(next()); continue; }
         if (a == "--spec-gate-inflight" && i + 1 < argc) { cfg.spec_gate_inflight = (uint32_t) atoi(next()); continue; }
         if (a == "--spec-block") { cfg.spec_block = true; continue; }
+        // Prompts up to this many new tokens go through the cache-batched decode
+        // path (one batch, experts through the tiers) instead of the streamed
+        // prefill, whose cost is a full expert sweep (~12 s on Q4) whatever T is.
+        if (a == "--prefill-decode-max" && i + 1 < argc) { cfg.prefill_decode_max = (uint32_t) atoi(argv[++i]); continue; }
         if (a == "--spec-block-layers" && i + 1 < argc) { cfg.spec_block = true; cfg.spec_block_layers = next(); continue; }
         if (a == "--state-host" && i + 1 < argc) {   // none | idx | kv | kv,idx
             std::string v = next();

@@ -261,6 +261,7 @@ def start_server(model, s):
                 return {"error": "no mmproj-*.gguf next to this model: download mmproj-F16.gguf into its snapshot directory, or turn Vision off"}
             argv += ["--mmproj", model["mmproj"]]
         if s.get("state_host") in ("idx", "kv", "kv,idx"): argv += ["--state-host", s["state_host"]]
+        if s.get("prefill_decode_max"): argv += ["--prefill-decode-max", str(int(s["prefill_decode_max"]))]
         log = open(STATE["log"], "w")
         log.write("$ " + " ".join(argv) + "\n")
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
