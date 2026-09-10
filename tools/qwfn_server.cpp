@@ -691,7 +691,7 @@ int main(int argc, char ** argv) {
           "      --ctx N         context (default 32768)   --batch N (default 2048)\n"
           "      --ram GB        --vram GB   --threads N   --cpu   --kv f16|q8_0\n"
           "      --reserve MB    VRAM kept free after the expert tier is sized (default 768; raise it on a desktop GPU)\n"
-          "      --ram-frac F    MemAvailable share the RAM tier may take (default 0.60)\n"
+          "      --ram-frac F    MemAvailable share the RAM tier may take (default 0.75)\n"
           "      --spec-ahead N  predict 1 or 2 layers ahead (default 2)\n"
           "      --no-prefill-overlap   single prefill staging buffer, saves ~1.8 GB RAM\n"
           "\n"

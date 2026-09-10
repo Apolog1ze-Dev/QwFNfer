@@ -25,7 +25,7 @@ STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": o
 LOCK = threading.Lock()
 
 # ---- models ------------------------------------------------------------------
-QUANT_BLOCK_MB = {"Q3_K_XL": 2.4, "Q4_K_XL": 3.4, "IQ1_S": 1.5}   # expert block size, for tier estimates
+QUANT_BLOCK_MB = {"Q3_K_XL": 2.27, "Q4_K_XL": 3.13, "IQ1_S": 1.62}   # routed-expert bytes per block (GGUF headers, 2026-09-10); the tiers hold blocks of this size
 QUANT_CORE_GB  = {"Q3_K_XL": 4.68, "Q4_K_XL": 4.83, "IQ1_S": 4.5}  # dense core on the GPU
 COLD_ONLY = ("IQ1_S",)   # 1-bit checkpoints: a cold tier (--cold), never served on their own
 
@@ -99,7 +99,9 @@ CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 163840, 262144]
 PRESETS = [("chat", "Chat", 32768, "short conversations; the fastest decode"),
            ("coding", "Agentic coding", 131072, "a coding harness with tool calls; room for a repository's worth of context"),
            ("coding_plus", "Agentic coding+", 262144, "the model's full trained context, for the longest sessions")]
-QUANT_GPU_MS = {"Q3_K_XL": 24.0, "Q4_K_XL": 32.0, "IQ1_S": 24.0}   # graph A with the speculative block, per token
+QUANT_GPU_MS = {"Q3_K_XL": 20.0, "Q4_K_XL": 20.0, "IQ1_S": 16.0}   # graph A and the GPU-served experts, per token (fitted, see predict)
+QUANT_CPU_MS = {"Q3_K_XL": 0.105, "Q4_K_XL": 0.076, "IQ1_S": 0.080}   # per CPU-served expert, measured on the replays
+NVME_MB_PER_MS = 7.0   # the drive's measured ceiling; a block read costs its bytes at this rate
 LOOKUPS_PER_TOKEN = 480   # 48 layers x 10 routed experts
 # Attention state per 1K tokens of context: the KV cache (by its type), the indexer key
 # cache and the pooled block keys; plus the constant DeltaNet state. The KV and indexer
@@ -122,14 +124,21 @@ def state_vram_gb(ctx, kv, state_host):
     return state_gb(ctx, kv) - state_host_gb(ctx, kv, state_host)
 
 def predict(quant, tier_gb, ram_gb, long_doc, extra_ms=0.0):
+    # Per token: graph A, the CPU-served experts, and the blocks read this token. The
+    # reads are what the tiers' size buys -- the prefetch turns most of them into "hits"
+    # but not into fewer bytes -- so the model is residency, the share of lookups served
+    # from VRAM or RAM without a read, fitted to the Q4 replays at 131K with tiers of
+    # 4.1K / 5.5K / 7.3K blocks (2026-09-10): reads 23 / 18 / 14% of lookups in chat,
+    # 33 / 26 / 20% on a long document. The other constants were fitted to ten measured
+    # points (three RAM sizes x two replays on Q4; Q3 and IQ1_S at 10.5 GB): rms error
+    # 2.7%. A GB of RAM tier is worth about 3% of decode at 131K.
     block = QUANT_BLOCK_MB.get(quant, 2.4)
     vb = max(0.0, tier_gb) * 1024 / block; rb = ram_gb * 1024 / block
-    f_v = max(0.0, 0.95 * (1 - math.exp(-vb / 1500)) - (0.06 if long_doc else 0.0)) if vb > 0 else 0.0
-    f_h = 0.97 * (1 - math.exp(-(vb + rb) / 1050))
-    f_h = max(f_h, f_v)
-    io = 1.4 * (block / 2.4) ** 1.4
-    ms = QUANT_GPU_MS.get(quant, 24.0) + extra_ms + LOOKUPS_PER_TOKEN * ((f_h - f_v) * 0.110 + (1 - f_h) * io) + 8.0
-    return {"tok_s": round(1000 / ms, 1), "vram_served": round(f_v, 3), "hit": round(f_h, 3), "blocks": int(vb)}
+    miss = (0.63 * math.exp(-(vb + rb) / 6400)) if long_doc else (0.46 * math.exp(-(vb + rb) / 5900))
+    f_v = max(0.0, 0.85 * (1 - math.exp(-vb / 1500)) - (0.06 if long_doc else 0.0)) if vb > 0 else 0.0
+    cpu = max(0.0, 1.0 - f_v - miss)
+    ms = QUANT_GPU_MS.get(quant, 20.0) + extra_ms + LOOKUPS_PER_TOKEN * (cpu * QUANT_CPU_MS.get(quant, 0.09) + miss * block / NVME_MB_PER_MS) + 6.0
+    return {"tok_s": round(1000 / ms, 1), "vram_served": round(f_v, 3), "hit": round(1.0 - miss, 3), "blocks": int(vb)}
 
 def recommend(model, hw, preset="coding", vision=None, state_host=None):
     """Settings for one preset on this machine, with every context step's cost and the
@@ -195,11 +204,20 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None):
         if c < 65536: return "none"
         if c >= 131072 or (tier_for(c, kv, "idx") <= 0 and tier_for(c, kv, "kv,idx") > 0): return "kv,idx"
         return "idx"
+    # Host memory the server needs besides the arena, measured 2026-09-10 at 131K with
+    # the head and the state on the host: MemAvailable at launch minus its minimum through
+    # a 43K prefill and 200 tokens, minus the arena, is 8.0 GB -- the head's pinned experts
+    # 2.7 of it, the state on the host ~1.3, the rest 4.0. The tier takes what is left
+    # above a floor. Measured: a 16 GB arena left 1.3-1.7 GB free at the worst point and
+    # was +16% decode in chat, +19% on a long document against 10.5 GB; 19 GB ran the
+    # machine out of memory. The old rule (0.6 x available - 3.2, capped at 12) asked for
+    # 12 and the engine's own clamp then built 10; every "bigger RAM tier" comparison
+    # before this compared 10.4 with 10.7 GB (docs/ENGINEERING.md, 2026-09-10).
+    PROCESS_HOST_GB = 8.0 - 2.7 - state_host_gb(131072, "q4_0", "kv,idx")
+    HEAD_HOST_GB = 2.7 if mtp_on else 0.0
+    FREE_FLOOR_GB = 3.5
     def ram_for(sh_gb):
-        # The pinned state comes out of the same RAM. The head's 2.7 GB of pinned experts
-        # is covered by the 0.6 factor: measured with the head at --ram 12 through a 43K
-        # prefill at 131K, MemAvailable never went below 7.5 GB (2026-09-10).
-        return max(4, min(12, int(0.6 * (avail - sh_gb) - 3.2)))
+        return max(4, int(avail - sh_gb - PROCESS_HOST_GB - HEAD_HOST_GB - FREE_FLOOR_GB))
     def option(c, with_vision):
         kv = "q4_0" if c >= 32768 else "q8_0"
         sh = state_host_for(c, kv)
@@ -274,7 +292,10 @@ def start_server(model, s):
         running = engines_running()
         if running: return {"error": "an engine is already running on this machine (one at a time): " + "; ".join(running)[:300]}
         if not os.path.exists(SERVER_BIN): return {"error": f"{SERVER_BIN} not found: install the release bundle, or build first (cmake --build build)"}
-        argv = [SERVER_BIN, model["path"], "--ram", str(int(s["ram"])), "--ctx", str(int(s["ctx"])), "--batch", str(int(s["batch"])),
+        # --ram-frac 0.85 keeps the engine's own MemAvailable clamp (a backstop for the
+        # command line, 0.75 by default) above the size computed here, which is the
+        # measured one; with the default clamp the tier came out at 10 GB whatever was asked.
+        argv = [SERVER_BIN, model["path"], "--ram", str(int(s["ram"])), "--ram-frac", "0.85", "--ctx", str(int(s["ctx"])), "--batch", str(int(s["batch"])),
                 "--kv", s["kv"], "--reserve", str(int(s["reserve"])), "--think", s["think"], "--think-budget", str(int(s["think_budget"])),
                 "--port", str(int(s["port"]))]
         if s.get("skip_miss"): argv.append("--skip-miss")

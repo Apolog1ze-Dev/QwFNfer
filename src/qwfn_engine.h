@@ -155,9 +155,13 @@ struct engine_config {
     // larger decode buffers cost ~150 MB of VRAM.
     uint32_t  prefill_decode_max = 512;
     // MemAvailable clamp on the expert RAM tier: frac of MemAvailable minus
-    // headroom. The default is deliberately conservative for a desktop with
-    // zram; raise ram_frac to trade the rest of the machine for hit rate.
-    double    ram_frac     = 0.60;
+    // headroom, a backstop for the command line. 0.75: on a 32 GB desktop with
+    // zram (25 GB available) a 16 GB arena left 1.5 GB free at the worst point
+    // of a 131K run and 19 GB ran it out; 0.75 allows ~15 GB there. 0.60 built
+    // a 10.5 GB tier whatever --ram asked and hid the tier's elasticity, about
+    // +3% of decode per GB at 131K (2026-09-10). The console sizes the tier
+    // from the process's measured needs and passes its own frac.
+    double    ram_frac     = 0.75;
     size_t    ram_headroom = 3ull << 30;
     // Device memory the VRAM expert tier must leave behind for everything
     // allocated after it: the prefill MoE graph arena (~0.31 MB per token of
