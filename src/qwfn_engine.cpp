@@ -492,7 +492,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
 
     // Decode computes each layer's VRAM-resident routed experts inside that
     // layer's own graph, looking residency up on the device; see eval_batch.
-    moe_in_graph_ = w_.on_gpu() && cfg.vram_bytes > 0 && !cfg.use_cold_tier &&
+    moe_in_graph_ = w_.on_gpu() && cfg.vram_bytes > 0 &&   // cold-file blocks never reach VRAM, so the in-graph MoE holds with a cold tier
                     !getenv("QWFN_LEGACY_MOE") && !getenv("QWFN_CHECK_MOE") && !getenv("QWFN_MOE_SEPARATE");
     // Experts promoted to VRAM during a layer's fetch were not resident when
     // that layer's graph ran: the next graph computes them from the tier by
@@ -648,7 +648,10 @@ bool engine::build_moe_gpu_graph(uint32_t il) {
     p.no_alloc = true;
     mg.ctx = ggml_init(p);
     mg.gf  = ggml_new_graph_custom(mg.ctx, 128, false);
-    ggml_tensor * acc = moe_id_graph(mg.ctx, tv, t_gids_, t_gw_, t_cur_, n_embd, n_ff, U);
+    // One position: the first column of the id and weight tables (they are sized for a verify step).
+    ggml_tensor * ids1 = ggml_view_2d(mg.ctx, t_gids_, U, 1, t_gids_->nb[1], 0);
+    ggml_tensor * w1   = ggml_view_3d(mg.ctx, t_gw_, 1, U, 1, t_gw_->nb[1], t_gw_->nb[2], 0);
+    ggml_tensor * acc = moe_id_graph(mg.ctx, tv, ids1, w1, t_cur_, n_embd, n_ff, U);
     ggml_build_forward_expand(mg.gf, ggml_cpy(mg.ctx, acc,
             ggml_view_2d(mg.ctx, t_pg_, n_embd, 1, t_pg_->nb[1], 0)));
     mg.ga = ggml_gallocr_new(w_.buft());
@@ -792,7 +795,7 @@ const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, 
     const bool as_decode = n_new > 1 && n_new <= (int32_t) cfg_.prefill_decode_max;
     // ... and, with a GPU, as ONE batch whose experts come through the cache.
     static const bool no_cbatch = getenv("QWFN_NO_CACHE_BATCH") != nullptr;
-    const bool as_cbatch = as_decode && cfg_.cache_batched && scr_buf_ && !cfg_.use_cold_tier && !no_cbatch;
+    const bool as_cbatch = as_decode && cfg_.cache_batched && scr_buf_ && !no_cbatch;   // cold-resident experts are re-read hot by fetch_batch
 
     const int32_t base = n_hist - n_new;
     // Long prompts: layer-major, one expert sweep per n_batch tokens, the
@@ -1479,7 +1482,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // mul_mat_id graph against it (and so runs it separately, not folded).
     static const bool legacy_moe = getenv("QWFN_LEGACY_MOE") != nullptr;
     static const bool check_moe  = getenv("QWFN_CHECK_MOE") != nullptr;
-    const bool moe_by_id = !legacy_moe && !cfg_.use_cold_tier;
+    const bool moe_by_id = !legacy_moe;   // cold-file blocks get their own mul_mat_id pass (part_rows)
     // In-graph VRAM MoE: graph A of layer L runs L's VRAM-resident routed
     // experts itself. The router's ids index two device tables (tier slot and
     // 1/0 mask by expert id, uploaded whenever the layer's residency changes)
@@ -2361,10 +2364,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // the selection order; then the one canonical sum over all of them.
             std::vector<int> pos_in_all((size_t) n_u, -1);
             for (size_t k = 0; k < all_cpu.size(); k++) pos_in_all[all_cpu[k]] = (int) k;
-            auto part_rows = [&](const std::vector<int> & which) {
+            std::function<void(const std::vector<int> &)> part_rows;
+            auto part_rows_view = [&](const std::vector<int> & which, const tier_view & tv) {
                 if (which.empty()) return;
                 const auto tm0 = std::chrono::steady_clock::now();
-                const tier_view tv = ec_.ram_tier(il);
                 const int n = (int) which.size();
                 ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
                 ggml_tensor * ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, n, T);   ggml_set_input(ids);
@@ -2384,6 +2387,14 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_free(c);
                 t_moe_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
                 n_exp_cpu += which.size();
+            };
+            // Blocks from the cold file have their own types: one pass per file.
+            part_rows = [&](const std::vector<int> & which) {
+                if (!cfg_.use_cold_tier) { part_rows_view(which, ec_.ram_tier(il)); return; }
+                std::vector<int> hot, cold;
+                for (int k : which) (eh[k].from_cold ? cold : hot).push_back(k);
+                part_rows_view(hot, ec_.ram_tier(il));
+                part_rows_view(cold, ec_.ram_tier_cold(il));
             };
             auto reduce_rows = [&]() {
                 const int n = (int) all_cpu.size();

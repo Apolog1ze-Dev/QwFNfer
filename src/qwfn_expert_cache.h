@@ -240,6 +240,7 @@ public:
     // Tier layouts for the mul_mat_id MoE paths. n_slots == 0 when absent.
     tier_view gpu_tier(uint32_t layer) const;
     tier_view ram_tier(uint32_t layer) const;
+    tier_view ram_tier_cold(uint32_t layer) const;   // the same slots seen with the cold file's types and payload offsets
 
     // Warm the tiers from a prefill. The streaming prefill bypasses the cache,
     // so generation after a prompt used to start cold (11.4 tok/s against 15+
@@ -267,6 +268,9 @@ public:
     uint8_t *             arena()        const { return arena_; }
 
     const expert_cache_stats & stats() const { return st_; }
+    // What the RAM tier holds right now (an instrument for the end-of-run print).
+    struct census { uint64_t slots = 0, empty = 0, hot = 0, cold = 0, cold_hotw = 0, speculative = 0, inflight = 0, hotw_marked = 0; };
+    census ram_census() const;
     size_t   capacity_experts() const { return total_slots_; }
     size_t   capacity_experts_gpu() const { return total_gslots_; }
     uint32_t block_bytes(uint32_t layer) const { return layer < blk_.size() ? blk_[layer].block_bytes : 0; }
@@ -310,6 +314,7 @@ private:
         // the cold checkpoint; anything fetched again is worth full precision,
         // so the cold tier stays confined to the one-off tail it was meant for.
         std::vector<uint8_t>  seen;
+        std::vector<uint8_t>  hotw;           // earned full precision at least once (a VRAM promotion candidate)
 
         // T0: device memory, but NOT the same layout. Three expert-major
         // arrays (gate, up, down) with the natural slice size as the slot
@@ -374,6 +379,8 @@ private:
     void prefetch_settle_for(uint32_t layer, const uint32_t * ids, uint32_t n);
     bool pf_layer_pending(uint32_t layer) const;
     int32_t  choose_victim(layer_pool & lp);
+    bool   would_promote(layer_pool & lp, uint32_t expert_id);   // promote()'s victim rule, without acting
+    uint32_t n_hot_shards_ = 0;   // io_pf_ opens the hot shards then the cold ones
     uint8_t * slot_ptr(layer_pool & lp, uint32_t slot) const { return lp.base + (size_t) slot * lp.block_bytes; }
     void     fill_handle(const layer_pool & lp, uint32_t slot, expert_handle & h) const;
 

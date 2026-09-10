@@ -25,7 +25,13 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
     cfg_  = cfg;
 
     if (!io_hot_.init(hot->shard_paths(), cfg.queue_depth, /*direct_io=*/true, err, cfg.io_backend)) return false;
-    if (!io_pf_.init(hot->shard_paths(), cfg.queue_depth, /*direct_io=*/true, err, cfg.io_backend)) return false;
+    {
+        // The prefetch reads either file: hot shards first, the cold ones after.
+        std::vector<std::string> pfp = hot->shard_paths();
+        n_hot_shards_ = (uint32_t) pfp.size();
+        if (cold_) for (const auto & p : cold_->shard_paths()) pfp.push_back(p);
+        if (!io_pf_.init(pfp, cfg.queue_depth, /*direct_io=*/true, err, cfg.io_backend)) return false;
+    }
     if (cold_ && !io_cold_.init(cold_->shard_paths(), cfg.queue_depth, true, err, cfg.io_backend)) {
         fprintf(stderr, "[qwfn] cold tier disabled: %s\n", err.c_str());
         cold_ = nullptr;
@@ -69,12 +75,12 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                             q, (unsigned long long) r0.offset, lp.part_pay[q], (int) lp.part_type[q],
                             (unsigned long long) cr.offset, (unsigned) (cr.offset % dio_align()), lp.cold_pay[q], (int) lp.cold_type[q], ct ? "found" : "MISSING",
                             cr.nbytes, r0.nbytes);
-                if (dio_padded_size(cr.offset, cr.nbytes) > dio_padded_size(r0.offset, r0.nbytes)) {
-                    err = "cold expert block is larger than the hot slot on layer " + std::to_string(il);
-                    return false;
-                }
             }
-            off += dio_padded_size(r0.offset, r0.nbytes);
+            // A slot holds a block from either file: size it for the larger.
+            size_t part_slot = dio_padded_size(r0.offset, r0.nbytes);
+            if (cold_) part_slot = std::max(part_slot, (size_t) dio_padded_size(cold_->expert_range(il, 0, (expert_part) q).offset,
+                                                                                 cold_->expert_range(il, 0, (expert_part) q).nbytes));
+            off += part_slot;
         }
         lp.block_bytes = off;
     }
@@ -146,6 +152,7 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         lp.slot_used.assign(lp.n_slots, 0);
         lp.expert_slot.assign(hot->hp().n_expert, -1);
         lp.seen.assign(hot->hp().n_expert, 0);
+        lp.hotw.assign(hot->hp().n_expert, 0);
         total_slots_ += lp.n_slots;
     }
     // ---- T0: mirror the same block layout in device memory -----------------
@@ -420,6 +427,53 @@ tier_view expert_cache::ram_tier(uint32_t layer) const {
     return v;
 }
 
+tier_view expert_cache::ram_tier_cold(uint32_t layer) const {
+    tier_view v;
+    if (layer >= blk_.size() || !arena_ || !cold_) return v;
+    const layer_pool & lp = blk_[layer];
+    for (int q = 0; q < EXPERT_NPARTS; q++) {
+        v.part[q]   = lp.base + lp.part_off[q] + lp.cold_pay[q];
+        v.stride[q] = lp.block_bytes;
+        v.type[q]   = lp.cold_type[q];
+    }
+    v.n_slots = lp.n_slots;
+    v.buffer  = arena_buf_;
+    return v;
+}
+
+expert_cache::census expert_cache::ram_census() const {
+    census c;
+    for (const layer_pool & lp : blk_) {
+        c.slots += lp.n_slots;
+        for (uint32_t s = 0; s < lp.n_slots; s++) {
+            const auto e = lp.slot_expert[s];
+            if (e == SLOT_EMPTY) { c.empty++; continue; }
+            if (!lp.slot_valid[s]) c.inflight++;
+            if (lp.slot_cold[s]) { c.cold++; if (e < lp.hotw.size() && lp.hotw[e]) c.cold_hotw++; } else c.hot++;
+            if (lp.slot_speculative[s]) c.speculative++;
+        }
+        for (auto h : lp.hotw) c.hotw_marked += h ? 1 : 0;
+    }
+    return c;
+}
+
+bool expert_cache::would_promote(layer_pool & lp, uint32_t expert_id) {
+    if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent) return false;
+    static const bool vram_lru = getenv("QWFN_VRAM_LRU") != nullptr;
+    constexpr uint64_t STALE_FETCHES = 48 * 24;
+    static thread_local uint64_t rng = 0x2545F4914F6CDD1Dull;
+    uint32_t worst = UINT32_MAX; bool any = false;
+    for (uint32_t k = 0; k < 16; k++) {
+        const uint32_t s = (uint32_t) (xorshift(rng) % lp.g_slots);
+        if (lp.g_slot_expert[s] == SLOT_EMPTY) return true;
+        if (lp.g_used[s] >= fetch_epoch_) continue;
+        if (vram_lru) return true;
+        if (fetch_count_ - lp.g_used_fetch[s] > STALE_FETCHES) return true;
+        worst = std::min(worst, lp.ef[lp.g_slot_expert[s]]); any = true;
+    }
+    return any && lp.ef[expert_id] > worst;
+}
+
 bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, const uint8_t * host_block) {
     if (!vram_buf_ || lp.g_slots == 0 || lp.g_lent) return false;
     // A block from the cold checkpoint has other quant types and sizes; the
@@ -532,6 +586,18 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
             if (gs >= 0 && lp.g_valid[gs] && lp.g_slot_expert[gs] == (uint16_t) e) { lp.g_used[gs] = tick_; lp.g_used_fetch[gs] = fetch_count_; }
         }
 
+    // The same for the RAM tier. A resident block of an expert later in this
+    // list still carries last token's recency and, for a tail expert, a low
+    // count, so a miss earlier in the list could pick it as the victim: a
+    // prefetched block evicted moments before it was looked up, and the miss
+    // that causes evicts another. Listing them as live protects them.
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t e = expert_ids[i];
+        if (e >= lp.expert_slot.size()) continue;
+        const int32_t s = lp.expert_slot[e];
+        if (s >= 0 && lp.slot_expert[s] == (uint16_t) e) live_.push_back(s);
+    }
+
     // Up to n_expert_used experts x 3 parts in flight for this layer.
     io_request reqs[64 * EXPERT_NPARTS];
     bool       req_cold[64 * EXPERT_NPARTS];
@@ -567,10 +633,17 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
             }
         }
 
-        // Claimed by a speculative read that has not landed: a hit, waited for in fetch_end.
+        // Claimed by a speculative read that has not landed: a hit, waited for in
+        // fetch_end. A cold block in flight counts too (it used to fall through to
+        // the miss path, which read the expert again into a second slot and left the
+        // landed block an orphan: with most prefetches cold, a third of them were
+        // wasted that way and the RAM tier lost the slots they held -- hit 97.7 ->
+        // 88%). If it is a VRAM candidate it is served cold this once and re-read
+        // hot at its next reuse.
         {
             const int32_t cs = lp.expert_slot[e];
-            if (cs >= 0 && lp.slot_expert[cs] == (uint16_t) e && !lp.slot_valid[cs] && !lp.slot_cold[cs]) {
+            if (cs >= 0 && lp.slot_expert[cs] == (uint16_t) e && !lp.slot_valid[cs]) {
+                if (lp.slot_cold[cs] && !lp.hotw[e] && would_promote(lp, e)) lp.hotw[e] = 1;
                 st_.hits++;
                 lp.slot_freq[cs]++;
                 lp.slot_used[cs] = ++tick_;
@@ -584,12 +657,18 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         }
         const int32_t s = find_slot(lp, e);
 
-        // A resident block that came from the cold checkpoint is upgraded the
-        // moment it is reused: being asked for twice is the evidence that this
-        // expert is worth full precision. Without this the first token -- where
-        // every expert is a first touch -- pins the whole working set at 1-bit
-        // and it never recovers.
-        const bool upgrade = s >= 0 && lp.slot_cold[s];
+        // A block from the cold file is served as it is, unless this expert would
+        // now earn a VRAM slot: then it is re-read at full precision on this fetch
+        // so the promotion can follow. A cold block cannot be promoted, and the RAM
+        // tier's frequency rule would keep it stuck there at CPU speed, holding a
+        // slot that VRAM should hold (measured without the re-read: hit 97.7 ->
+        // 89.8%, VRAM-served 64 -> 52%). The prefetch and the miss path read the
+        // candidates hot by the same rule, so this re-read is left to the blocks
+        // whose standing changed between the read and the reuse. (Re-reading every
+        // reused cold block, when nothing was read hot yet, doubled the fill:
+        // 12 -> 6 tok/s.)
+        const bool upgrade = s >= 0 && lp.slot_cold[s] && would_promote(lp, e);
+        if (upgrade) lp.hotw[e] = 1;
 
         if (s >= 0 && !upgrade) {
             st_.hits++;
@@ -630,11 +709,12 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         st_.misses++;
         if (upgrade) st_.upgrades++;
 
-        // First touch may come from the cold checkpoint; a repeat fetch means
-        // this expert matters, so take the full-precision copy. That keeps the
-        // cold tier confined to the one-off tail it was meant for, instead of
-        // letting the whole working set decay to 1-bit.
-        const bool take_cold = cold_ != nullptr && !lp.seen[e];
+        // A miss reads the hot file when the expert would earn a VRAM slot now, by
+        // the rule the prefetch applies. Without this a miss during the fill came
+        // in cold, was reused while the tier still had empty slots (no re-read
+        // then) and sat in RAM unpromotable for the rest of the run.
+        if (cold_ && !upgrade && !lp.hotw[e] && would_promote(lp, e)) lp.hotw[e] = 1;
+        const bool take_cold = cold_ != nullptr && !upgrade && !lp.hotw[e];
         lp.seen[e] = 1;
         const model_index * src = take_cold ? cold_ : hot_;
         if (take_cold) st_.cold_tier_reads++;
@@ -642,6 +722,7 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         const int32_t v = upgrade ? s : choose_victim(lp);
         if (v < 0) return false;
         if (!upgrade && lp.slot_expert[v] != SLOT_EMPTY) {
+            if (lp.slot_speculative[v]) st_.pf_wasted++;   // prefetched, never used, evicted by a miss
             lp.expert_slot[lp.slot_expert[v]] = -1;
             st_.evictions++;
         }
@@ -736,6 +817,7 @@ bool expert_cache::read_block_now(layer_pool & lp, uint32_t layer, int32_t slot,
     while (reaped < EXPERT_NPARTS) { const size_t got = io_hot_.reap(tags, 16, EXPERT_NPARTS - reaped); if (got == 0) return false; reaped += got; }
     st_.n_reads += EXPERT_NPARTS;
     lp.slot_valid[slot] = 1;
+    lp.slot_cold[slot]  = 0;
     return true;
 }
 
@@ -1199,7 +1281,6 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
             lp.slot_valid[v]       = 0;      // valid once its reads land
             lp.slot_freq[v]        = 1;
             lp.slot_used[v]        = ++tick_;
-            lp.slot_cold[v]        = 0;      // predictions always take full precision
             lp.slot_speculative[v] = 1;
             lp.expert_slot[e]      = v;
             lp.seen[e]             = 1;
@@ -1209,10 +1290,14 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
             pf_entry & ent = pf_pending_.back();
 
             uint8_t * base = slot_ptr(lp, (uint32_t) v);
+            if (cold_ && !lp.hotw[e] && would_promote(lp, e)) lp.hotw[e] = 1;   // a VRAM candidate is read at full precision
+            const bool pf_cold = cold_ != nullptr && !lp.hotw[e];   // the tail comes from the cold file
+            lp.slot_cold[v] = pf_cold ? 1 : 0;
+            if (pf_cold) st_.cold_tier_reads++;
             for (int q = 0; q < EXPERT_NPARTS; q++) {
-                const byte_range br = hot_->expert_range(layer, e, (expert_part) q);
+                const byte_range br = (pf_cold ? cold_ : hot_)->expert_range(layer, e, (expert_part) q);
                 if (!br.valid()) continue;
-                reqs[n_req++] = io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], tag };
+                reqs[n_req++] = io_request{ br.shard + (pf_cold ? (int) n_hot_shards_ : 0), br.offset, br.nbytes, base + lp.part_off[q], tag };
                 ent.remaining++;
                 st_.bytes_from_disk += br.nbytes;
             }

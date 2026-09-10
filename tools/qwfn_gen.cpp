@@ -338,6 +338,15 @@ int main(int argc, char ** argv) {
     const auto & s = eng.cache_stats();
     printf("expert cache: %.1f%% hit, %.1f%% from VRAM, %.2f GB from disk\n",
            100.0 * s.hit_rate(), 100.0 * s.gpu_rate(), s.bytes_from_disk / 1e9);
+    printf("              tiers: %llu promotions, %llu RAM evictions, %llu cold-file reads, %llu upgrades\n",
+           (unsigned long long) s.promotions, (unsigned long long) s.evictions,
+           (unsigned long long) s.cold_tier_reads, (unsigned long long) s.upgrades);
+    {
+        const auto c = eng.ram_census();
+        printf("              RAM tier at end: %llu slots = %llu hot + %llu cold (%llu of them hot-worthy) + %llu empty; %llu prefetched unused, %llu in flight; %llu experts marked hot-worthy\n",
+               (unsigned long long) c.slots, (unsigned long long) c.hot, (unsigned long long) c.cold, (unsigned long long) c.cold_hotw,
+               (unsigned long long) c.empty, (unsigned long long) c.speculative, (unsigned long long) c.inflight, (unsigned long long) c.hotw_marked);
+    }
     printf("decode split: graphA(GPU) %.2f s | MoE gpu %.2f s (%llu experts, sync-wait %.2f s) | MoE cpu %.2f s (%llu experts) | io %.2f s\n",
            eng.t_layerA, eng.t_moe_gpu, (unsigned long long) eng.n_exp_gpu, eng.t_moe_gpu_sync,
            eng.t_moe_cpu, (unsigned long long) eng.n_exp_cpu, eng.t_io);
