@@ -242,6 +242,8 @@ public:
     // The vision tower shares the language model's backend and buffer type.
     ggml_backend_t             backend() const { return w_.backend(); }
     ggml_backend_buffer_type_t buft()    const { return w_.buft(); }
+    // Device bytes held by the cached per-layer decode graphs' allocators (QWFN_VRAM_AUDIT).
+    void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 
     const expert_cache_stats & cache_stats() const { return ec_.stats(); }
     const io_engine &          cache_io()    const { return ec_.io(); }

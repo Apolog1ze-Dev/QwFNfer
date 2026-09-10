@@ -526,6 +526,17 @@ bool engine::init(const model_index * hot, const model_index * cold,
     gA_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
     gM_.assign(hp_.n_layer, moe_graph{});
+    if (getenv("QWFN_VRAM_AUDIT")) {
+        // Every device buffer the engine holds at the end of init, and what the
+        // device says is left: the difference to a process's footprint under
+        // load is the CUDA context, the graphs' activations and ggml's pool.
+        auto sz = [](ggml_backend_buffer_t b) { return b ? ggml_backend_buffer_get_size(b) / 1e6 : 0.0; };
+        fprintf(stderr, "[qwfn] VRAM audit (MB): dense core %.0f | state %.0f | tier %.0f + lent %.0f | qsa keys %.0f | batch scratch %.0f | work %.0f | residency tables %.0f | rollback %.0f | head dense %.0f | predictor %.0f\n",
+                w_.device_bytes() / 1e6, st_.bytes() / 1e6, sz(ec_.vram_buffer()), sz(ec_.vram_extra_buffer()), sz(qbuf_), sz(scr_buf_), sz(wbuf_), sz(vbuf_), sz(rbbuf_), sz(mbuf_), sz(predbuf_));
+        size_t dfree = 0, dtotal = 0;
+        if (ggml_backend_dev_t d = ggml_backend_buft_get_device(w_.buft())) { ggml_backend_dev_memory(d, &dfree, &dtotal); }
+        fprintf(stderr, "[qwfn] VRAM audit: device %.0f MB total, %.0f MB free after init\n", dtotal / 1e6, dfree / 1e6);
+    }
     galloc_gpu_ = ggml_gallocr_new(w_.buft());
     galloc_cpu_ = ggml_gallocr_new(wh_.buft());
     galloc_moe_ = ggml_gallocr_new(w_.buft());
@@ -966,6 +977,12 @@ void engine::dump_decode_token() {
         ggml_fp32_to_fp16_row(tok_w_.data() + (size_t) il * U, wh.data(), U);
         fwrite(xh.data(), 2, n_embd, dump_dec_f_[il]); fwrite(ids.data(), 2, U, dump_dec_f_[il]); fwrite(wh.data(), 2, U, dump_dec_f_[il]);
     }
+}
+
+void engine::graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const {
+    a_bytes = m_bytes = 0; a_graphs = m_graphs = 0;
+    for (const auto & g : gA_) if (g.ga) { a_bytes += ggml_gallocr_get_buffer_size(g.ga, 0); a_graphs++; }
+    for (const auto & g : gM_) if (g.ga) { m_bytes += ggml_gallocr_get_buffer_size(g.ga, 0); m_graphs++; }
 }
 
 // One record per sampled token: x as F16[n_embd], ids as u16[U], gates as F16[U].

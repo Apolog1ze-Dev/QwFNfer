@@ -253,6 +253,7 @@ public:
     // memory traffic per token -- as much as the weights themselves.
     ggml_backend_buffer_t arena_buffer() const { return arena_buf_; }
     ggml_backend_buffer_t vram_buffer()  const { return vram_buf_; }
+    ggml_backend_buffer_t vram_extra_buffer() const { return vram_extra_; }
     const io_engine &     io() const { return cold_ ? io_cold_ : io_hot_; }
     uint8_t *             arena()        const { return arena_; }
 

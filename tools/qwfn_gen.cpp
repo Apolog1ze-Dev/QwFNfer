@@ -253,6 +253,11 @@ int main(int argc, char ** argv) {
     }
     if (nll_n) printf("replay NLL: %.4f per token (ppl %.2f) over %d tokens\n", nll_sum / nll_n, std::exp(nll_sum / nll_n), nll_n);
     if (eng.n_exp_skipped) printf("skipped experts: %llu (misses computed without)\n", (unsigned long long) eng.n_exp_skipped);
+    if (getenv("QWFN_VRAM_AUDIT")) {
+        size_t ab = 0, mb = 0; int ag = 0, mg = 0; eng.graph_buffer_bytes(ab, ag, mb, mg);
+        printf("VRAM audit: cached decode graphs hold %.0f MB of activations in %d layer graphs (%.1f MB each), MoE graphs %.0f MB in %d\n",
+               ab / 1e6, ag, ag ? ab / 1e6 / ag : 0.0, mb / 1e6, mg);
+    }
     if (eng.n_exp_dropped) printf("dropped experts: %llu (gate below --gate-drop; %.1f%% of routed)\n", (unsigned long long) eng.n_exp_dropped,
                                   100.0 * eng.n_exp_dropped / std::max<uint64_t>(1, eng.n_exp_dropped + eng.n_exp_gpu + eng.n_exp_cpu + eng.n_exp_skipped));
 

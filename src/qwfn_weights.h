@@ -56,6 +56,7 @@ public:
     ggml_context *             ctx()     const { return ctx_; }
     ggml_backend_t             backend() const { return backend_; }
     ggml_backend_buffer_type_t buft()    const { return buft_; }
+    size_t device_bytes() const { return buf_ ? ggml_backend_buffer_get_size(buf_) : 0; }
     bool                       on_gpu()  const { return on_gpu_; }
     size_t                     bytes()   const { return declared_bytes_; }
     const char *               dev_name() const;
