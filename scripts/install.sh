@@ -63,4 +63,4 @@ fi
 say "Installed qwfnfer $(cat "$DEST/VERSION" 2>/dev/null || echo). Start it with:"
 echo "    qwfnfer"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "    ($BIN is not in your PATH: run $BIN/qwfnfer, or add it to PATH)" ;; esac
-echo "It opens the console at http://127.0.0.1:8090: pick a preset, Start server, Self-test."
+echo "It opens the console at http://127.0.0.1:8090: pick a tier, press Auto-tune & start."

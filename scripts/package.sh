@@ -55,7 +55,9 @@ qwfnfer $VERSION -- Qwen3.8-Flash-Next on one 16 GB GPU (Linux x86_64, NVIDIA)
    (opens the console at http://127.0.0.1:8090; needs python3 and an NVIDIA driver 580 or newer)
 2. Get the model once:       hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"
    (pip install -U huggingface_hub for the hf command; the console finds the files in the Hugging Face cache)
-3. Pick a preset, press Start server, press Self-test. The endpoint is http://127.0.0.1:8080/v1.
+3. Pick a tier (Chat, Agentic coding, Agentic coding+ or your own Custom one) and press Auto-tune & start:
+   the console measures your drive, threads and memory, picks every flag, starts the server and verifies it.
+   The endpoint is http://127.0.0.1:8080/v1. Model locations: add any folder that holds the shards.
 Everything the engine needs is in bin/ except the NVIDIA driver. See README.md.
 EOF
 
