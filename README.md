@@ -7,11 +7,13 @@
 | <a href="#getting-started"><b>Getting Started</b></a> | <a href="#results"><b>Results</b></a> | <a href="#how-it-works"><b>How it works</b></a> | <a href="#built-around-the-qwen4-architecture"><b>Qwen4</b></a> | <a href="https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF"><b>Model (Unsloth GGUF)</b></a> |
 </p>
 
+Run a **125B** open-weight MoE on the gaming PC you already own, at interactive speed: **15–25 tok/s**.
+
 ## Updates
 
-**2026-09-11** — The console now tunes itself to the machine it runs on: it measures the drive, sweeps the CPU thread count live on a long-context run, sizes the RAM tier from the memory the server really needs, defaults the KV cache to q8_0 wherever the plan affords it, and its Stats page is live (prefill progress, input / cached / output tokens). The numbers below were re-measured today with those defaults, and an OpenCode agentic-coding run was added.
+**2026-09-11** — (Experimental)The console now tunes itself to the machine it runs on: it measures the drive, sweeps the CPU thread count live on a long-context run, sizes the RAM tier from the memory the server really needs, defaults the KV cache to q8_0 wherever the plan affords it, and its Stats page is live (prefill progress, input / cached / output tokens). The numbers below were re-measured today with those defaults, and an OpenCode agentic-coding run was added.
+Several optimizations and tweaks were introduced including fixing a MTP and vision bug.
 
-Run a **125B** open-weight MoE on the gaming PC you already own, at interactive speed: **13–16 tok/s** in chat, 13 tok/s answering questions about a 155K-token document it read at 355 tok/s (the Q3 file: 20 tok/s in chat, 18 on the document), the KV cache at q8_0.
 
 ## About
 
