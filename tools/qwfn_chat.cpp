@@ -181,7 +181,7 @@ int main(int argc, char ** argv) {
           "  -p, --prompt TEXT   one-shot: answer TEXT and exit (default: interactive)\n"
           "  -f, --file PATH     attach a text file to the first message (repeatable)\n"
           "  -i, --image PATH    attach an image (needs --mmproj) (repeatable)\n"
-          "      --mmproj PATH   vision projector gguf; enables images\n"
+          "      --mmproj PATH   vision projector gguf; enables images (encoded on the CPU, --threads)\n"
           "      --system TEXT   system message\n"
           "      --think LEVEL   xhigh (default) | medium | low | off\n"
           "      --hide-think    generate reasoning but do not print it\n"
@@ -309,9 +309,12 @@ int main(int argc, char ** argv) {
     qwfn::vision_encoder vis;
     int32_t tok_image_pad = -1;
     if (!mmproj_path.empty()) {
-        if (!vis.load(mmproj_path, eng.backend(), eng.buft(), err)) {
-            fprintf(stderr, "vision: %s\n", err.c_str()); return 1;
+        // On the CPU backend, as the server runs it: no VRAM for the projector.
+        ggml_backend_t vis_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (!vis_backend || !vis.load(mmproj_path, vis_backend, ggml_backend_get_default_buffer_type(vis_backend), err)) {
+            fprintf(stderr, "vision: %s\n", vis_backend ? err.c_str() : "no CPU backend"); return 1;
         }
+        vis.set_n_threads(cfg.n_threads);
         const auto ip = vb.encode("<|image_pad|>", false, true);
         if (ip.size() != 1) { fprintf(stderr, "vision: <|image_pad|> is not a single token\n"); return 1; }
         tok_image_pad = ip[0];

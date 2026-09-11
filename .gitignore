@@ -1,6 +1,7 @@
 # Working notes that stay local (the README is the public face)
 ROADMAP.md
 docs/ENGINEERING.md
+docs/POST.md
 
 # Build output (any build dir: build, build2, build-*, cmake-build-*)
 build*/
@@ -11,6 +12,7 @@ compile_commands.json
 *.so
 
 # Test artifacts and generated pages
+OpenCodeFlashReview.md
 pagoda_qwen3.8.html
 *.log
 *.out

@@ -11,12 +11,13 @@
 using namespace qwfn;
 
 int main(int argc, char ** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: qwfn-vtest <mmproj.gguf> <image> [--cpu] [--reps N]\n"); return 1; }
-    bool use_gpu = true; int reps = 2;
+    if (argc < 3) { fprintf(stderr, "usage: qwfn-vtest <mmproj.gguf> <image> [--gpu] [--threads N] [--reps N]   (CPU by default, as the server runs it)\n"); return 1; }
+    bool use_gpu = false; int reps = 2, n_threads = 0;
     for (int i = 3; i < argc; i++) {
         const std::string a = argv[i];
-        if (a == "--cpu") use_gpu = false;
+        if (a == "--gpu") use_gpu = true;
         else if (a == "--reps" && i + 1 < argc) reps = atoi(argv[++i]);
+        else if (a == "--threads" && i + 1 < argc) n_threads = atoi(argv[++i]);
     }
     ggml_backend_load_all_from_path((std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin").c_str());
 
@@ -28,6 +29,11 @@ int main(int argc, char ** argv) {
         }
     }
     if (!be) be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (n_threads > 0) {   // the CPU module is loaded dynamically: ask its registry for the setter
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+        auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_threads) set_threads(be, n_threads);
+    }
     printf("backend: %s\n", ggml_backend_name(be));
 
     std::string err;

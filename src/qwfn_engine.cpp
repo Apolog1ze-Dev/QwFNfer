@@ -71,6 +71,12 @@ static void qwfn_ggml_log(enum ggml_log_level level, const char * text, void * /
     fputs(text, stderr);
 }
 
+void engine::set_n_threads(int n) {
+    n_threads_ = std::max(1, n);
+    wh_.set_n_threads(n_threads_);
+    w_.set_n_threads(n_threads_);
+}
+
 bool engine::init(const model_index * hot, const model_index * cold,
                   const engine_config & cfg, const std::string & backend_dir, std::string & err) {
     ggml_log_set(qwfn_ggml_log, nullptr);
@@ -152,8 +158,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 err = "expert tensor missing on layer " + std::to_string(il); return false;
             }
     have_expert_map_ = true;
-    wh_.set_n_threads(cfg.n_threads);
-    w_.set_n_threads(cfg.n_threads);
+    set_n_threads(cfg.n_threads);
 
     // State first: the KV cache, indexer keys and recurrent state are not
     // optional, whereas the VRAM expert tier is. Allocating the tier first let
@@ -1472,6 +1477,7 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
             ec_.warm(il, items.data(), (uint32_t) items.size(), cfg_.prefill_warm_vram);
             t_warm += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
         }
+        if (prefill_progress) prefill_progress(il, hp_.n_layer, (int32_t) T);
     }
 
     // ---- draft head: its KV rows for this batch's positions ---------------

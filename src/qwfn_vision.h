@@ -53,15 +53,21 @@ public:
     vision_encoder(const vision_encoder &) = delete;
     vision_encoder & operator=(const vision_encoder &) = delete;
 
-    // The 0.9 GB of weights live in pinned host memory and are staged onto the
-    // device only while an image is encoded, so the projector never costs VRAM
-    // at decode. The upload is ~60 ms per image; reading them over PCIe in place
-    // instead measured 0.40 -> 2.3 s per screenshot, so the staging is not
-    // optional. The caller makes room first (engine::vram_lend_begin). On a CPU
-    // backend the weights are simply in RAM and nothing is staged.
+    // The server runs the tower on the CPU backend: the 0.9 GB of weights sit in
+    // RAM (the linear layers converted to BF16 at load), the graph runs on the
+    // cores, and the projector costs no VRAM at all -- neither resident nor lent
+    // from the expert tier. A 1400x1000 screenshot is ~10 s against 0.5 s on the
+    // GPU, which is the trade chosen (docs/ENGINEERING.md, 2026-09-11).
+    // Given a GPU backend instead (qwfn-vtest --gpu, for comparisons) the weights
+    // live in pinned host memory and are staged onto the device per encode; the
+    // caller makes room first (engine::vram_lend_begin).
     bool load(const std::string & mmproj_path, ggml_backend_t backend,
               ggml_backend_buffer_type_t buft, std::string & err);
     bool weights_on_host() const { return stage_; }
+    bool on_cpu() const { return cpu_; }
+    // Threads for the CPU backend's graph compute (the engine's own workers are
+    // idle while an image is encoded, so all hardware threads is the default).
+    void set_n_threads(int n);
 
     bool loaded() const { return ctx_ != nullptr; }
     const vision_hparams & hp() const { return hp_; }
@@ -97,7 +103,8 @@ private:
     ggml_backend_t        backend_ = nullptr;
     ggml_backend_buffer_type_t buft_ = nullptr;
     ggml_gallocr_t        galloc_ = nullptr;
-    bool                  use_fa_ = false;      // flash attention supported by the backend at this head size
+    bool                  use_fa_ = false;      // flash attention: GPU backends only (the CPU kernel is 3x slower than GEMMs)
+    bool                  cpu_    = false;      // the CPU backend: chunked materialised attention, BF16 linears
     bool                  stage_ = false;       // weights live on the host; staged per encode
     ggml_backend_buffer_t dbuf_ = nullptr;      // the staging buffer while an encode runs
     std::vector<std::pair<void *, ggml_backend_buffer_t>> saved_;   // the host placement to restore

@@ -22,6 +22,7 @@
 #include "qwfn_state.h"
 #include "qwfn_weights.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -295,6 +296,13 @@ public:
     void graph_buffer_bytes(size_t & a_bytes, int & a_graphs, size_t & m_bytes, int & m_graphs) const;
 
     const expert_cache_stats & cache_stats() const { return ec_.stats(); }
+    // CPU threads for the experts served from RAM (ggml's CPU backend), changeable
+    // between evals: the console's auto-tune sweeps it on a running server.
+    void set_n_threads(int n);
+    int  n_threads() const { return n_threads_; }
+    // Called after each layer of a streamed prefill batch (il, n_layer, T tokens in
+    // the batch), so a server can report the prefill's progress inside a batch.
+    std::function<void(uint32_t, uint32_t, int32_t)> prefill_progress;
     // Instrument: time layer `il`'s cached decode graph truncated after each node
     // (min of `reps` replays) and print the per-node deltas >= 8 us. Ends the session.
     void profile_layer_graph(uint32_t il, int reps = 10);
@@ -367,6 +375,7 @@ private:
 
     const model_index * mi_ = nullptr;
     engine_config       cfg_;
+    int                 n_threads_ = 8;
     hparams             hp_;
 
     weights        w_;    // dense core, GPU

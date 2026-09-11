@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>qwfn console</title>
 <style>
-  :root { --bg:#0f1216; --panel:#171b21; --line:#262c35; --fg:#e6e9ee; --dim:#8b95a3; --acc:#6ee7b7; --warn:#f6c453; --bad:#f87171; --ok:#6ee7b7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  :root { --bg:#0f1216; --panel:#171b21; --line:#262c35; --fg:#e6e9ee; --dim:#8b95a3; --acc:#6ee7b7; --warn:#f6c453; --bad:#f87171; --ok:#6ee7b7; --blue:#7cb8ff; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
   * { box-sizing:border-box }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { display:flex; align-items:center; gap:14px; padding:12px 22px; border-bottom:1px solid var(--line); flex-wrap:wrap }
@@ -21,20 +21,25 @@
   .grid2 { display:grid; grid-template-columns: 1fr 1.35fr; gap:18px }
   section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:18px }
   h2 { font-size:12.5px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); margin:0 0 12px }
+  h2 .sub { text-transform:none; letter-spacing:0; font-weight:400 }
   .banner { border:1px solid rgba(110,231,183,.35); background:rgba(110,231,183,.06); border-radius:12px; padding:12px 16px; margin-bottom:18px; display:flex; gap:18px; align-items:center; flex-wrap:wrap }
   .banner.off { border-color:var(--line); background:transparent; color:var(--dim) }
   .banner b { font-size:15px } .banner .flags { font-family:var(--mono); font-size:12.5px; color:var(--dim) } .banner .flags span { display:inline-block; margin-right:10px; color:var(--fg) }
-  .model { display:grid; grid-template-columns: 22px 1fr; gap:10px; align-items:center; padding:11px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
+  .loc { color:var(--dim); font-size:11.5px; margin:10px 0 6px; font-family:var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .model { display:grid; grid-template-columns: 22px 1fr; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
   .model.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
-  .model .name { font-weight:600 }
+  .model .name { font-weight:600 } .model .sub { color:var(--dim); font-size:12px } .badge { display:inline-block; font-size:10.5px; padding:1px 6px; border:1px solid var(--line); border-radius:6px; color:var(--dim); margin-left:6px; vertical-align:1px } .badge.ok { color:var(--ok); border-color:rgba(110,231,183,.4) }
+  .locs { display:flex; flex-direction:column; gap:6px; margin-top:8px } .locrow { display:flex; gap:8px; align-items:center; font-size:12.5px } .locrow code { font-family:var(--mono); font-size:12px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 } .locrow .x { background:transparent; color:var(--dim); border:1px solid var(--line); padding:2px 8px; font-size:12px }
+  .addloc { display:flex; gap:8px; margin-top:8px } .addloc input { flex:1 }
   .kv { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:10px }
-  .kv div { border:1px solid var(--line); border-radius:10px; padding:10px 12px } .kv b { display:block; font-size:19px; font-weight:600; margin-top:2px } .kv span { color:var(--dim); font-size:12px } .kv small { display:block; color:var(--dim); font-size:11.5px; margin-top:3px }
-  .presets { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:12px }
-  .preset { border:1px solid var(--line); border-radius:10px; padding:10px 12px; cursor:pointer }
+  .kv div { border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:0 } .kv b { display:block; font-size:19px; font-weight:600; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis } .kv span { color:var(--dim); font-size:12px } .kv small { display:block; color:var(--dim); font-size:11.5px; margin-top:3px }
+  .kv div.wide { grid-column: span 2 }
+  .presets { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:12px }
+  .preset { border:1px solid var(--line); border-radius:10px; padding:10px 12px; cursor:pointer; min-width:0 }
   .preset.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
   .preset .pname { font-weight:600 } .preset .pctx { color:var(--dim); font-size:12px }
   .preset .pnum { font-size:12.5px; margin-top:8px; color:var(--dim) } .preset .pnum b { color:var(--fg) }
-  .preset .pfit { color:var(--warn); font-size:12px; margin-top:4px }
+  .preset .pfit { color:var(--warn); font-size:12px; margin-top:4px } .preset .pmeas { color:var(--ok); font-size:11.5px; margin-top:4px }
   .plan { color:var(--dim); font-size:12.5px; line-height:1.7; margin-bottom:6px } .plan b { color:var(--fg) }
   details.adv { margin:0 0 6px; border-top:1px solid var(--line); padding-top:8px } details.adv > summary { cursor:pointer; font-size:12.5px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.8px; padding:4px 0; list-style:none } details.adv > summary::before { content:'▸ '; } details.adv[open] > summary::before { content:'▾ '; } details.adv[open] > summary { margin-bottom:10px }
   form { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px 14px }
@@ -51,17 +56,21 @@
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px }
   button { background:var(--acc); color:#0b0f12; border:0; border-radius:9px; padding:9px 14px; font:inherit; font-weight:600; cursor:pointer }
   button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line) } button.danger { background:var(--bad); color:#fff } button:disabled { opacity:.45; cursor:default }
+  button.primary { background:var(--blue) }
   .est { display:flex; gap:14px; flex-wrap:wrap; color:var(--dim); font-size:12.5px; margin-top:10px } .est b { color:var(--fg) }
-  #options { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px }
-  #options th { text-align:left; color:var(--dim); font-weight:500; padding:4px 6px; border-bottom:1px solid var(--line) }
-  #options td { padding:5px 6px; border-bottom:1px solid var(--line); cursor:pointer } #options tr.sel td { background:rgba(110,231,183,.08) } #options tr:hover td { background:rgba(255,255,255,.03) }
-  .selftest { margin-top:14px; border-top:1px solid var(--line); padding-top:12px }
-  .steps { font-family:var(--mono); font-size:12px; color:var(--dim); white-space:pre-wrap; margin:0 0 10px; max-height:120px; overflow:auto }
+  .reasons { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.5 }
+  .panel { margin-top:14px; border-top:1px solid var(--line); padding-top:12px }
+  .steps { font-family:var(--mono); font-size:12px; color:var(--dim); white-space:pre-wrap; margin:0 0 10px; max-height:160px; overflow:auto }
   .verdict { margin:10px 0 0; font-size:13px } .verdict.ok { color:var(--ok) } .verdict.warn { color:var(--warn) } .verdict.bad { color:var(--bad) }
-  .endpoint { font-family:var(--mono); font-size:13px; background:#0f1216; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; gap:10px }
-  canvas { width:100%; height:80px; display:block; margin-top:10px }
+  .bar { height:8px; background:#0f1216; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin:8px 0 } .bar i { display:block; height:100%; background:var(--acc); width:0; transition:width .4s }
+  .bar.p i { background:var(--warn) }
+  .notes { color:var(--warn); font-size:12.5px; margin-top:8px; line-height:1.5 }
+  .sweep { font-size:12px; color:var(--dim); margin-top:6px } .sweep b { color:var(--fg) } .sweep span { display:inline-block; margin-right:10px }
+  .endpoint { font-family:var(--mono); font-size:13px; background:#0f1216; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap }
+  .connect { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.6 } .connect code { font-family:var(--mono); color:var(--fg); background:#0f1216; padding:1px 5px; border-radius:4px }
+  canvas { width:100%; height:110px; display:block; margin-top:10px }
   pre { background:#0b0e12; border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px; line-height:1.4; max-height:560px; overflow:auto; margin:0; white-space:pre-wrap; color:#b7c0cc }
-  .muted { color:var(--dim) } .err { color:var(--bad) }
+  .muted { color:var(--dim) } .err { color:var(--bad) } .okc { color:var(--ok) } .warnc { color:var(--warn) }
   .chat { display:grid; grid-template-columns: 1fr 260px; gap:18px }
   .msgs { min-height:420px; max-height:62vh; overflow:auto; display:flex; flex-direction:column; gap:12px; padding:4px 2px }
   .msg { border:1px solid var(--line); border-radius:12px; padding:10px 14px; max-width:92% } .msg.user { align-self:flex-end; background:rgba(110,231,183,.07); border-color:rgba(110,231,183,.3) } .msg.assistant { align-self:flex-start }
@@ -70,6 +79,8 @@
   .msg details { margin:4px 0 8px } .msg summary { cursor:pointer; color:var(--dim); font-size:12.5px } .think { color:var(--dim); font-size:12.5px; white-space:pre-wrap; border-left:2px solid var(--line); padding-left:10px; margin-top:6px; max-height:260px; overflow:auto }
   .meta { color:var(--dim); font-size:11.5px; margin-top:6px }
   .compose { display:flex; gap:10px; margin-top:12px } .compose textarea { flex:1; min-height:64px; resize:vertical }
+  .statehead { display:flex; align-items:baseline; gap:14px; margin:12px 0 10px } .statehead b { font-size:22px } .statehead .muted { font-size:12.5px }
+  @media (max-width: 1100px) { .presets { grid-template-columns: repeat(2, 1fr) } }
   @media (max-width: 980px) { .grid2, .chat { grid-template-columns: 1fr } form { grid-template-columns: repeat(2, 1fr) } .presets { grid-template-columns: 1fr } }
 </style>
 </head>
@@ -78,6 +89,7 @@
   <h1>qwfn console</h1>
   <span class="pill"><span id="dot" class="dot"></span><span id="state">connecting…</span></span>
   <span class="pill" id="uptime"></span>
+  <span class="pill" id="livepill" hidden></span>
   <nav>
     <button data-tab="serve" class="on">Serve</button>
     <button data-tab="chat">Chat</button>
@@ -91,24 +103,54 @@
   <div class="tab on" id="tab-serve">
     <div class="grid2">
       <section>
-        <h2>Models downloaded</h2>
+        <h2>Models</h2>
         <div id="models" class="muted">scanning…</div>
-        <div class="muted" id="hfdir" style="font-size:12px;margin-top:6px"></div>
+        <details class="adv" id="locbox" style="margin-top:12px">
+          <summary>Model locations</summary>
+          <div class="muted" style="font-size:12px">Folders the console scans for Qwen3.8-Flash-Next GGUFs (a Hugging Face cache, or any folder holding the shards; the <code>mmproj</code> and <code>MTP</code> files are picked up next to them). You can also give a <code>.gguf</code> file directly.</div>
+          <div class="locs" id="locs"></div>
+          <div class="addloc"><input id="locpath" placeholder="/path/to/models or /path/to/model-00001-of-00004.gguf"><button class="secondary" id="locadd">Add</button></div>
+          <div class="muted" id="locmsg" style="font-size:12px;margin-top:6px"></div>
+        </details>
         <h2 style="margin-top:18px">This machine</h2>
         <div class="kv" id="hw"></div>
       </section>
       <section>
-        <h2>Settings <span class="muted" style="text-transform:none;letter-spacing:0">— sized for the selected model on this machine</span></h2>
+        <h2>Tier <span class="muted sub">— sized for the selected model on this machine</span></h2>
         <div id="settingsbox">
           <div class="presets" id="presets"></div>
           <div class="plan" id="plan"></div>
+          <div class="reasons" id="reasons"></div>
+        </div>
+        <p class="hint" id="lockhint" hidden>A server is running with the settings shown in the banner. Stop it to change the model or the settings.</p>
+        <div class="row">
+          <button id="tune" class="primary">Auto-tune &amp; start</button>
+          <button id="start">Start server</button>
+          <button id="stop" class="danger" disabled>Stop server</button>
+          <button id="selftest" class="secondary">Self-test</button>
+          <button id="reco" class="secondary">Reset</button>
+          <span id="msg" class="muted"></span>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px" id="tunehelp">Auto-tune measures this machine and picks every flag from what it finds: the drive's read rate, then the plan (the KV precision the GPU has room for, the tiers, the batch, where the attention state lives, the RAM tier the memory allows), then the server is started with it and verified on a short chat and a long document, and the CPU thread count is swept live on that document's context. About four minutes; the result is saved for this model and the tier card shows the measured speed.</div>
+        <div class="panel" id="tunebox" hidden>
+          <h2>Auto-tune <span class="muted sub" id="tune_sub"></span></h2>
+          <div class="bar" id="tunebar"><i></i></div>
+          <div class="steps" id="tune_steps"></div>
+          <div class="kv" id="tune_result"></div>
+          <div class="sweep" id="tune_sweep"></div>
+          <div class="notes" id="tune_notes"></div>
+          <p class="verdict" id="tune_verdict"></p>
+          <div class="row" style="margin-top:8px"><button class="secondary" id="tunecancel" hidden>Cancel tune</button></div>
+        </div>
+        <div id="settingsbox2" style="margin-top:12px">
           <details class="adv" id="advanced">
             <summary>Advanced settings</summary>
             <form id="form" onsubmit="return false">
-              <label><span class="lbl">Context (tokens) <span class="tip" data-tip="The most tokens one conversation can hold, prompt and answer together. The attention state for it is allocated in VRAM up front and comes out of the expert tier, so a larger context leaves fewer experts on the GPU and decodes a little slower; the table below shows the cost of every step on this machine. The presets set it.">?</span></span><select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
-              <label><span class="lbl">KV cache <span class="tip" data-tip="Storage type of the attention cache. q4_0 takes a quarter of f16 for no measurable difference in the answers and is what every measurement used; it is the choice from 32K up. q8_0 and f16 spend more VRAM per token of context.">?</span></span><select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
-              <label><span class="lbl">RAM tier (GB) <span class="tip" data-tip="Pinned host memory for the expert cache behind the VRAM tier: what the memory available right now leaves after the server's other host memory (~4 GB, plus the draft head's 2.7 GB of pinned experts and the context state kept in RAM) and a 3.5 GB floor. It is a real lever: measured at 131K, 10.5 to 16 GB was +16% decode in chat and +19% on a long document, about 3% per GB; 19 GB ran the machine out of memory.">?</span></span><input id="ram" type="number" min="2" max="64"></label>
-              <label><span class="lbl">CPU threads <span class="tip" data-tip="Threads for the experts served from the RAM tier (the GPU runs the rest). Measured 2026-09-10 on an 8-core / 16-thread CPU at 131K: 4 threads 15.2 tok/s, 6 15.5, 8 15.6, 12 15.2, 16 11.5, since SMT threads starve the drive reader and the graph thread. The default is the physical core count.">?</span></span><input id="threads" type="number" min="1" max="128"></label>
+              <label><span class="lbl">Context (tokens) <span class="tip" data-tip="The most tokens one conversation can hold, prompt and answer together. The attention state for it is allocated up front and comes out of the expert tier, so a larger context leaves fewer experts on the GPU and decodes a little slower. The tiers set it; change it here and the plan is re-sized for it.">?</span></span><select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
+              <label><span class="lbl">KV cache <span class="tip" data-tip="Storage type of the attention cache. q8_0 is the default, the safer choice for long, exact work (tool arguments, code), taken whenever the plan can afford it: the VRAM expert tier survives and the predicted cost is under 10% of decode (its bytes come out of the expert tier, or, with the cache in RAM, out of the RAM tier and the PCIe gathers per token). f16 when it costs under 2%. q4_0 takes a quarter of f16 (the replays measured it no different) and is the fallback where q8_0 would not fit. The reasons line under the tier cards shows the cost.">?</span></span><select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
+              <label><span class="lbl">RAM tier (GB) <span class="tip" data-tip="Pinned host memory for the expert cache behind the VRAM tier: the memory available right now, minus what the server needs besides the tier (the draft head's 2.7 GB of pinned experts, the context state kept in RAM, staging buffers, the vision projector; estimated until Auto-tune has measured it on this machine), minus the headroom below. It is a real lever: measured at 131K, 10.5 to 16 GB was +16% decode in chat and +19% on a long document, about 3% per GB; 19 GB ran the machine out of memory. Auto-tune measures the server's real need through its run and re-sizes the tier to leave exactly the headroom.">?</span></span><input id="ram" type="number" min="2" max="64"></label>
+              <label><span class="lbl">Memory headroom (GB) <span class="tip" data-tip="RAM to leave free at the worst point of a run, for what starts after the server: a coding harness's language servers took 1.5 GB after the first tool call; with 1.9 GB free the server once stalled on its own /stats. 3 GB by default. Lower it for a bigger RAM tier (about 3% of decode per GB) when the machine runs nothing else; raise it if other apps get squeezed. A machine setting, saved for every tier and model.">?</span></span><input id="headroom" type="number" min="0.5" max="16" step="0.5"></label>
+              <label><span class="lbl">CPU threads <span class="tip" data-tip="Threads for the experts served from the RAM tier (the GPU runs the rest). Measured 2026-09-10 on an 8-core / 16-thread CPU at 131K: 4 threads 15.2 tok/s, 6 15.5, 8 15.6, 12 15.2, 16 11.5, since SMT threads starve the drive reader and the graph thread. The default is the physical core count; the auto-tune sweeps it on the running server and keeps the smallest count within 2% of the best.">?</span></span><input id="threads" type="number" min="1" max="128"></label>
               <label><span class="lbl">Batch <span class="tip" data-tip="Tokens per prefill batch. The prefill streams every expert once per batch and computes per token, so a bigger batch is a faster prefill: on a 43K document 4096 gives ~300 tok/s, 8192 ~480, 16384 ~720. A batch borrows VRAM from the expert tier only while a prompt streams (about 0.6 GB per 4096 tokens on top of the staging), so the recommendation picks the largest that leaves the tier a gigabyte; decode speed is the same either way.">?</span></span><select id="batch"><option>2048</option><option>4096</option><option>8192</option><option>16384</option></select></label>
               <label><span class="lbl">VRAM reserve (MB) <span class="tip" data-tip="VRAM kept free after the expert tier is sized, for what decode allocates later: its per-layer graphs, the attention graphs shaped by the context, the CUDA pool and graph instantiations. 768 MB up to 48K tokens of context, plus 8 MB per 1K tokens above that (1.4 GB at 131K): measured 2026-09-10, 805 MB ran out at the first token after a 101K prefill and 1024 held. Too small crashes the server on a long conversation; too large costs expert tier.">?</span></span><input id="reserve" type="number" min="256" max="4096" step="128"></label>
               <label><span class="lbl">Port <span class="tip" data-tip="The server's port. Clients use http://127.0.0.1:PORT/v1 with any API key.">?</span></span><input id="port" type="number" min="1024" max="65535"></label>
@@ -116,24 +158,16 @@
               <label><span class="lbl">Thinking budget (tokens, 0 = none) <span class="tip" data-tip="Cap on reasoning tokens per answer. 6000 keeps a hard think under about eight minutes at Q4 speed, inside the timeouts most harnesses have; the model is told time is up and answers from what it has. 0 lifts the cap.">?</span></span><input id="think_budget" type="number" min="0" step="500"></label>
               <label><span class="lbl">Skip missed experts <span class="tip" data-tip="Compute a token without the experts that are still on the NVMe instead of waiting for them. Faster decode at a small, measured quality cost: the output is no longer exact. Cannot be combined with the draft head.">?</span></span><select id="skip_miss"><option value="false">off</option><option value="true">on</option></select></label>
               <label><span class="lbl">Speculative block <span class="tip" data-tip="Predict the next layer's experts by running that layer's own block on the current residual, and fetch them while the current layer computes. The output is exact; on by default because it was never measured slower.">?</span></span><select id="spec_block"><option value="true">on</option><option value="false">off</option></select></label>
-              <label><span class="lbl">Draft head (MTP) <span class="tip" data-tip="The checkpoint's draft head (MTP/mtp-*.gguf): it proposes the token after next and the trunk verifies it as a two-token step, so the output stays the trunk's own; at temperature the draft is sampled from the head's distribution and accepted by the speculative-sampling rule, which keeps the trunk's exact distribution. It drafts after any prompt, streamed ones included (their KV rows are filled during the prefill). Measured on the reference machine (2026-09-10): +7-8% on the short and 43K-document replays at ~80% acceptance, and through OpenCode on a coding task +12% on Q4 and +19% on Q3 at 95-96% acceptance. It costs one tier step of VRAM and 2.7 GB of pinned RAM, both counted in the plan. On by default when the file is there.">?</span></span><select id="mtp"><option value="false">off</option><option value="true">on</option></select></label>
-              <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood. Its 0.9 GB of weights stay in RAM and are uploaded to the GPU only while an image is encoded (about 40 ms per image), so vision costs no VRAM at decode. On by default whenever the file is next to the model; off gives a text-only server.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
-              <label><span class="lbl">Attention state in RAM <span class="tip" data-tip="Where the attention caches live. 'indexer cache' keeps the indexer keys (3 MB per 1K tokens of context) in pinned RAM, read over PCIe at about 0.35 ms per token; 'indexer + KV cache' also moves the KV cache (7 MB per 1K tokens at q4_0) at about 2 ms per token. The VRAM they free goes to the expert tier: about 4% of decode per GB at 128K, and the difference between an expert tier and none at 256K (measured 7.0 to 9.7 tok/s). The presets pick it per context: indexer from 64K, both from 128K (measured +5% decode at 126K) or whenever the tier would not fit otherwise.">?</span></span><select id="state_host"><option value="none">off (all in VRAM)</option><option value="idx">indexer cache</option><option value="kv,idx">indexer + KV cache</option></select></label>
+              <label><span class="lbl">Draft head (MTP) <span class="tip" data-tip="The checkpoint's draft head (MTP/mtp-*.gguf): it proposes the token after next and the trunk verifies it as a two-token step, so the output stays the trunk's own; at temperature the draft is sampled from the head's distribution and accepted by the speculative-sampling rule, which keeps the trunk's exact distribution. It drafts after any prompt, streamed ones included. Measured on the reference machine (2026-09-10): +7-8% on the short and 43K-document replays at ~80% acceptance, and through OpenCode on a coding task +12% on Q4 and +19% on Q3 at 95-96% acceptance. It costs one tier step of VRAM and 2.7 GB of pinned RAM, both counted in the plan. On by default when the file is there.">?</span></span><select id="mtp"><option value="false">off</option><option value="true">on</option></select></label>
+              <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood. It runs on the CPU: its 0.9 GB of weights stay in RAM and the encode uses the cores (about 15 s for a 1400x1000 screenshot, 0.3 s for a small image), so vision costs no VRAM at all and the expert tier keeps its size. On by default whenever the file is next to the model; off gives a text-only server.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
+              <label><span class="lbl">Attention state in RAM <span class="tip" data-tip="Where the attention caches live. 'indexer cache' keeps the indexer keys (3 MB per 1K tokens of context) in pinned RAM, read over PCIe at about 0.35 ms per token; 'indexer + KV cache' also moves the KV cache (7 MB per 1K tokens at q4_0) at about 2 ms per token. The VRAM they free goes to the expert tier: about 4% of decode per GB at 128K, and the difference between an expert tier and none at 256K (measured 7.0 to 9.7 tok/s). The tiers pick it per context: indexer from 64K, both from 128K (measured +5% decode at 126K) or whenever the tier would not fit otherwise.">?</span></span><select id="state_host"><option value="none">off (all in VRAM)</option><option value="idx">indexer cache</option><option value="kv,idx">indexer + KV cache</option></select></label>
             </form>
             <div class="est" id="est"></div>
-            <table id="options"></table>
+            <div class="row"><button class="secondary" id="savecustom">Save as Custom tier</button><button class="secondary" id="delcustom" hidden>Delete Custom tier</button><span class="muted" id="custommsg" style="font-size:12px"></span></div>
           </details>
         </div>
-        <p class="hint" id="lockhint" hidden>A server is running with the settings shown in the banner. Stop it to change the model or the settings.</p>
-        <div class="row">
-          <button id="start">Start server</button>
-          <button id="stop" class="danger" disabled>Stop server</button>
-          <button id="selftest" class="secondary">Self-test</button>
-          <button id="reco" class="secondary">Reset</button>
-          <span id="msg" class="muted"></span>
-        </div>
-        <div class="selftest" id="st" hidden>
-          <h2>Self-test <span class="muted" id="st_sub" style="text-transform:none;letter-spacing:0"></span></h2>
+        <div class="panel" id="st" hidden>
+          <h2>Self-test <span class="muted sub" id="st_sub"></span></h2>
           <div class="steps" id="st_steps"></div>
           <div class="kv" id="st_result"></div>
           <p class="verdict" id="st_verdict"></p>
@@ -145,7 +179,7 @@
   <div class="tab" id="tab-chat">
     <div class="chat">
       <section>
-        <h2>Chat <span class="muted" style="text-transform:none;letter-spacing:0">— talks to the served endpoint directly, streamed; the history is kept here and replayed each turn</span></h2>
+        <h2>Chat <span class="muted sub">— talks to the served endpoint directly, streamed; the history is kept here and replayed each turn</span></h2>
         <div class="msgs" id="msgs"><div class="muted" id="chatempty">No model is being served. Start one on the Serve tab.</div></div>
         <div class="compose">
           <textarea id="prompt" placeholder="Message… (Enter to send, Shift+Enter for a newline)"></textarea>
@@ -174,38 +208,69 @@
 
   <div class="tab" id="tab-stats">
     <section>
-      <h2>Live <span class="muted" style="text-transform:none;letter-spacing:0">— polled every 5 s; peaks and averages are for this server's lifetime as seen by the console</span></h2>
-      <div class="endpoint"><span>endpoint <b id="endpoint">—</b> <span class="muted" id="modelid"></span></span><button class="secondary" id="copy">copy</button></div>
-      <div class="kv" style="margin-top:12px">
-        <div><span>generation now</span><b id="tps">—</b><span id="tpsnote">tok/s</span><small id="tps2"></small></div>
-        <div><span>prefill</span><b id="ptps">—</b><span>tok/s, last request</span><small id="ptps2"></small></div>
-        <div><span>tokens served</span><b id="served">—</b><span id="servednote"></span></div>
-        <div><span>requests</span><b id="reqs">—</b><span id="reqsnote">since start</span></div>
+      <h2>Endpoint</h2>
+      <div class="endpoint"><span>base URL <b id="endpoint">—</b> <span class="muted" id="modelid"></span></span><button class="secondary" id="copy">copy</button></div>
+      <div class="connect">Any OpenAI-compatible client works with any API key: base URL <code id="ep2">—</code>, model <code id="ep3">—</code>. Thinking is controlled per request with <code>reasoning_effort</code> (xhigh · medium · low · off) or by ending a message with <code>/think</code> or <code>/no_think</code>; every reply carries <code>usage</code> (input, cached and output tokens) and llama.cpp-style <code>timings</code>. <code>/stats</code> is what this page reads, once a second.</div>
+    </section>
+    <section>
+      <h2>Now <span class="muted sub" id="nowsub">— polled every second</span></h2>
+      <div class="statehead"><b id="nowstate">—</b><span class="muted" id="nownote"></span></div>
+      <div class="kv">
+        <div><span>generation</span><b id="tps">—</b><span id="tpsnote">tok/s</span><small id="tps2"></small></div>
+        <div class="wide"><span>prefill</span><b id="ptps">—</b><span id="ptpsnote">tok/s</span><div class="bar p" id="pbar" hidden><i></i></div><small id="ptps2"></small></div>
+        <div><span>input tokens</span><b id="cur_in">—</b><span>this request</span><small id="cur_in2"></small></div>
+        <div><span>cached</span><b id="cur_cached">—</b><span>reused from the prefix</span><small id="cur_cached2"></small></div>
+        <div><span>output tokens</span><b id="cur_out">—</b><span id="cur_outnote">so far</span><small id="cur_out2"></small></div>
+      </div>
+      <canvas id="chart" width="1200" height="110"></canvas>
+      <div class="muted" style="font-size:12px;margin-top:4px"><span style="color:var(--acc)">■</span> generation tok/s · <span style="color:var(--warn)">■</span> prefill tok/s (right scale) · last 5 minutes · <span id="chartnote"></span></div>
+    </section>
+    <section>
+      <h2>Last request <span class="muted sub" id="lastsub"></span></h2>
+      <div class="kv">
+        <div><span>input tokens</span><b id="l_in">—</b><span id="l_innote">prompt, cached included</span></div>
+        <div><span>cached</span><b id="l_cached">—</b><span id="l_cachednote">reused, not re-read</span></div>
+        <div><span>prefilled</span><b id="l_new">—</b><span id="l_newnote">new tokens read</span></div>
+        <div><span>output tokens</span><b id="l_out">—</b><span id="l_outnote"></span></div>
+        <div><span>prefill</span><b id="l_ptps">—</b><span>tok/s</span><small id="l_ptps2"></small></div>
+        <div><span>generation</span><b id="l_tps">—</b><span>tok/s</span><small id="l_tps2"></small></div>
+        <div><span>finish</span><b id="l_finish" style="font-size:15px">—</b><span id="l_finishnote"></span></div>
+      </div>
+    </section>
+    <section>
+      <h2>Session <span class="muted sub">— this server's lifetime</span></h2>
+      <div class="kv">
+        <div><span>requests</span><b id="reqs">—</b><span id="reqsnote"></span></div>
+        <div><span>input tokens</span><b id="t_in">—</b><span id="t_innote"></span></div>
+        <div><span>cached</span><b id="t_cached">—</b><span id="t_cachednote"></span></div>
+        <div><span>output tokens</span><b id="t_out">—</b><span id="t_outnote"></span></div>
+        <div><span>generation, average</span><b id="t_tps">—</b><span>tok/s</span><small id="t_tps2"></small></div>
+        <div><span>prefill, average</span><b id="t_ptps">—</b><span>tok/s</span><small id="t_ptps2"></small></div>
         <div><span>context in use</span><b id="ctxuse">—</b><span id="ctxnote"></span><small id="ctx2"></small></div>
         <div><span>expert cache</span><b id="hit">—</b><span>hit · from VRAM</span><small id="hit2"></small></div>
-        <div><span>current request</span><b id="cur">—</b><span id="curnote"></span></div>
-        <div><span>last request</span><b id="last">—</b><span id="lastnote"></span></div>
+        <div><span>draft head</span><b id="spec">—</b><span id="specnote">accepted</span><small id="spec2"></small></div>
+        <div><span>CPU threads</span><b id="thr">—</b><span>for RAM-served experts</span></div>
       </div>
-      <canvas id="chart" width="1200" height="80"></canvas>
-      <div class="muted" style="font-size:12px;margin-top:4px">generation tok/s, last 5 minutes · <span id="chartnote"></span></div>
     </section>
   </div>
 
   <div class="tab" id="tab-log">
     <section>
-      <h2>Server log <span class="muted" style="text-transform:none;letter-spacing:0">— last lines, follows while you stay at the bottom</span></h2>
+      <h2>Server log <span class="muted sub">— last lines, follows while you stay at the bottom</span></h2>
       <pre id="log">—</pre>
     </section>
   </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let models = [], selected = 0, reco = null, presetId = 'coding', hist = [], peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }, lastStatus = null, pageReady = false;
+let models = [], selected = null, reco = null, presetId = 'coding', customDirty = false, hist = [], peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }, lastStatus = null, lastLive = null, pageReady = false;
 const fmt = (n, d=1) => (n === undefined || n === null || isNaN(n)) ? '—' : Number(n).toFixed(d);
-const big = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n);
+const big = n => (n === undefined || n === null || isNaN(n)) ? '—' : n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(Math.round(n));
 const kctx = c => (c/1024).toFixed(0) + 'K';
-const commas = n => Number(n).toLocaleString('en-US');
-async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
+const commas = n => (n === undefined || n === null || isNaN(n)) ? '—' : Math.round(Number(n)).toLocaleString('en-US');
+const secs = s => s === undefined || s === null || isNaN(s) ? '—' : s >= 3600 ? Math.floor(s/3600) + ' h ' + Math.floor((s%3600)/60) + ' min' : s >= 90 ? Math.floor(s/60) + ' min ' + Math.round(s%60) + ' s' : s >= 10 ? Math.round(s) + ' s' : s.toFixed(1) + ' s';
+async function api(path, opts) { const r = await fetch(path, Object.assign({ cache: 'no-store' }, opts || {})); return r.json(); }
+const post = (path, body) => api(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
@@ -214,109 +279,217 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 });
 try { const t = (location.hash || '').replace('#', '') || localStorage.getItem('qwfn.tab'); if (t) { const b = document.querySelector('nav button[data-tab="' + t + '"]'); if (b) b.click(); } } catch (e) {}
 
+// ---- models and locations ----
+let locations = [];
 async function loadModels() {
-  const d = await api('/api/models'); models = d.models; $('hfdir').textContent = 'from ' + d.hf;
-  const q4 = models.findIndex(m => m.quant === 'Q4_K_XL'); if (q4 >= 0) selected = q4;
-  renderModels();
+  const d = await api('/api/models'); models = d.models; locations = d.locations || [];
+  if (!models.find(m => m.path === selected)) {
+    const last = d.last && models.find(m => m.path === d.last.model);
+    const q4 = models.find(m => m.quant === 'Q4_K_XL');
+    selected = (last || q4 || models[0] || {}).path || null;
+    if (last && d.last.preset && presetId === 'coding') presetId = d.last.preset;
+  }
+  renderModels(); renderLocations();
 }
 function renderModels() {
   const el = $('models'); el.innerHTML = '';
-  if (!models.length) { el.textContent = 'no Qwen3.8-Flash-Next GGUF found in the Hugging Face cache'; return; }
+  if (!models.length) { el.innerHTML = '<span class="muted">no Qwen3.8-Flash-Next GGUF found. Download one (<code>hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"</code>) or add the folder that holds it under Model locations.</span>'; return; }
+  let loc = null;
   models.forEach(m => {
-    const div = document.createElement('div'); div.className = 'model' + (m.id === selected ? ' sel' : '');
-    div.innerHTML = `<input type="radio" ${m.id === selected ? 'checked' : ''}><div class="name">${m.name} <span class="muted">${m.size_gb} GB</span></div>`;
-    div.onclick = () => { selected = m.id; visionChoice = null; renderModels(); loadReco(); };
+    if (m.location !== loc) { loc = m.location; const l = document.createElement('div'); l.className = 'loc'; l.textContent = loc; l.title = loc; el.appendChild(l); }
+    const div = document.createElement('div'); div.className = 'model' + (m.path === selected ? ' sel' : '');
+    const tuned = (reco && reco.tune && m.name === (reco.tune.model)) || false;
+    div.innerHTML = `<input type="radio" ${m.path === selected ? 'checked' : ''}><div><div class="name">${m.name} <span class="muted" style="font-weight:400">${m.size_gb} GB</span>${m.mmproj ? '<span class="badge">vision</span>' : ''}${m.mtp ? '<span class="badge">draft head</span>' : ''}${m.tuned_date ? '<span class="badge ok">tuned</span>' : ''}</div><div class="sub">${m.repo}${m.known_quant ? '' : ' · unknown quant, estimates are rough'}</div></div>`;
+    div.onclick = () => { selected = m.path; visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; customDirty = false; renderModels(); loadReco(); };
     el.appendChild(div);
   });
 }
+function renderLocations() {
+  const el = $('locs'); el.innerHTML = '';
+  locations.forEach(l => {
+    const n = models.filter(m => m.location === l.path).length;
+    const row = document.createElement('div'); row.className = 'locrow';
+    row.innerHTML = `<code title="${l.path}">${l.path}</code><span class="muted">${l.builtin ? 'Hugging Face cache · ' : ''}${l.exists ? n + ' model' + (n === 1 ? '' : 's') : 'missing'}</span>` + (l.builtin ? '' : '<button class="x">remove</button>');
+    const x = row.querySelector('.x'); if (x) x.onclick = async () => { await post('/api/locations', { remove: l.path }); await loadModels(); await loadReco(); };
+    el.appendChild(row);
+  });
+}
+$('locadd').onclick = async () => {
+  const p = $('locpath').value.trim(); if (!p) return;
+  $('locmsg').textContent = 'scanning…';
+  const r = await post('/api/locations', { add: p });
+  if (r.error) { $('locmsg').textContent = r.error; $('locmsg').className = 'err'; return; }
+  $('locmsg').textContent = ''; $('locpath').value = ''; await loadModels(); await loadReco();
+};
+$('locpath').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('locadd').click(); } });
+
 async function loadHw() {
   const hw = await api('/api/hardware');
   $('hw').innerHTML = `
-    <div><span>GPU</span><b style="font-size:14px">${hw.gpu || 'none'}</b><span>${(hw.vram_total_mb/1024).toFixed(1)} GB VRAM, ${(hw.vram_used_mb/1024).toFixed(1)} used</span></div>
+    <div><span>GPU</span><b style="font-size:14px">${hw.gpu || 'none'}</b><span>${(hw.vram_total_mb/1024).toFixed(1)} GB VRAM, ${(hw.vram_used_mb/1024).toFixed(1)} used${hw.desktop_gpu ? ' · desktop on it' : ''}</span></div>
     <div><span>RAM</span><b>${hw.ram_total_gb} GB</b><span>${hw.ram_available_gb} GB available</span></div>
-    <div><span>CPU threads</span><b>${hw.cpu_threads}</b><span></span></div>
-    <div><span>desktop on GPU</span><b>${hw.desktop_gpu ? 'yes' : 'no'}</b><span>${hw.other_gpu_apps || 0} other GPU apps</span></div>`;
+    <div><span>CPU</span><b>${hw.cpu_cores} cores</b><span>${hw.cpu_threads} threads · ${(hw.cpu || '').replace(/\s+(Processor|CPU).*$/, '').replace(/^(AMD|Intel\(R\)|Intel) /, '')}</span></div>
+    <div id="hwdrive"><span>drive under the model</span><b>—</b><span>run Auto-tune to measure it</span></div>`;
 }
-function currentOption() {
-  if (!reco) return null;
-  return reco.options.find(o => o.ctx === +$('ctx').value) || null;
+function renderDrive() {
+  const t = reco && reco.tune, el = $('hwdrive'); if (!el) return;
+  if (!t || !t.nvme) { el.innerHTML = '<span>drive under the model</span><b>—</b><span>run Auto-tune to measure it</span>'; return; }
+  const d = t.drive || {};
+  el.innerHTML = `<span>drive under the model</span><b>${fmt(t.nvme.gbs)} GB/s</b><span>${d.model || d.disk || ''}${d.rotational ? ' · spinning disk' : ''} · random 2 MiB reads</span>`;
 }
+
+// ---- the plan ----
+let visionChoice = null, stateChoice = null, kvChoice = null, ctxChoice = null;
 function renderPresets() {
   const el = $('presets'); el.innerHTML = '';
   if (!reco) return;
-  reco.presets.forEach(p => {
+  reco.tiers.forEach(p => {
     const div = document.createElement('div'); div.className = 'preset' + (p.id === presetId ? ' sel' : '');
-    div.innerHTML = `<div class="pname">${p.label}</div><div class="pctx">${kctx(p.ctx)} context</div>` +
-      `<div class="pnum"><b>${fmt(p.tok_s_short)}</b> tok/s in chat<br><b>${fmt(p.tok_s_long_doc)}</b> tok/s on a long document</div>` +
+    let body;
+    if (p.id === 'custom' && !p.saved) body = `<div class="pname">Custom</div><div class="pctx">${customDirty && presetId === 'custom' ? 'unsaved changes' : 'your own settings'}</div><div class="pnum">${customDirty && presetId === 'custom' ? 'save them under Advanced settings to keep this tier' : p.blurb}</div>`;
+    else body = `<div class="pname">${p.label}</div><div class="pctx">${kctx(p.ctx)} context · KV ${p.kv}${p.id === 'custom' && customDirty && presetId === 'custom' ? ' · unsaved changes' : ''}</div>` +
+      (p.measured && p.measured.chat ? `<div class="pnum"><b>${fmt(p.measured.chat)}</b> tok/s in chat<br><b>${fmt(p.measured.doc)}</b> tok/s on a long document</div><div class="pmeas">measured here ${p.measured.date.slice(0, 10)}${p.measured.prefill ? ' · prefill ' + fmt(p.measured.prefill, 0) + ' tok/s' : ''}</div>`
+                                       : `<div class="pnum"><b>${fmt(p.tok_s_short)}</b> tok/s in chat<br><b>${fmt(p.tok_s_long_doc)}</b> tok/s on a long document</div><div class="pctx" style="margin-top:4px">predicted</div>`) +
       (p.note ? `<div class="pfit">${p.note}</div>` : '');
-    div.onclick = () => { presetId = p.id; loadReco(); };
+    div.innerHTML = body;
+    div.onclick = () => { if (p.id === 'custom' && !p.saved) { presetId = 'custom'; customDirty = true; $('advanced').open = true; renderPresets(); renderPlan(); return; } presetId = p.id; customDirty = false; visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; loadReco(); };
     el.appendChild(div);
   });
 }
 function renderPlan() {
-  const o = currentOption(), m = models[selected];
-  if (!reco || !m) { $('plan').textContent = ''; return; }
-  const custom = presetId === 'custom' ? '<b>custom settings</b> · ' : '';
+  const m = models.find(x => x.path === selected), e = reco && reco.estimates;
+  if (!reco || !m) { $('plan').textContent = ''; $('reasons').textContent = ''; return; }
+  const tier = reco.tiers.find(t => t.id === presetId);
+  const head = presetId === 'custom' ? (customDirty ? '<b>Custom (unsaved)</b> · ' : '<b>Custom</b> · ') : `<b>${tier ? tier.label : presetId}</b> · `;
   const sh = $('state_host').value, shName = sh === 'kv,idx' ? 'indexer + KV cache in RAM' : sh === 'idx' ? 'indexer cache in RAM' : 'attention state in VRAM';
-  $('plan').innerHTML = custom + `<b>${m.name}</b> · context <b>${commas($('ctx').value)}</b> tokens, KV <b>${$('kv').value}</b> · ` +
-    (o ? (o.tier_gb > 0 ? `expert tier <b>${o.tier_gb} GB</b> of VRAM (~${commas(o.blocks)} experts, ${(o.vram_served*100).toFixed(0)}% of lookups) + <b>${$('ram').value} GB</b> of RAM` : `<b>no VRAM expert tier</b> at this context on this GPU (experts from <b>${$('ram').value} GB</b> of RAM and the NVMe)`) + ` · predicted <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document · ` : `RAM tier <b>${$('ram').value} GB</b> · `) +
-    `<b>${shName}</b>${o && o.state_host_gb ? ' (' + o.state_host_gb + ' GB)' : ''} · vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
+  $('plan').innerHTML = head + `<b>${m.name}</b> · context <b>${commas($('ctx').value)}</b> tokens, KV <b>${$('kv').value}</b> · ` +
+    (e.vram_tier_gb > 0 ? `expert tier <b>${e.vram_tier_gb} GB</b> of VRAM (~${commas(e.vram_tier_blocks)} experts, ${(e.vram_served*100).toFixed(0)}% of lookups) + <b>${$('ram').value} GB</b> of RAM` : `<b>no VRAM expert tier</b> at this context on this GPU (experts from <b>${$('ram').value} GB</b> of RAM and the NVMe)`) +
+    ` · <b>${$('threads').value}</b> threads · predicted <b>${fmt(e.decode_tps_short)}</b> tok/s in chat, <b>${fmt(e.decode_tps_long_doc)}</b> on a long document, prefill ~<b>${e.prefill_tps_long}</b> tok/s · ` +
+    `<b>${shName}</b>${e.state_host_gb ? ' (' + e.state_host_gb + ' GB)' : ''} · vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · draft head <b>${$('mtp').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
+  const cal = reco.calibration || {};
+  $('reasons').innerHTML = `KV cache ${reco.kv_reason || ''}. RAM tier ${reco.ram_reason || ''}. ${reco.state_reason || ''}.` + (cal.date ? ` Tuned on this machine ${cal.date}: ${cal.threads ? cal.threads + ' threads' : ''}${cal.nvme_gbs ? ', drive ' + fmt(cal.nvme_gbs) + ' GB/s' : ''}${cal.host_other_gb ? ', the server needs ' + fmt(cal.host_other_gb) + ' GB besides the tier' : ''}.` : ' Not tuned on this machine yet: the numbers are the cost model\'s predictions from the reference machine\'s constants, and the RAM tier keeps 2 GB for the estimate\'s uncertainty until the tune has measured it.');
 }
-function applyOption(o) {
-  $('ctx').value = o.ctx; $('kv').value = o.kv; if (o.state_host) $('state_host').value = o.state_host; if (o.ram) $('ram').value = o.ram; if (o.threads) $('threads').value = o.threads;
-  $('est').innerHTML = `<span>VRAM expert tier <b>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</b> (~${o.blocks} blocks, ${(o.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>prefill batch <b>${o.batch}</b>${o.prefill_tps ? ` (~${o.prefill_tps} tok/s on a long document; lends ${o.lend_gb} GB of the tier while a prompt streams)` : ''}</span><span>KV + state <b>${o.state_vram_gb !== undefined ? o.state_vram_gb : o.state_gb} GB</b> in VRAM${o.state_host_gb ? ` + <b>${o.state_host_gb} GB</b> in RAM` : ''}</span><span>dense core <b>${reco.estimates.dense_core_gb} GB</b></span>${reco.vision ? `<span>vision projector <b>${reco.estimates.mmproj_gb} GB</b> in RAM, staged per image</span>` : ''}<span>predicted decode <b>${fmt(o.tok_s_short)}</b> tok/s in chat, <b>${fmt(o.tok_s_long_doc)}</b> on a long document</span><span>prefill ~<b>${reco.estimates.prefill_tps_long}</b> tok/s</span>`;
-  document.querySelectorAll('#options tr').forEach(tr => tr.classList.toggle('sel', +tr.dataset.ctx === o.ctx));
-  renderPlan();
-}
-let visionChoice = null;   // null: the model's default (on when an mmproj file is there)
-let stateChoice = null;    // null: chosen per context by the presets
-async function loadReco() {
-  const r = await api('/api/recommend?model=' + selected + '&preset=' + (presetId === 'custom' ? 'coding' : presetId) + '&vision=' + (visionChoice === null ? '' : (visionChoice ? '1' : '0')) + '&state_host=' + encodeURIComponent(stateChoice === null ? '' : stateChoice)); reco = r;
-  if (presetId !== 'custom') presetId = r.preset;
+function fillForm(r) {
   ['ctx','kv','ram','threads','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
-  $('skip_miss').value = String(r.skip_miss);
-  if (r.spec_block !== undefined) $('spec_block').value = String(r.spec_block);
-  const von = $('vision').options[0];
-  von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'on' : 'unavailable (no mmproj file)';
-  $('vision').value = String(r.vision);
+  if (r.headroom_gb !== undefined && document.activeElement !== $('headroom')) $('headroom').value = r.headroom_gb;
+  $('skip_miss').value = String(!!r.skip_miss); $('spec_block').value = String(r.spec_block !== false);
+  const von = $('vision').options[0]; von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'on' : 'unavailable (no mmproj file)';
+  $('vision').value = String(!!r.vision);
   if (r.state_host) $('state_host').value = r.state_host;
-  const mon = $('mtp').options[1];
-  mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'on' : 'unavailable (no MTP file)';
+  const mon = $('mtp').options[1]; mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'on' : 'unavailable (no MTP file)';
   $('mtp').value = String(!!r.mtp);
-  const tb = $('options');
-  const shShort = sh => sh === 'kv,idx' ? 'indexer + KV' : sh === 'idx' ? 'indexer' : '—';
-  tb.innerHTML = '<tr><th>context</th><th>KV</th><th>state in RAM</th><th>VRAM tier</th><th>experts in VRAM</th><th>from VRAM</th><th>decode, chat</th><th>decode, long document</th></tr>' +
-    r.options.map(o => `<tr data-ctx="${o.ctx}"><td>${kctx(o.ctx)}</td><td>${o.kv}</td><td>${shShort(o.state_host)}${o.state_host_gb ? ' (' + o.state_host_gb + ' GB)' : ''}</td><td>${o.tier_gb > 0 ? o.tier_gb + ' GB' : 'none'}</td><td>${o.tier_gb > 0 ? o.blocks : '—'}</td><td>${(o.vram_served*100).toFixed(0)}%</td><td>${fmt(o.tok_s_short)} tok/s</td><td>${fmt(o.tok_s_long_doc)} tok/s</td></tr>`).join('');
-  tb.querySelectorAll('tr[data-ctx]').forEach(tr => tr.onclick = () => { presetId = 'custom'; renderPresets(); applyOption(r.options.find(o => o.ctx === +tr.dataset.ctx)); });
-  renderPresets();
-  applyOption(r.options.find(o => o.ctx === r.ctx) || r.options[r.options.length - 1]);
+  const e = r.estimates;
+  $('est').innerHTML = `<span>VRAM expert tier <b>${e.vram_tier_gb > 0 ? e.vram_tier_gb + ' GB' : 'none'}</b> (~${e.vram_tier_blocks} blocks, ${(e.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>prefill batch <b>${r.batch}</b>${e.prefill_tps_long ? ` (~${e.prefill_tps_long} tok/s on a long document; lends ${e.lend_gb} GB of the tier while a prompt streams)` : ''}</span><span>KV + state <b>${e.state_vram_gb} GB</b> in VRAM${e.state_host_gb ? ` + <b>${e.state_host_gb} GB</b> in RAM` : ''}</span><span>dense core <b>${e.dense_core_gb} GB</b></span>${r.vision ? `<span>vision projector <b>${e.mmproj_gb} GB</b> in RAM, on the CPU</span>` : ''}<span>predicted decode <b>${fmt(e.decode_tps_short)}</b> tok/s in chat, <b>${fmt(e.decode_tps_long_doc)}</b> on a long document</span>`;
+  $('delcustom').hidden = !r.custom_saved;
 }
-$('ctx').onchange = () => { presetId = 'custom'; renderPresets(); const o = currentOption(); if (o) applyOption(o); else renderPlan(); };
-['kv','ram','threads','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { if (k === 'kv') { presetId = 'custom'; renderPresets(); } renderPlan(); }));
-$('vision').onchange = () => { visionChoice = $('vision').value === 'true'; loadReco(); };
-$('state_host').onchange = () => { stateChoice = $('state_host').value; loadReco(); };
+async function loadReco() {
+  if (!selected) { reco = null; $('presets').innerHTML = ''; $('plan').textContent = ''; return; }
+  const qs = new URLSearchParams({ model: selected, preset: presetId === 'custom' && customDirty ? 'coding' : presetId });
+  if (visionChoice !== null) qs.set('vision', visionChoice ? '1' : '0');
+  if (stateChoice !== null) qs.set('state_host', stateChoice);
+  if (kvChoice !== null) qs.set('kv', kvChoice);
+  if (ctxChoice !== null) qs.set('ctx', ctxChoice);
+  const r = await api('/api/recommend?' + qs.toString()); if (r.error) return; reco = r;
+  if (!(presetId === 'custom' && customDirty)) presetId = r.preset;
+  const keep = presetId === 'custom' && customDirty ? { ram: $('ram').value, threads: $('threads').value, batch: $('batch').value, reserve: $('reserve').value, port: $('port').value, think: $('think').value, think_budget: $('think_budget').value, skip_miss: $('skip_miss').value, spec_block: $('spec_block').value, mtp: $('mtp').value } : null;
+  fillForm(r);
+  if (keep) { Object.keys(keep).forEach(k => { if (!['ram','threads','batch','reserve'].includes(k) || !['ctx','kv','state_host','vision'].includes(lastChanged)) $(k).value = keep[k]; }); }
+  models.forEach(m => m.tuned_date = (r.tune && r.tune.model === m.name) ? r.tune.date : m.tuned_date);
+  renderPresets(); renderPlan(); renderDrive(); renderModels();
+  if (r.tune && !TUNE_SEEN) { TUNE_SEEN = true; renderTune({ running: false, result: r.tune, log: [] }); }
+}
+let lastChanged = '';
+function markCustom(k) { lastChanged = k; presetId = 'custom'; customDirty = true; }
+$('ctx').onchange = () => { markCustom('ctx'); ctxChoice = +$('ctx').value; loadReco(); };
+$('kv').onchange = () => { markCustom('kv'); kvChoice = $('kv').value; ctxChoice = +$('ctx').value; loadReco(); };
+$('vision').onchange = () => { markCustom('vision'); visionChoice = $('vision').value === 'true'; ctxChoice = +$('ctx').value; loadReco(); };
+$('state_host').onchange = () => { markCustom('state_host'); stateChoice = $('state_host').value; ctxChoice = +$('ctx').value; loadReco(); };
+['ram','threads','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { markCustom(k); renderPresets(); renderPlan(); }));
+$('headroom').onchange = async () => { const r = await post('/api/config', { headroom_gb: +$('headroom').value }); if (r.error) { $('custommsg').textContent = r.error; return; } $('custommsg').textContent = 'headroom ' + r.headroom_gb + ' GB saved for this machine'; if (!customDirty) { visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; } await loadReco(); };
 function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, threads: +$('threads').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
            spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true',
            state_host: $('state_host').value, preset: presetId };
 }
+$('savecustom').onclick = async () => {
+  const m = models.find(x => x.path === selected); if (!m) return;
+  const r = await post('/api/custom', { model: m.name, settings: settings() });
+  $('custommsg').textContent = r.error || 'saved as the Custom tier for ' + m.name; customDirty = false; presetId = 'custom';
+  visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; await loadReco();
+};
+$('delcustom').onclick = async () => {
+  const m = models.find(x => x.path === selected); if (!m) return;
+  await post('/api/custom', { model: m.name, delete: true }); $('custommsg').textContent = 'custom tier deleted'; customDirty = false; presetId = 'coding'; await loadReco();
+};
 $('start').onclick = async () => {
-  $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true;
-  const r = await api('/api/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ model: selected, settings: settings() }) });
-  if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; $('start').disabled = false; }
-  else { $('msg').textContent = 'started, loading the model…'; hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }; }
+  $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true; $('tune').disabled = true;
+  const r = await post('/api/start', { model: selected, settings: settings() });
+  if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; $('start').disabled = false; $('tune').disabled = false; }
+  else { $('msg').textContent = 'started, loading the model…' + (r.note ? ' (' + r.note + ')' : ''); hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }; }
   poll();
 };
-$('stop').onclick = async () => { $('msg').textContent = 'stopping…'; $('msg').className = 'muted'; await api('/api/stop', { method: 'POST' }); poll(); };
-$('reco').onclick = () => { visionChoice = null; stateChoice = null; presetId = 'coding'; loadReco(); };
+$('stop').onclick = async () => { $('msg').textContent = 'stopping…'; $('msg').className = 'muted'; await post('/api/stop'); poll(); };
+$('reco').onclick = () => { visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; customDirty = false; presetId = 'coding'; loadReco(); };
 $('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('endpoint').textContent);
 
-// ---- self-test: the chosen model on this hardware, through the server ----
+// ---- auto-tune ----
+let tuneTimer = null, TUNE_SEEN = false;
+$('tune').onclick = async () => {
+  $('msg').textContent = ''; $('msg').className = 'muted';
+  const r = await post('/api/tune', { model: selected, preset: presetId, settings: presetId === 'custom' ? settings() : null });
+  if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; return; }
+  $('tunebox').hidden = false; $('tune_result').innerHTML = ''; $('tune_sweep').innerHTML = ''; $('tune_notes').textContent = ''; $('tune_verdict').textContent = ''; $('tune_steps').textContent = 'starting…';
+  hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 };
+  pollTune();
+};
+$('tunecancel').onclick = () => post('/api/tune/cancel');
+async function pollTune() {
+  const t = await api('/api/tune');
+  renderTune(t);
+  clearTimeout(tuneTimer);
+  if (t.running) { tuneTimer = setTimeout(pollTune, 1500); }
+  else { tuneTimer = null; await loadReco(); poll(); }
+}
+function renderTune(t) {
+  const running = t.running;
+  $('tunecancel').hidden = !running;
+  if (!t.result && !running && !t.error) { $('tunebox').hidden = true; return; }
+  $('tunebox').hidden = false;
+  $('tunebar').querySelector('i').style.width = ((running ? (t.progress || 0) : 1) * 100).toFixed(0) + '%';
+  $('tunebar').hidden = !running && !t.error;
+  $('tune_steps').textContent = (t.log || []).join('\n'); $('tune_steps').hidden = !running && !t.error && !(t.log || []).length;
+  if (t.error) { $('tune_sub').textContent = ''; $('tune_verdict').textContent = t.error; $('tune_verdict').className = 'verdict bad'; if (!running) { $('tune_result').innerHTML = ''; return; } }
+  const r = t.result; if (!r || running) { if (running) { $('tune_sub').textContent = '— running: ' + (t.step || ''); $('tune_verdict').textContent = ''; $('tune_result').innerHTML = ''; $('tune_sweep').innerHTML = ''; } return; }
+  const tier = reco && reco.tiers.find(p => p.id === r.preset);
+  $('tune_sub').textContent = `— ${r.model} · ${tier ? tier.label + ', ' : ''}${kctx(r.plan.ctx)} context · ${r.date} · ${secs(r.elapsed_s)}`;
+  const v = r.verify || {}, nv = r.nvme, d = r.drive || {};
+  $('tune_result').innerHTML = `
+    <div><span>drive</span><b>${nv ? fmt(nv.gbs) + ' GB/s' : '—'}</b><span>${d.model || d.disk || 'random 2 MiB reads'}${d.rotational ? ' · spinning' : ''}</span><small>${nv ? 'reference NVMe 7.0' : 'not measured'}</small></div>
+    <div><span>threads</span><b>${r.threads}</b><span>of ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.sweep ? 'swept live on the server' : 'physical cores'}</small></div>
+    <div><span>KV cache</span><b>${r.plan.kv}</b><span>${r.plan.state_host !== 'none' ? 'state in RAM (' + r.plan.state_host + ')' : 'state in VRAM'}</span><small>${(r.kv_reason || '').split(':')[0]}</small></div>
+    <div><span>tiers</span><b>${r.built && r.built.vram_tier_gb !== undefined ? fmt(r.built.vram_tier_gb) + ' + ' + fmt(r.built.ram_tier_gb, 0) + ' GB' : r.plan.ram + ' GB RAM'}</b><span>VRAM + RAM expert tiers</span><small>batch ${r.plan.batch} · reserve ${r.plan.reserve} MB</small></div>
+    <div><span>chat, decode</span><b>${fmt(v.chat_tps)}</b><span>tok/s</span><small>predicted ${fmt(v.predicted_chat)}</small></div>
+    <div><span>document, prefill</span><b>${fmt(v.doc_prefill_tps, 0)}</b><span>tok/s</span><small>${commas(v.doc_tokens)} tokens in ${secs(v.doc_prefill_s)}</small></div>
+    <div><span>document, decode</span><b>${fmt(v.doc_tps)}</b><span>tok/s at ${kctx(v.doc_tokens || 0)}</span><small>predicted ${fmt(v.predicted_doc)}</small></div>
+    <div><span>grounded answer</span><b class="${v.found ? 'okc' : 'err'}">${v.found ? 'yes' : 'no'}</b><span>${v.found ? 'quoted the planted passphrase' : 'did not quote the passphrase'}</span></div>
+    <div><span>memory, worst point</span><b>${fmt(r.mem_min_gb)} GB</b><span>free with the first tier</span><small>${r.memory ? 'server needs ' + fmt(r.memory.host_other_gb) + ' GB besides the tier' : ''}</small></div>
+    <div><span>RAM tier</span><b>${r.memory && r.memory.after_resize ? fmt(r.memory.after_resize.ram_tier_gb) + ' GB' : fmt((r.built || {}).ram_tier_gb || r.plan.ram) + ' GB'}</b><span>${r.memory && r.memory.after_resize ? 're-sized from ' + fmt(r.memory.ram_tier_gb) + ' GB' : 'as planned'}</span><small>${r.memory && r.memory.after_resize ? fmt(r.memory.after_resize.min_free_gb) + ' GB free at the worst point after · chat ' + fmt(r.memory.after_resize.chat_tps) + ' tok/s' : (r.memory ? 'headroom ' + fmt(r.memory.headroom_gb) + ' GB' : '')}</small></div>`;
+  $('tune_sweep').innerHTML = r.sweep ? 'thread sweep: ' + r.sweep.map(s => `<span>${s.threads}: <b>${fmt(s.tok_s)}</b></span>`).join('') : '';
+  $('tune_notes').innerHTML = (r.notes || []).map(n => '• ' + n).join('<br>');
+  const ratio = Math.min(v.predicted_doc ? v.doc_tps / v.predicted_doc : 1, v.predicted_chat ? v.chat_tps / v.predicted_chat : 1);
+  let verdict, cls = 'ok';
+  if (!v.found) { verdict = 'The answer did not quote the passphrase: the model did not read the document correctly on this setup. Check the Log tab.'; cls = 'bad'; }
+  else if (ratio >= 0.85) verdict = `Tuned. The server is running with these flags; the tier card now shows the measured numbers, and the saved thread count and drive rate size every tier for this model from now on.`;
+  else { verdict = `Tuned, but decode came out ${Math.round((1 - ratio) * 100)}% under the cost model's prediction: a busy desktop, less free RAM, or a slower drive than assumed. The measured numbers are what the tier card shows now.`; cls = 'warn'; }
+  $('tune_verdict').textContent = verdict; $('tune_verdict').className = 'verdict ' + cls;
+}
+
+// ---- self-test ----
 let stTimer = null;
 $('selftest').onclick = async () => {
   $('msg').textContent = ''; $('msg').className = 'muted';
-  const r = await api('/api/selftest', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ model: selected, settings: settings() }) });
+  const r = await post('/api/selftest', { model: selected, settings: settings() });
   if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; return; }
   $('st').hidden = false; $('st_result').innerHTML = ''; $('st_verdict').textContent = ''; $('st_steps').textContent = 'starting…';
   pollSelftest();
@@ -326,114 +499,161 @@ async function pollSelftest() {
   renderSelftest(t);
   clearTimeout(stTimer);
   if (t.running) { stTimer = setTimeout(pollSelftest, 2000); if (!lastStatus || lastStatus.state !== 'ready') poll(); }
-  else poll();
+  else { stTimer = null; poll(); }
 }
 function renderSelftest(t) {
   const running = t.running;
-  $('selftest').disabled = running; $('start').disabled = running || (lastStatus && ['loading','ready','busy'].includes(lastStatus.state)); $('stop').disabled = running || !(lastStatus && ['loading','ready','busy'].includes(lastStatus.state));
   if (!t.result && !running && !t.error) { $('st').hidden = true; return; }
   $('st').hidden = false;
   $('st_steps').textContent = running || t.error ? (t.log || []).join('\n') : '';
   $('st_steps').hidden = !running && !t.error;
   if (t.error) { $('st_sub').textContent = ''; $('st_result').innerHTML = ''; $('st_verdict').textContent = t.error; $('st_verdict').className = 'verdict bad'; if (!running) return; }
   const r = t.result; if (!r || running) { if (running) { $('st_sub').textContent = '— running'; $('st_verdict').textContent = ''; $('st_result').innerHTML = ''; } return; }
-  const pl = reco && reco.presets.find(p => p.id === r.preset);
+  const pl = reco && reco.tiers.find(p => p.id === r.preset);
   $('st_sub').textContent = `— ${r.model} · ${pl ? pl.label + ', ' : ''}${kctx(r.ctx)} context · ${r.date}`;
   const d = r.doc, c = r.chat, p = r.predicted || {};
   $('st_result').innerHTML = `
     <div><span>chat, decode</span><b>${fmt(c.tok_s)}</b><span>tok/s</span><small>predicted ${fmt(p.chat)} · ${c.n} tokens</small></div>
-    <div><span>document, prefill</span><b>${fmt(d.prefill_tok_s, 0)}</b><span>tok/s</span><small>${commas(d.tokens)} tokens in ${d.prefill_s} s</small></div>
+    <div><span>document, prefill</span><b>${fmt(d.prefill_tok_s, 0)}</b><span>tok/s</span><small>${commas(d.tokens)} tokens in ${secs(d.prefill_s)}</small></div>
     <div><span>document, decode</span><b>${fmt(d.tok_s)}</b><span>tok/s at ${kctx(d.tokens)} of context</span><small>predicted ${fmt(p.doc)}</small></div>
-    <div><span>grounded answer</span><b style="color:${d.found ? 'var(--ok)' : 'var(--bad)'}">${d.found ? 'yes' : 'no'}</b><span>${d.found ? 'found the passphrase planted in the document' : 'did not quote the planted passphrase'}</span></div>
+    <div><span>grounded answer</span><b class="${d.found ? 'okc' : 'err'}">${d.found ? 'yes' : 'no'}</b><span>${d.found ? 'found the passphrase planted in the document' : 'did not quote the planted passphrase'}</span></div>
     <div><span>expert cache</span><b>${(r.cache.hit*100).toFixed(0)}% · ${(r.cache.vram_served*100).toFixed(0)}%</b><span>hit · from VRAM</span><small>predicted ${(p.vram_served*100).toFixed(0)}% from VRAM</small></div>
     <div><span>VRAM in use</span><b>${fmt(r.vram_used_gb)} / ${fmt(r.vram_total_gb, 0)} GB</b><span>${r.ram_available_gb} GB of RAM still free</span></div>`;
   const ratio = p.doc ? d.tok_s / p.doc : 1, ratioC = p.chat ? c.tok_s / p.chat : 1;
   let v, cls = 'ok';
   if (!d.found) { v = 'The answer did not quote the passphrase: the model did not read the document correctly on this setup. Check the Log tab and try a smaller context.'; cls = 'bad'; }
   else if (Math.min(ratio, ratioC) >= 0.9) v = `This machine runs ${r.model} at these settings as predicted${Math.max(ratio, ratioC) > 1.15 ? ', faster than the estimate' : ''}. The server is still running: point your tools at the endpoint or use the Chat tab.`;
-  else if (Math.min(ratio, ratioC) >= 0.7) { v = `A little below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% on the slower of the two). A busy desktop, a slower NVMe or less free RAM than the estimate assumed do this; the server is still running.`; cls = 'warn'; }
-  else { v = `Well below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% slower): check that nothing else is using the GPU or the NVMe, that the model files are on an NVMe, and that the RAM tier fitted (Log tab).`; cls = 'bad'; }
+  else if (Math.min(ratio, ratioC) >= 0.7) { v = `A little below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% on the slower of the two). A busy desktop, a slower NVMe or less free RAM than the estimate assumed do this; run Auto-tune to measure and adapt. The server is still running.`; cls = 'warn'; }
+  else { v = `Well below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% slower): check that nothing else is using the GPU or the NVMe, that the model files are on an NVMe, and that the RAM tier fitted (Log tab). Auto-tune measures the drive and adapts the flags.`; cls = 'bad'; }
   $('st_verdict').textContent = v; $('st_verdict').className = 'verdict ' + cls;
 }
 
+// ---- status (every 5 s) and the live counters (every second) ----
 function setLocked(s) {
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
-  $('settingsbox').classList.toggle('locked', running); $('models').classList.toggle('locked', running);
-  $('lockhint').hidden = !running;
-  $('start').disabled = running || s.selftest_running; $('stop').disabled = !running || s.selftest_running; $('selftest').disabled = !!s.selftest_running;
-  if (!running && $('msg').textContent === 'started, loading the model…') $('msg').textContent = '';
+  const jobs = !!s.selftest_running || !!(s.tune && s.tune.running);
+  $('settingsbox').classList.toggle('locked', running || jobs); $('settingsbox2').classList.toggle('locked', running || jobs); $('models').classList.toggle('locked', running || jobs);
+  $('lockhint').hidden = !running || jobs;
+  $('start').disabled = running || jobs; $('stop').disabled = !running || jobs; $('selftest').disabled = jobs; $('tune').disabled = jobs;
+  $('tune').textContent = running ? 'Auto-tune (restarts the server)' : 'Auto-tune & start';
+  if (!running && $('msg').textContent.startsWith('started, loading')) $('msg').textContent = '';
   const b = $('banner');
-  if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
+  if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined && s.exit_code !== null ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
   const st = s.settings || {}, p = s.props || {};
-  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.state_host && st.state_host !== 'none' ? `--state-host ${st.state_host}` : '', st.mtp ? '--mtp (draft head)' : '', st.vision ? '--mmproj (vision, staged per image)' : ''].filter(Boolean)
-                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.state_host && p.state_host !== 'none' ? `state-host ${p.state_host}` : '', p.mtp ? 'mtp' : '', p.vision ? (p.vision_weights === 'host' ? 'vision (staged per image)' : 'vision') : ''].filter(Boolean);
+  const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--threads ${p.n_threads || st.threads}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.state_host && st.state_host !== 'none' ? `--state-host ${st.state_host}` : '', st.mtp ? '--mtp (draft head)' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
+                        : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.kv_type ? `kv ${p.kv_type}` : '', p.n_threads ? `threads ${p.n_threads}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.state_host && p.state_host !== 'none' ? `state-host ${p.state_host}` : '', p.mtp ? 'mtp' : '', p.vision ? 'vision' : ''].filter(Boolean);
+  const tb = s.tiers_built || {};
   b.className = 'banner';
-  b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}</span></span>
+  b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}${st.preset ? ' · ' + (({chat:'Chat', coding:'Agentic coding', coding_plus:'Agentic coding+', custom:'Custom'})[st.preset] || st.preset) + ' tier' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}${tb.vram_tier_gb !== undefined ? ' · expert tiers ' + fmt(tb.vram_tier_gb) + ' GB VRAM + ' + fmt(tb.ram_tier_gb, 0) + ' GB RAM' : ''}</span></span>
     <span class="flags">${flags.map(f => `<span>${f}</span>`).join('')}</span>
     <span class="muted" style="margin-left:auto;font-family:var(--mono);font-size:12.5px">${s.endpoint}</span>`;
 }
 
 function drawChart() {
-  const c = $('chart'), g = c.getContext('2d'); g.clearRect(0,0,c.width,c.height);
+  const c = $('chart'), g = c.getContext('2d'); g.clearRect(0, 0, c.width, c.height);
   if (hist.length < 2) return;
-  const max = Math.max(5, ...hist, peak.tps), w = c.width / 59, h = c.height - 8;
-  g.strokeStyle = '#2b3340'; g.beginPath(); g.moveTo(0, 4 + h - (peak.tps / max) * h); g.lineTo(c.width, 4 + h - (peak.tps / max) * h); g.stroke();
+  const N = 300, w = c.width / (N - 1), h = c.height - 16, top = 4;
+  const maxT = Math.max(5, peak.tps, ...hist.map(x => x.tps)), maxP = Math.max(50, ...hist.map(x => x.ptps));
+  g.strokeStyle = '#2b3340'; g.beginPath(); g.moveTo(0, top + h - (peak.tps / maxT) * h); g.lineTo(c.width, top + h - (peak.tps / maxT) * h); g.stroke();
+  g.strokeStyle = '#f6c453'; g.lineWidth = 1.5; g.beginPath(); let started = false;
+  hist.forEach((v, i) => { const x = c.width - (hist.length - 1 - i) * w, y = top + h - (v.ptps / maxP) * h; if (v.ptps > 0) { started ? g.lineTo(x, y) : g.moveTo(x, y); started = true; } else started = false; });
+  g.stroke();
   g.strokeStyle = '#6ee7b7'; g.lineWidth = 2; g.beginPath();
-  hist.forEach((v, i) => { const x = c.width - (hist.length - 1 - i) * w, y = 4 + h - (v / max) * h; i ? g.lineTo(x, y) : g.moveTo(x, y); });
-  g.stroke(); g.fillStyle = '#8b95a3'; g.font = '12px system-ui'; g.fillText(max.toFixed(0) + ' tok/s', 6, 14);
+  hist.forEach((v, i) => { const x = c.width - (hist.length - 1 - i) * w, y = top + h - (v.tps / maxT) * h; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.stroke(); g.fillStyle = '#8b95a3'; g.font = '12px system-ui'; g.fillText(maxT.toFixed(0) + ' tok/s', 6, 14); g.textAlign = 'right'; g.fillText(maxP.toFixed(0) + ' tok/s prefill', c.width - 6, 14); g.textAlign = 'left';
+}
+function renderLive(s) {
+  lastLive = s;
+  $('dot').className = 'dot ' + s.state; $('state').textContent = s.state + (s.external ? ' (external)' : '');
+  $('uptime').textContent = s.uptime_s ? 'up ' + secs(s.uptime_s) : '';
+  $('endpoint').textContent = s.endpoint; $('ep2').textContent = s.endpoint;
+  const chatable = s.state === 'ready' || s.state === 'busy';
+  $('send').disabled = !chatable || chatting || !!s.selftest_running || !!(s.tune && s.tune.running); const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
+  const st = s.stats;
+  const lp = $('livepill');
+  if (!st) { lp.hidden = true; $('nowstate').textContent = s.state === 'loading' ? 'loading the model' : 'no server'; $('nownote').textContent = ''; $('pbar').hidden = true; hist.push({ tps: 0, ptps: 0 }); if (hist.length > 300) hist.shift(); drawChart(); return; }
+  const g = st.generation, p = st.prompt, t = st.totals, c = st.expert_cache, L = st.last, sp = st.speculative || {};
+  const prefilling = !!(st.busy && p.prefilling), generating = st.busy && !p.prefilling;
+  const nowTps = generating ? g.tokens_per_second : 0, nowP = prefilling ? p.tokens_per_second : 0;
+  if (g.tokens_per_second > peak.tps && generating) peak.tps = g.tokens_per_second;
+  if (p.tokens_per_second > peak.ptps) peak.ptps = p.tokens_per_second;
+  if (st.context.n_past > peak.ctx) peak.ctx = st.context.n_past;
+  if (c.hit_rate > peak.hit) peak.hit = c.hit_rate;
+  // the header pill and the Now block
+  lp.hidden = !st.busy;
+  const left = prefilling && p.tokens_per_second > 0 ? (p.n - p.done) / p.tokens_per_second : null;
+  lp.textContent = prefilling ? `prefilling ${commas(p.done)} / ${commas(p.n)} · ${fmt(p.tokens_per_second, 0)} tok/s` : generating ? `generating ${commas(g.n)} tok · ${fmt(g.tokens_per_second)} tok/s` : '';
+  $('nowstate').textContent = prefilling ? 'prefilling' : generating ? 'generating' : 'idle';
+  $('nownote').textContent = prefilling ? `${commas(p.done)} of ${commas(p.n)} new prompt tokens read, ${fmt(p.ms/1000, 0)} s so far${left !== null ? ', about ' + secs(left) + ' left' : ''}${p.cached ? ' · ' + commas(p.cached) + ' tokens reused from the previous turn' : ''}` : generating ? `${commas(g.n)} tokens in ${secs(g.ms/1000)}` : (L ? 'last request finished ' + secs(Math.max(0, Date.now()/1000 - L.completed_at)) + ' ago' : 'no request yet');
+  $('tps').textContent = generating ? fmt(g.tokens_per_second) : (L ? fmt(L.tokens_per_second) : '—'); $('tpsnote').textContent = generating ? 'tok/s, generating now' : 'tok/s, last request';
+  $('tps2').textContent = `peak ${fmt(peak.tps)} · session average ${fmt(t.generated_tokens_per_second)}`;
+  $('ptps').textContent = prefilling ? fmt(p.tokens_per_second, 0) : (L ? fmt(L.prompt_tokens_per_second, 0) : '—'); $('ptpsnote').textContent = prefilling ? 'tok/s, reading the prompt now' : 'tok/s, last request';
+  $('pbar').hidden = !prefilling; if (prefilling) $('pbar').querySelector('i').style.width = (p.n ? Math.min(100, 100 * p.done / p.n) : 0).toFixed(1) + '%';
+  $('ptps2').textContent = prefilling ? `${commas(p.done)} / ${commas(p.n)} tokens · ${secs(p.ms/1000)}${left !== null ? ' · ~' + secs(left) + ' left' : ''}` : `peak ${fmt(peak.ptps, 0)} · session average ${fmt(t.prompt_tokens_per_second, 0)}`;
+  const cur = st.busy ? p : (L ? { input: L.input_tokens, cached: L.cached_tokens, n: L.prompt_tokens } : null);
+  $('cur_in').textContent = cur ? commas(cur.input) : '—'; $('cur_in2').textContent = cur ? (st.busy ? 'the request running now' : 'the last request') : '';
+  $('cur_cached').textContent = cur ? commas(cur.cached) : '—'; $('cur_cached2').textContent = cur && cur.input ? (100 * cur.cached / cur.input).toFixed(0) + '% of the input' : '';
+  $('cur_out').textContent = st.busy ? commas(g.n) : (L ? commas(L.generated_tokens) : '—'); $('cur_outnote').textContent = st.busy ? 'so far' : 'last request'; $('cur_out2').textContent = st.busy ? (prefilling ? 'waiting for the prefill' : secs(g.ms/1000)) : (L ? secs(L.generation_ms/1000) : '');
+  // the last completed request
+  if (L) {
+    $('lastsub').textContent = '— finished ' + new Date(L.completed_at * 1000).toLocaleTimeString();
+    $('l_in').textContent = commas(L.input_tokens); $('l_cached').textContent = commas(L.cached_tokens); $('l_cachednote').textContent = L.input_tokens ? (100 * L.cached_tokens / L.input_tokens).toFixed(0) + '% of the input, not re-read' : 'reused, not re-read';
+    $('l_new').textContent = commas(L.prompt_tokens); $('l_newnote').textContent = L.prompt_tokens ? 'new tokens read in ' + secs(L.prompt_ms/1000) : 'nothing new to read';
+    $('l_out').textContent = commas(L.generated_tokens); $('l_outnote').textContent = 'in ' + secs(L.generation_ms/1000);
+    $('l_ptps').textContent = L.prompt_tokens ? fmt(L.prompt_tokens_per_second, 0) : '—'; $('l_ptps2').textContent = L.prompt_tokens ? `${commas(L.prompt_tokens)} tokens, ${secs(L.prompt_ms/1000)}` : 'prefix reused';
+    $('l_tps').textContent = fmt(L.tokens_per_second); $('l_tps2').textContent = L.speculative && L.speculative.pairs ? `${L.speculative.accepted} of ${L.speculative.drafted} drafts accepted` : '';
+    $('l_finish').textContent = L.finish_reason || '—'; $('l_finishnote').textContent = L.finish_reason === 'length' ? 'hit max_tokens' : L.finish_reason === 'tool_calls' ? 'the model called a tool' : L.finish_reason === 'stop' ? 'the model ended its turn' : '';
+  } else { $('lastsub').textContent = '— none yet'; }
+  // the session
+  $('reqs').textContent = t.requests; $('reqsnote').textContent = t.requests ? 'avg ' + big(Math.round(t.generated_tokens / t.requests)) + ' output per request' : 'since start';
+  $('t_in').textContent = big(t.input_tokens); $('t_innote').textContent = commas(t.input_tokens) + ' tokens';
+  $('t_cached').textContent = big(t.cached_tokens); $('t_cachednote').textContent = t.input_tokens ? (100 * t.cached_tokens / t.input_tokens).toFixed(0) + '% of the input reused' : '';
+  $('t_out').textContent = big(t.generated_tokens); $('t_outnote').textContent = commas(t.generated_tokens) + ' tokens in ' + secs(t.generation_seconds);
+  $('t_tps').textContent = fmt(t.generated_tokens_per_second); $('t_tps2').textContent = 'peak ' + fmt(peak.tps);
+  $('t_ptps').textContent = fmt(t.prompt_tokens_per_second, 0); $('t_ptps2').textContent = commas(t.prompt_tokens) + ' tokens read in ' + secs(t.prompt_seconds);
+  $('ctxuse').textContent = big(st.context.n_past); $('ctxnote').textContent = 'of ' + big(st.context.n_ctx) + ' (' + (100 * st.context.n_past / Math.max(1, st.context.n_ctx)).toFixed(0) + '%)'; $('ctx2').textContent = 'highest reached ' + big(peak.ctx);
+  $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'best hit ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' GB read from the drive';
+  $('spec').textContent = sp.drafted ? (sp.acceptance*100).toFixed(0) + '%' : (lastStatus && lastStatus.props && lastStatus.props.mtp ? '—' : 'off'); $('specnote').textContent = sp.drafted ? 'of drafts accepted' : ''; $('spec2').textContent = sp.pairs ? `${commas(sp.pairs)} verify steps · ${fmt(sp.tokens_per_step, 2)} tokens per step` : '';
+  $('thr').textContent = st.threads || '—';
+  hist.push({ tps: nowTps, ptps: nowP }); if (hist.length > 300) hist.shift(); drawChart(); $('chartnote').textContent = 'grey line: peak ' + fmt(peak.tps) + ' tok/s';
+  if (chatting && chatWaiting) chatWaiting(st);
+}
+async function pollLive() {
+  let s; try { s = await api('/api/live'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
+  renderLive(s);
+  if (s.tune && s.tune.running && !tuneTimer) pollTune();
+  if (s.selftest_running && !stTimer) pollSelftest();
 }
 async function poll() {
   let s; try { s = await api('/api/status'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
   lastStatus = s;
-  $('dot').className = 'dot ' + s.state; $('state').textContent = s.state + (s.external ? ' (external)' : '');
-  $('uptime').textContent = s.uptime_s ? 'up ' + (s.uptime_s >= 3600 ? Math.floor(s.uptime_s/3600) + ' h ' : '') + Math.floor((s.uptime_s % 3600)/60) + ' min' : '';
-  $('endpoint').textContent = s.endpoint; $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : '';
+  $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : ''; $('ep3').textContent = s.model_id || 'any';
   setLocked(s);
   // While a server runs, the cards and the settings show what is being served.
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
-  if (running && s.model && models.length) {
-    const i = models.findIndex(m => m.name === s.model);
+  if (running && models.length) {
+    const m = models.find(x => x.path === s.model_path) || models.find(x => x.name === s.model);
     let reload = false;
-    if (s.settings && s.settings.preset && s.settings.preset !== presetId) { presetId = s.settings.preset; reload = true; }
-    if (i >= 0 && i !== selected) { selected = i; renderModels(); reload = true; }
-    if (reload) await loadReco();   // the running preset's own options (its context, and its vision choice)
+    if (s.settings && s.settings.preset && s.settings.preset !== presetId) { presetId = s.settings.preset; customDirty = false; reload = true; }
+    if (m && m.path !== selected) { selected = m.path; renderModels(); reload = true; }
+    if (reload) await loadReco();
     if (s.settings) { ['ctx','kv','ram','threads','batch','reserve','port','think','think_budget'].forEach(k => { if (s.settings[k] !== undefined) $(k).value = s.settings[k]; }); $('skip_miss').value = String(!!s.settings.skip_miss); $('spec_block').value = String(s.settings.spec_block !== false); $('vision').value = String(!!s.settings.vision); $('mtp').value = String(!!s.settings.mtp); $('state_host').value = s.settings.state_host || 'none'; renderPlan(); }
   }
-  if (s.selftest_running && !stTimer) pollSelftest();
-  const chatable = s.state === 'ready' || s.state === 'busy';
-  $('send').disabled = !chatable || chatting || !!s.selftest_running; const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
-  const st = s.stats;
-  if (st) {
-    const g = st.generation, p = st.prompt, t = st.totals, c = st.expert_cache;
-    const now = st.busy ? g.tokens_per_second : 0;
-    if (g.tokens_per_second > peak.tps) peak.tps = g.tokens_per_second;
-    if (p.tokens_per_second > peak.ptps) peak.ptps = p.tokens_per_second;
-    if (st.context.n_past > peak.ctx) peak.ctx = st.context.n_past;
-    if (c.hit_rate > peak.hit) peak.hit = c.hit_rate;
-    $('tps').textContent = st.busy ? fmt(g.tokens_per_second) : (g.n ? fmt(g.tokens_per_second) : '—'); $('tpsnote').textContent = st.busy ? 'tok/s, generating now' : 'tok/s, last request';
-    $('tps2').textContent = `peak ${fmt(peak.tps)} · session avg ${fmt(t.generated_tokens_per_second)}`;
-    $('ptps').textContent = fmt(p.tokens_per_second, 0); $('ptps2').textContent = `peak ${fmt(peak.ptps, 0)} · session avg ${fmt(t.prompt_tokens_per_second, 0)}`;
-    $('served').textContent = big(t.generated_tokens + t.prompt_tokens); $('servednote').textContent = big(t.generated_tokens) + ' generated · ' + big(t.prompt_tokens) + ' prompt';
-    $('reqs').textContent = t.requests; $('reqsnote').textContent = t.requests ? 'avg ' + big(Math.round(t.generated_tokens / t.requests)) + ' generated per request' : 'since start';
-    $('ctxuse').textContent = big(st.context.n_past); $('ctxnote').textContent = 'of ' + big(st.context.n_ctx); $('ctx2').textContent = 'highest reached ' + big(peak.ctx);
-    $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'best hit ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' GB read from NVMe' + (st.speculative && st.speculative.pairs ? ' · drafts ' + (st.speculative.acceptance*100).toFixed(0) + '% accepted (' + st.speculative.pairs + ' pairs)' : '');
-    $('cur').textContent = st.busy ? big(g.n) + ' tok' : '—'; $('curnote').textContent = st.busy ? 'so far, ' + fmt(g.ms/1000, 0) + ' s' : 'idle';
-    $('last').textContent = g.n && !st.busy ? big(g.n) + ' tok' : (g.n ? '…' : '—'); $('lastnote').textContent = g.n && !st.busy ? 'in ' + fmt(g.ms/1000, 1) + ' s after a ' + big(p.n) + '-token prompt' : '';
-    hist.push(now); if (hist.length > 60) hist.shift(); drawChart(); $('chartnote').textContent = 'grey line: peak ' + fmt(peak.tps) + ' tok/s';
-  }
+  renderLive(s);
   const lg = $('log'); const atBottom = lg.scrollHeight - lg.scrollTop - lg.clientHeight < 40;
   lg.textContent = (s.log || []).join('\n') || '—'; if (atBottom) lg.scrollTop = lg.scrollHeight;
 }
 
-let chatHistory = [], chatting = false, aborter = null;
+// ---- chat ----
+let chatHistory = [], chatting = false, aborter = null, chatWaiting = null;
 function addMsg(role, text) {
   const d = document.createElement('div'); d.className = 'msg ' + role;
   d.innerHTML = `<div class="who">${role}</div>${role === 'assistant' ? '<details hidden><summary>thinking</summary><div class="think"></div></details>' : ''}<div class="text"></div><div class="meta"></div>`;
   d.querySelector('.text').textContent = text || ''; $('msgs').appendChild(d); $('msgs').scrollTop = $('msgs').scrollHeight; return d;
 }
 async function send() {
-  const text = $('prompt').value.trim(); if (!text || chatting || !lastStatus) return;
-  const endpoint = lastStatus.endpoint; $('prompt').value = '';
+  const text = $('prompt').value.trim(); if (!text || chatting || !lastLive) return;
+  const endpoint = lastLive.endpoint; $('prompt').value = '';
   chatHistory.push({ role: 'user', content: text }); addMsg('user', text); const ce = $('chatempty'); if (ce) ce.hidden = true;
   const el = addMsg('assistant', ''); const think = el.querySelector('.think'), det = el.querySelector('details'), textEl = el.querySelector('.text'), meta = el.querySelector('.meta');
   const body = { messages: ($('c_system').value.trim() ? [{ role: 'system', content: $('c_system').value.trim() }] : []).concat(chatHistory), stream: true, timings_per_token: true };
@@ -443,6 +663,8 @@ async function send() {
   if ($('c_budget').value !== '') body.reasoning_budget = +$('c_budget').value;
   chatting = true; $('send').disabled = true; $('abort').disabled = false; aborter = new AbortController();
   let reasoning = '', content = '', timings = null, t0 = performance.now(), tFirst = 0;
+  meta.textContent = 'sending…';
+  chatWaiting = st => { if (tFirst) return; const p = st.prompt; if (st.busy && p.prefilling) meta.textContent = `reading the prompt: ${commas(p.done)} / ${commas(p.n)} new tokens · ${fmt(p.tokens_per_second, 0)} tok/s · ${secs(p.ms/1000)}${p.cached ? ' · ' + commas(p.cached) + ' reused' : ''}`; else if (st.busy) meta.textContent = 'thinking about the first token…'; };
   try {
     const r = await fetch(endpoint + '/chat/completions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body), signal: aborter.signal });
     if (!r.ok) { textEl.textContent = 'HTTP ' + r.status + ': ' + (await r.text()).slice(0, 400); textEl.classList.add('err'); throw new Error('http'); }
@@ -456,25 +678,27 @@ async function send() {
         let j; try { j = JSON.parse(line.slice(6)); } catch (e) { continue; }
         if (j.error) { textEl.textContent += '\n[error] ' + j.error.message; textEl.classList.add('err'); continue; }
         const ch = j.choices && j.choices[0]; if (!ch) continue;
-        if (!tFirst) tFirst = performance.now();
+        if (ch.delta && (ch.delta.reasoning_content || ch.delta.content || ch.delta.tool_calls) && !tFirst) tFirst = performance.now();
         if (ch.delta.reasoning_content) { reasoning += ch.delta.reasoning_content; det.hidden = false; det.open = !content; think.textContent = reasoning; think.scrollTop = think.scrollHeight; }
         if (ch.delta.content) { content += ch.delta.content; textEl.textContent = content; det.open = false; }
         if (ch.delta.tool_calls) { content += '\n[tool call] ' + JSON.stringify(ch.delta.tool_calls); textEl.textContent = content; }
-        if (j.timings) { timings = j.timings; meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens`; }
+        if (j.timings) { timings = j.timings; if (tFirst) meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens`; }
+        if (j.usage) timings = Object.assign(timings || {}, { usage: j.usage });
         $('msgs').scrollTop = $('msgs').scrollHeight;
       }
     }
     chatHistory.push({ role: 'assistant', content: content || '' });
     if (timings) {
-      $('c_tps').textContent = fmt(timings.predicted_per_second); $('c_ptps').textContent = fmt(timings.prompt_per_second, 0);
-      $('c_tok').textContent = timings.predicted_n; $('c_toknote').textContent = `reply (${timings.prompt_n} prompt)`; $('c_time').textContent = fmt(timings.predicted_ms/1000, 1);
-      meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens · prefill ${fmt(timings.prompt_per_second, 0)} tok/s · first token after ${fmt((tFirst - t0)/1000, 1)} s`;
+      const u = timings.usage || {};
+      $('c_tps').textContent = fmt(timings.predicted_per_second); $('c_ptps').textContent = timings.prompt_n ? fmt(timings.prompt_per_second, 0) : '—';
+      $('c_tok').textContent = timings.predicted_n; $('c_toknote').textContent = `reply · ${commas(u.prompt_tokens || timings.prompt_input_n)} input, ${commas(u.prompt_tokens_details ? u.prompt_tokens_details.cached_tokens : timings.prompt_cached_n)} cached`; $('c_time').textContent = fmt(timings.predicted_ms/1000, 1);
+      meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens · prompt ${commas(u.prompt_tokens || timings.prompt_input_n)} (${commas(timings.prompt_cached_n)} cached, ${commas(timings.prompt_n)} read at ${fmt(timings.prompt_per_second, 0)} tok/s) · first token after ${fmt((tFirst - t0)/1000, 1)} s`;
     }
   } catch (e) {
     if (e.name === 'AbortError') { meta.textContent = 'stopped'; chatHistory.push({ role: 'assistant', content: content || '' }); }
     else if (e.message !== 'http') { textEl.textContent = 'request failed: ' + e; textEl.classList.add('err'); }
   }
-  chatting = false; $('abort').disabled = true; $('send').disabled = false; poll();
+  chatting = false; chatWaiting = null; $('abort').disabled = true; $('send').disabled = false; poll();
 }
 $('send').onclick = send;
 $('prompt').addEventListener('keydown', e => { if ((e.key === 'Enter' || e.keyCode === 13) && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
@@ -483,7 +707,8 @@ $('clear').onclick = () => { chatHistory = []; $('msgs').innerHTML = '<div class
 
 (async () => { await loadModels(); await loadHw(); await loadReco(); await poll();
   try { const t = await api('/api/selftest'); renderSelftest(t); if (t.running) pollSelftest(); } catch (e) {}
-  setInterval(poll, 5000); pageReady = true; })();
+  try { const t = await api('/api/tune'); if (t.running) { $('tunebox').hidden = false; pollTune(); } } catch (e) {}
+  setInterval(poll, 5000); setInterval(pollLive, 1000); pageReady = true; })();
 </script>
 </body>
 </html>

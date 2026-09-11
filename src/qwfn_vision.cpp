@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 namespace qwfn {
 
@@ -118,11 +119,20 @@ ggml_tensor * vision_encoder::get(const std::string & name) const {
     return ggml_get_tensor(ctx_, name.c_str());
 }
 
+void vision_encoder::set_n_threads(int n) {
+    if (!backend_ || n <= 0) return;
+    // The CPU module is loaded dynamically, so its setter comes from the registry.
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_));
+    auto fn = reg ? (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads") : nullptr;
+    if (fn) fn(backend_, n);
+}
+
 bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
                           ggml_backend_buffer_type_t buft, std::string & err) {
     backend_ = backend;
     buft_    = buft;
     stage_   = false;
+    cpu_     = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
 
     // no_alloc: read metadata first, then place the tensors on the backend and
     // stream the data in. Loading into host memory first would cost 0.9 GB.
@@ -174,10 +184,28 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
     ip.no_alloc = true;
     ctx_ = ggml_init(ip);
 
+    // On the CPU the linear layers are converted to BF16 at load: the tiled GEMM
+    // has an AVX-512 BF16 path, measured 17.2 -> 15.4 s on a 1400x1000 screenshot
+    // with embeddings at rounding level (first values move in the 4th decimal).
+    // Q8_0 was no faster (16.0 s) and cannot take ffn_down (4304 is not a
+    // multiple of 32). QWFN_VISION_WTYPE=f16|bf16|q8_0 overrides, an experiment knob.
+    ggml_type wtype = cpu_ ? GGML_TYPE_BF16 : GGML_TYPE_COUNT;
+    if (const char * e = getenv("QWFN_VISION_WTYPE")) {
+        if (!strcmp(e, "f16"))  wtype = GGML_TYPE_COUNT;
+        if (!strcmp(e, "bf16")) wtype = GGML_TYPE_BF16;
+        if (!strcmp(e, "q8_0")) wtype = GGML_TYPE_Q8_0;
+    }
+    auto is_linear = [](const std::string & n) {
+        return n.size() > 7 && n.compare(n.size() - 7, 7, ".weight") == 0 &&
+               n != "v.position_embd.weight" && n.rfind("v.patch_embd", 0) != 0;
+    };
     for (int i = 0; i < n_tensors; i++) {
         const char * name = gguf_get_tensor_name(gc, i);
         ggml_tensor * src = ggml_get_tensor(meta, name);
-        ggml_tensor * dst = ggml_dup_tensor(ctx_, src);
+        ggml_type ty = src->type;
+        if (wtype != GGML_TYPE_COUNT && src->type == GGML_TYPE_F16 && ggml_n_dims(src) == 2 && is_linear(name) &&
+            src->ne[0] % ggml_blck_size(wtype) == 0) ty = wtype;
+        ggml_tensor * dst = ggml_new_tensor(ctx_, ty, ggml_n_dims(src), src->ne);
         ggml_set_name(dst, name);
     }
 
@@ -200,14 +228,22 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
     for (int i = 0; i < n_tensors; i++) {
         const char * name = gguf_get_tensor_name(gc, i);
         ggml_tensor * dst = get(name);
-        const size_t nb   = ggml_nbytes(dst);
+        const size_t nb   = gguf_get_tensor_size(gc, i);
         tmp.resize(nb);
         if (fseek(f, (long) (data_off + gguf_get_tensor_offset(gc, i)), SEEK_SET) != 0 ||
             fread(tmp.data(), 1, nb, f) != nb) {
             err = std::string("short read for mmproj tensor ") + name;
             fclose(f); gguf_free(gc); ggml_free(meta); return false;
         }
-        ggml_backend_tensor_set(dst, tmp.data(), 0, nb);
+        if (dst->type != gguf_get_tensor_type(gc, i)) {
+            const int64_t n = ggml_nelements(dst);
+            std::vector<float> f32(n);
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) tmp.data(), f32.data(), n);
+            std::vector<uint8_t> conv(ggml_nbytes(dst));
+            if (dst->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row(f32.data(), (ggml_bf16_t *) conv.data(), n);
+            else ggml_quantize_chunk(dst->type, f32.data(), conv.data(), 0, dst->ne[1], dst->ne[0], nullptr);
+            ggml_backend_tensor_set(dst, conv.data(), 0, conv.size());
+        } else ggml_backend_tensor_set(dst, tmp.data(), 0, nb);
     }
     fclose(f);
     gguf_free(gc);
@@ -242,7 +278,10 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
     galloc_ = ggml_gallocr_new(buft_);
     // Flash attention at this head size (72), on this backend? Ask it about the
     // exact op the graph will carry; otherwise attention materialises its scores.
-    {
+    // The CPU backend says yes but its kernel is a per-key loop: 52 s against
+    // 17 s materialised on a 1400x1000 screenshot, so there attention goes
+    // through the GEMMs, chunked over the queries to bound the score matrix.
+    if (!cpu_) {
         ggml_init_params pp{}; pp.mem_size = ggml_tensor_overhead() * 8; pp.no_alloc = true;
         ggml_context * pc = ggml_init(pp);
         const int64_t d = hp_.d_head(), n = 64, h = hp_.n_head;
@@ -254,9 +293,12 @@ bool vision_encoder::load(const std::string & path, ggml_backend_t backend,
         use_fa_ = ggml_backend_supports_op(backend_, o);
         ggml_free(pc);
     }
+    if (const char * e = getenv("QWFN_VISION_FA")) use_fa_ = atoi(e) != 0;   // experiment knob
     fprintf(stderr, "[qwfn] vision: %u blocks, n_embd %u, patch %u, merge %u -> %u, attention: %s, weights %s\n",
-            hp_.n_layer, hp_.n_embd, hp_.patch, hp_.merge, hp_.proj_dim, use_fa_ ? "flash" : "materialised scores",
-            stage_ ? "in host memory, staged per image" : "on the device");
+            hp_.n_layer, hp_.n_embd, hp_.patch, hp_.merge, hp_.proj_dim,
+            use_fa_ ? "flash" : cpu_ ? "materialised scores, chunked" : "materialised scores",
+            cpu_ ? (wtype == GGML_TYPE_BF16 ? "in RAM (linears BF16), computed on the CPU" : "in RAM, computed on the CPU")
+                 : stage_ ? "in host memory, staged per image" : "on the device");
     return true;
 }
 
@@ -395,11 +437,23 @@ bool vision_encoder::encode(const image_u8 & img, std::vector<float> & out,
     }
 
     // ---- graph -------------------------------------------------------------
+    // Materialised attention is chunked over the queries so one chunk's scores
+    // [n_pos, chunk, n_head] stay under ~256 MB: 768 queries for a 1400x1000
+    // screenshot (5,456 patches), 256 for the largest image the token budget
+    // allows (16,384 patches, where the full matrix would be 17 GB).
+    int chunk = n_pos;
+    if (!use_fa_) {
+        const int64_t budget = 256ll << 20;
+        chunk = (int) std::max<int64_t>(64, std::min<int64_t>(n_pos, budget / ((int64_t) n_pos * n_head * sizeof(float))));
+        chunk = (chunk + 15) / 16 * 16;
+    }
+    const int n_chunks = (n_pos + chunk - 1) / chunk;
+    const size_t graph_size = 512 + (size_t) hp_.n_layer * (48 + (size_t) n_chunks * 14);
     ggml_init_params gp{};
-    gp.mem_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false);
+    gp.mem_size = ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false);
     gp.no_alloc = true;
     ggml_context * c = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(c, 8192, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(c, graph_size, false);
 
     auto norm = [&](ggml_tensor * x, ggml_tensor * w, ggml_tensor * b) {
         x = ggml_norm(c, x, hp_.eps);
@@ -462,12 +516,29 @@ bool vision_encoder::encode(const image_u8 & img, std::vector<float> & out,
             ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
             kqv = ggml_reshape_2d(c, kqv, n_embd, n_pos);
         } else {
-            ggml_tensor * k = ggml_permute(c, K, 0, 2, 1, 3);
-            ggml_tensor * v = ggml_cont(c, ggml_permute(c, V, 1, 2, 0, 3));   // [pos,d,head]
-            ggml_tensor * kq = ggml_mul_mat(c, k, q);
-            kq = ggml_soft_max_ext(c, kq, nullptr, kq_scale, 0.0f);
-            kqv = ggml_mul_mat(c, v, kq);                                     // [d,pos,head]
-            kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), n_embd, n_pos);
+            // The CPU's tiled GEMM wants the reduction length a multiple of 16
+            // and both operands contiguous: the head size 72 is padded to 80
+            // with zeros (the dot products are unchanged), Q and K are laid out
+            // [d,pos,head], and each query chunk is copied out contiguous.
+            // Without the padding the scores fell to the per-row dot path.
+            // (BF16 scores, padded to 96 for the BF16 GEMM, measured 15.6 -> 15.0 s: not taken.)
+            const int64_t d_pad = (d_head + 15) / 16 * 16;
+            ggml_tensor * Qp = d_pad != d_head ? ggml_pad(c, Q, (int) (d_pad - d_head), 0, 0, 0) : Q;
+            ggml_tensor * Kp = d_pad != d_head ? ggml_pad(c, K, (int) (d_pad - d_head), 0, 0, 0) : K;
+            ggml_tensor * qa = ggml_cont(c, ggml_permute(c, Qp, 0, 2, 1, 3));   // [d_pad,pos,head]
+            ggml_tensor * k  = ggml_cont(c, ggml_permute(c, Kp, 0, 2, 1, 3));   // [d_pad,pos,head]
+            ggml_tensor * v  = ggml_cont(c, ggml_permute(c, V, 1, 2, 0, 3));    // [pos,d,head]
+            ggml_tensor * acc = nullptr;
+            for (int s0 = 0; s0 < n_pos; s0 += chunk) {
+                const int n = std::min(chunk, n_pos - s0);
+                ggml_tensor * qi = ggml_cont(c, ggml_view_3d(c, qa, d_pad, n, n_head, qa->nb[1], qa->nb[2], (size_t) s0 * qa->nb[1]));
+                ggml_tensor * kq = ggml_mul_mat(c, k, qi);                        // [pos,n,head]
+                kq = ggml_soft_max_ext(c, kq, nullptr, kq_scale, 0.0f);
+                ggml_tensor * oi = ggml_mul_mat(c, v, kq);                        // [d,n,head]
+                oi = ggml_cont_2d(c, ggml_permute(c, oi, 0, 2, 1, 3), n_embd, n);
+                acc = acc ? ggml_concat(c, acc, oi, 1) : oi;
+            }
+            kqv = acc;                                                            // [n_embd,pos]
         }
 
         x = ggml_add(c, ggml_mul_mat(c, L.out_w, kqv), L.out_b);
@@ -499,7 +570,8 @@ bool vision_encoder::encode(const image_u8 & img, std::vector<float> & out,
         ggml_free(c); ggml_backend_buffer_free(ibuf); ggml_free(ictx); return false;
     }
     fprintf(stderr, "[qwfn] vision graph: %d patches -> %d tokens, arena %.0f MB%s\n", n_pos, n_out,
-            ggml_gallocr_get_buffer_size(galloc_, 0) / 1e6, use_fa_ ? " (flash attention)" : "");
+            ggml_gallocr_get_buffer_size(galloc_, 0) / 1e6,
+            use_fa_ ? " (flash attention)" : cpu_ ? (", attention in " + std::to_string(n_chunks) + " chunks of " + std::to_string(chunk)).c_str() : "");
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
         err = "vision graph compute failed";
         ggml_free(c); ggml_backend_buffer_free(ibuf); ggml_free(ictx); return false;

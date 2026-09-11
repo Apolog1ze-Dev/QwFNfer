@@ -567,20 +567,51 @@ static std::atomic<bool> g_gen_thread_set{false};
 struct live_stats {
     std::mutex mu;
     bool   busy = false;
-    int    n_prompt = 0, n_gen = 0;
+    // The current (or, when idle, the last) request: its whole prompt, the part reused
+    // from the engine's prefix, the part being prefilled and the tokens generated.
+    int    n_input = 0, n_cached = 0, n_prompt = 0, n_gen = 0;
     double t_prompt = 0, t_gen = 0;          // seconds, the current or last request
+    // Prefill progress: new prompt tokens done so far, fractional inside a batch (the
+    // engine reports each layer of a streamed batch), and the clock it runs on, so a
+    // reader sees the rate move while the prefill is still going.
+    bool   prefilling = false;
+    double prompt_done = 0, prompt_base = 0;
+    std::chrono::steady_clock::time_point t_prompt0;
     double t_prompt_total = 0, t_gen_total = 0;
-    long long n_prompt_total = 0, n_gen_total = 0, n_requests = 0;
+    long long n_prompt_total = 0, n_gen_total = 0, n_requests = 0, n_input_total = 0, n_cached_total = 0;
     long long n_pairs_total = 0, n_accepted_total = 0, n_drafted_total = 0;   // the draft head's verify steps, drafts accepted, drafts proposed
     int    n_past = 0;
-    json timings() {   // llama.cpp's field names
+    // The last request that completed, kept apart from the live counters so a monitor
+    // can show it while the next one runs.
+    struct snapshot {
+        int n_input = 0, n_cached = 0, n_prompt = 0, n_gen = 0, n_pairs = 0, n_accepted = 0, n_drafted = 0;
+        double t_prompt = 0, t_gen = 0; std::string finish; long long when = 0; bool ok = true;
+    } last;
+    bool have_last = false;
+    double prompt_seconds_locked() const {   // mu held
+        if (prefilling) return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prompt0).count();
+        return t_prompt;
+    }
+    json timings() {   // llama.cpp's field names, plus the prompt's cached share and live progress
         std::lock_guard<std::mutex> lk(mu);
-        return {{"prompt_n", n_prompt}, {"prompt_ms", t_prompt * 1e3},
-                {"prompt_per_second", t_prompt > 0 ? n_prompt / t_prompt : 0.0},
+        const double tp = prompt_seconds_locked();
+        const double done = prefilling ? prompt_done : (double) n_prompt;
+        return {{"prompt_n", n_prompt}, {"prompt_ms", tp * 1e3},
+                {"prompt_per_second", tp > 0.05 ? done / tp : 0.0},
+                {"prompt_cached_n", n_cached}, {"prompt_done_n", done}, {"prompt_input_n", n_input}, {"prefilling", prefilling},
                 {"predicted_n", n_gen}, {"predicted_ms", t_gen * 1e3},
                 // The first token comes straight from the prompt's logits at ~0 ms:
                 // no rate until the clock has something to divide by.
                 {"predicted_per_second", t_gen >= 0.1 ? n_gen / t_gen : 0.0}};
+    }
+    json last_json() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!have_last) return nullptr;
+        return {{"input_tokens", last.n_input}, {"cached_tokens", last.n_cached}, {"prompt_tokens", last.n_prompt}, {"generated_tokens", last.n_gen},
+                {"prompt_ms", last.t_prompt * 1e3}, {"prompt_tokens_per_second", last.t_prompt > 0 ? last.n_prompt / last.t_prompt : 0.0},
+                {"generation_ms", last.t_gen * 1e3}, {"tokens_per_second", last.t_gen > 0 ? last.n_gen / last.t_gen : 0.0},
+                {"finish_reason", last.finish}, {"ok", last.ok}, {"completed_at", last.when},
+                {"speculative", {{"pairs", last.n_pairs}, {"accepted", last.n_accepted}, {"drafted", last.n_drafted}}}};
     }
 };
 
@@ -594,6 +625,7 @@ struct server {
     engine         eng;
     qwfn::vocab    vb;
     vision_encoder vis;
+    ggml_backend_t vis_backend = nullptr;   // the CPU backend the projector runs on
     int32_t        tok_image_pad = -1;
 
     std::mutex           mu;
@@ -661,10 +693,8 @@ static bool render_content(server & S, const json & content, std::string & text,
             pending_img pi;
             int gw = 0, gh = 0;
             const auto t0 = clk::now();
-            // Room for the staged weights and the arena: the tier's dynamic buffer,
-            // which the prefill that follows would take anyway.
-            if (S.vis.weights_on_host()) S.eng.vram_lend_begin();
-            if (!S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err)) { S.eng.vram_lend_end(); return false; }
+            // On the CPU: no VRAM is borrowed from the expert tier for this.
+            if (!S.vis.encode(img, pi.emb, pi.n_tok, gw, gh, err)) return false;
             fprintf(stderr, "[qwfn-server] image: %zu bytes, %dx%d px -> %dx%d grid, %d tokens, encoded in %.2f s\n",
                     raw.size(), img.nx, img.ny, gw, gh, pi.n_tok, since(t0));
             imgs.emplace_back(text.size(), std::move(pi));   // marker position in text
@@ -681,8 +711,9 @@ int main(int argc, char ** argv) {
           "\n"
           "      --host HOST     bind address (default 127.0.0.1)\n"
           "      --port N        port (default 8080)\n"
-          "      --mmproj PATH   vision projector gguf; enables image input. Its weights stay in host memory and are\n"
-          "                      staged onto the GPU per image (~60 ms), so vision costs no VRAM at decode\n"
+          "      --mmproj PATH   vision projector gguf; enables image input. It runs on the CPU (weights in RAM, no VRAM\n"
+          "                      at all): a 1400x1000 screenshot encodes in ~15 s, a 320x240 image in 0.3 s\n"
+          "      --vision-threads N  threads for the image encode (default: --threads, the physical cores)\n"
           "      --state-host V  attention state in pinned host memory: none (default) | idx | kv,idx. The VRAM it held goes to\n"
           "                      the expert tier; costs ~0.35 ms/token (idx) or ~2 ms/token (kv,idx) of PCIe reads\n"
           "      --alias NAME    model id reported by /v1/models\n"
@@ -704,6 +735,7 @@ int main(int argc, char ** argv) {
     }
 
     std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
+    int vision_threads = 0;
     int def_reasoning_budget = 0;
     int port = 8080;
     engine_config cfg;
@@ -719,6 +751,7 @@ int main(int argc, char ** argv) {
         if (a == "--host"   && i + 1 < argc) { host = next(); continue; }
         if (a == "--port"   && i + 1 < argc) { port = atoi(next()); continue; }
         if (a == "--mmproj" && i + 1 < argc) { mmproj_path = next(); continue; }
+        if (a == "--vision-threads" && i + 1 < argc) { vision_threads = atoi(next()); continue; }
         if (a == "--alias"  && i + 1 < argc) { alias = next(); continue; }
         if (a == "--think"  && i + 1 < argc) { def_effort = next(); continue; }
         if (a == "--think-budget" && i + 1 < argc) { def_reasoning_budget = atoi(next()); continue; }
@@ -777,21 +810,29 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "loading tokenizer...\n");
     if (!S.vb.load(argv[1], err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     if (!S.mi.load(argv[1], err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
-    // The vision projector is loaded onto the device AFTER the engine has sized
-    // its expert tier from the free VRAM: reserve its size up front, or it comes
-    // out of the decode reserve and the first CUDA graph instantiation fails.
-    // The projector's weights live in host memory and are staged into the tier's
-    // lent buffer while an image is encoded, so nothing is reserved for them.
+    // The vision projector runs on the CPU backend (its weights in RAM, the
+    // graph on the cores), so it takes no VRAM: nothing is reserved for it and
+    // the expert tier is not lent while an image is encoded. Loaded after the
+    // engine, which loads the ggml backends.
     if (!S.eng.init(&S.mi, nullptr, cfg,
                     std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", S.eng.memory_summary().c_str());
+    S.eng.prefill_progress = [&S](uint32_t il, uint32_t nl, int32_t T) {
+        std::lock_guard<std::mutex> lk(S.live.mu);
+        S.live.prompt_done = S.live.prompt_base + (double) T * (il + 1) / nl;
+    };
     S.eng.set_mtp_logits(true);   // the draft is sampled from the head's distribution at temperature
     if (!mmproj_path.empty()) {
-        if (!S.vis.load(mmproj_path, S.eng.backend(), S.eng.buft(), err)) {
+        S.vis_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (!S.vis_backend) { fprintf(stderr, "vision: no CPU backend\n"); return 1; }
+        if (!S.vis.load(mmproj_path, S.vis_backend, ggml_backend_get_default_buffer_type(S.vis_backend), err)) {
             fprintf(stderr, "vision: %s\n", err.c_str()); return 1;
         }
+        // Physical cores, like the engine's own workers: 8 threads encoded a
+        // 1400x1000 screenshot in 14.2 s where 16 took 15.5 (SMT starves the GEMMs).
+        S.vis.set_n_threads(vision_threads > 0 ? vision_threads : cfg.n_threads);
         const auto ip = S.vb.encode("<|image_pad|>", false, true);
         if (ip.size() != 1) { fprintf(stderr, "vision: <|image_pad|> is not one token\n"); return 1; }
         S.tok_image_pad = ip[0];
@@ -943,7 +984,7 @@ int main(int argc, char ** argv) {
     // ---- generation ---------------------------------------------------------
     struct gen_result {
         std::string reasoning, content, finish = "stop";
-        int n_prompt = 0, n_gen = 0;
+        int n_input = 0, n_cached = 0, n_prompt = 0, n_gen = 0;   // whole prompt, reused prefix, prefilled, generated
         int n_pairs = 0, n_accepted = 0, n_drafted = 0;     // verify steps, drafts accepted, drafts proposed
         double t_prompt = 0, t_gen = 0;
         bool reasoning_budget_hit = false;
@@ -991,8 +1032,15 @@ int main(int argc, char ** argv) {
 
         std::vector<int32_t> hist = P.tok;
         int32_t fed = (int32_t) S.consumed.size();
+        const int32_t fed0 = fed;
+        R.n_input  = (int32_t) hist.size();
+        R.n_cached = fed;
         R.n_prompt = (int32_t) hist.size() - fed;
-        { std::lock_guard<std::mutex> lk(S.live.mu); S.live.busy = true; S.live.n_prompt = R.n_prompt; S.live.n_gen = 0; S.live.t_prompt = 0; S.live.t_gen = 0; S.live.n_requests++; }
+        { std::lock_guard<std::mutex> lk(S.live.mu); S.live.busy = true; S.live.n_input = R.n_input; S.live.n_cached = R.n_cached; S.live.n_prompt = R.n_prompt; S.live.n_gen = 0;
+          S.live.t_prompt = 0; S.live.t_gen = 0; S.live.prompt_done = 0; S.live.prompt_base = 0; S.live.prefilling = R.n_prompt > 0; S.live.t_prompt0 = clk::now(); S.live.n_requests++; }
+        // Whatever way this returns (an eval error, a client that went away), the
+        // counters must not say "busy" forever.
+        struct busy_guard { live_stats & L; ~busy_guard() { std::lock_guard<std::mutex> lk(L.mu); L.busy = false; L.prefilling = false; } } guard{S.live};
         g_gen_thread = pthread_self(); g_gen_thread_set = true;
         smp.gen.clear();
 
@@ -1000,13 +1048,15 @@ int main(int argc, char ** argv) {
         const float * lg = nullptr;
         while (fed < (int32_t) hist.size()) {
             const int32_t take = std::min<int32_t>(S.n_batch, (int32_t) hist.size() - fed);
+            { std::lock_guard<std::mutex> lk(S.live.mu); S.live.prompt_base = fed - fed0; S.live.prompt_done = fed - fed0; }
             lg = S.eng.eval(hist.data(), fed + take, take, e);
             if (!lg) return false;
             fed += take;
+            { std::lock_guard<std::mutex> lk(S.live.mu); S.live.prompt_base = fed - fed0; S.live.prompt_done = fed - fed0; S.live.n_past = S.eng.n_past(); }
             if (on_tick) on_tick();
         }
         R.t_prompt = since(tp);
-        { std::lock_guard<std::mutex> lk(S.live.mu); S.live.t_prompt = R.t_prompt; S.live.n_past = S.eng.n_past(); }
+        { std::lock_guard<std::mutex> lk(S.live.mu); S.live.t_prompt = R.t_prompt; S.live.prefilling = false; S.live.prompt_done = R.n_prompt; S.live.n_past = S.eng.n_past(); }
 
         const int32_t room = (int32_t) S.n_ctx - (int32_t) hist.size() - 2;
         const int budget = std::max(0, max_tok > 0 ? std::min(max_tok, room) : room);
@@ -1207,7 +1257,10 @@ int main(int argc, char ** argv) {
         R.n_gen = n;
         { std::lock_guard<std::mutex> lk(S.live.mu); S.live.busy = false; S.live.n_gen = n; S.live.t_gen = R.t_gen;
           S.live.n_prompt_total += R.n_prompt; S.live.t_prompt_total += R.t_prompt; S.live.n_gen_total += n; S.live.t_gen_total += R.t_gen; S.live.n_past = S.eng.n_past();
-          S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; S.live.n_drafted_total += R.n_drafted; }
+          S.live.n_input_total += R.n_input; S.live.n_cached_total += R.n_cached;
+          S.live.n_pairs_total += R.n_pairs; S.live.n_accepted_total += R.n_accepted; S.live.n_drafted_total += R.n_drafted;
+          S.live.last = live_stats::snapshot{R.n_input, R.n_cached, R.n_prompt, R.n_gen, R.n_pairs, R.n_accepted, R.n_drafted, R.t_prompt, R.t_gen, R.finish, now_unix(), true};
+          S.live.have_last = true; }
 
         // Close the turn so the next request can continue from here. The sampled
         // end-of-turn token was appended but never evaluated, so the engine's
@@ -1291,8 +1344,9 @@ int main(int argc, char ** argv) {
                 {"reasoning_budget", S.def_reasoning_budget},
                 {"thinking", S.preset_think.to_json()}, {"non_thinking", S.preset_nothink.to_json()}}},
             {"skip_miss", cfg.skip_miss}, {"spec_block", cfg.spec_block}, {"mtp", S.eng.mtp_loaded()}, {"model_file", S.model_file},
-            {"vision", S.vis.loaded()}, {"vision_weights", S.vis.loaded() ? "host" : "off"},
+            {"vision", S.vis.loaded()}, {"vision_weights", S.vis.loaded() ? "cpu" : "off"},
             {"state_host", cfg.kv_host && cfg.idx_host ? "kv,idx" : cfg.kv_host ? "kv" : cfg.idx_host ? "idx" : "none"},
+            {"n_threads", S.eng.n_threads()}, {"kv_type", cfg.type_k == GGML_TYPE_Q4_0 ? "q4_0" : cfg.type_k == GGML_TYPE_Q8_0 ? "q8_0" : "f16"},
             {"total_slots", 1}};
     };
     svr.Get("/props", [&](const httplib::Request &, httplib::Response & res) {
@@ -1317,6 +1371,16 @@ int main(int argc, char ** argv) {
             // Flat sampling fields apply to both presets.
             S.preset_think.from_json(body); S.preset_nothink.from_json(body);
         }
+        // CPU threads for the RAM-served experts, applied between requests (the console's
+        // auto-tune sweeps it on the running server). Refused while a generation holds the engine.
+        if (body.contains("threads")) {
+            const int n = body["threads"].get<int>();
+            if (n < 1 || n > 512) { fail(res, 400, "threads must be 1..512"); return; }
+            std::unique_lock<std::mutex> lk(S.mu, std::try_to_lock);
+            if (!lk.owns_lock()) { fail(res, 409, "a request is running; set threads between requests"); return; }
+            S.eng.set_n_threads(n);
+            fprintf(stderr, "[qwfn-server] threads set to %d\n", n);
+        }
         res.set_content(props_json().dump(2, ' ', false, json::error_handler_t::replace), "application/json");
     });
     // ---- the live counter ------------------------------------------------------
@@ -1327,12 +1391,20 @@ int main(int argc, char ** argv) {
         { std::lock_guard<std::mutex> lk(S.live.mu); np = S.live.n_prompt_total; ng = S.live.n_gen_total; nr = S.live.n_requests;
           tp = S.live.t_prompt_total; tg = S.live.t_gen_total; busy = S.live.busy; n_past = S.live.n_past;
           npair = S.live.n_pairs_total; nacc = S.live.n_accepted_total; ndraft = S.live.n_drafted_total; }
+        long long ninp, ncach; { std::lock_guard<std::mutex> lk(S.live.mu); ninp = S.live.n_input_total; ncach = S.live.n_cached_total; }
         return json{
             {"busy", busy},
-            {"prompt", {{"n", t["prompt_n"]}, {"ms", t["prompt_ms"]}, {"tokens_per_second", t["prompt_per_second"]}}},
+            // prompt: the current request's prompt while busy, the last one's when idle.
+            // input = cached (reused from the engine's prefix) + n (prefilled); done counts
+            // the prefilled tokens so far, fractional inside a batch.
+            {"prompt", {{"n", t["prompt_n"]}, {"ms", t["prompt_ms"]}, {"tokens_per_second", t["prompt_per_second"]},
+                        {"input", t["prompt_input_n"]}, {"cached", t["prompt_cached_n"]}, {"done", t["prompt_done_n"]}, {"prefilling", t["prefilling"]}}},
             {"generation", {{"n", t["predicted_n"]}, {"ms", t["predicted_ms"]}, {"tokens_per_second", t["predicted_per_second"]}}},
+            {"last", S.live.last_json()},
             {"context", {{"n_past", n_past}, {"n_ctx", S.n_ctx}}},
+            {"threads", S.eng.n_threads()},
             {"totals", {{"requests", nr}, {"prompt_tokens", np}, {"prompt_tokens_per_second", tp > 0 ? np / tp : 0.0},
+                        {"input_tokens", ninp}, {"cached_tokens", ncach},
                         {"generated_tokens", ng}, {"generated_tokens_per_second", tg > 0 ? ng / tg : 0.0},
                         {"prompt_seconds", tp}, {"generation_seconds", tg}}},
             {"expert_cache", {{"hit_rate", c.hit_rate()}, {"vram_served", c.gpu_rate()},
@@ -1518,9 +1590,9 @@ int main(int argc, char ** argv) {
                 {"model", S.model_id},
                 {"choices", json::array({ json{
                     {"index", 0}, {"message", msg}, {"finish_reason", R.finish}} })},
-                {"usage", {{"prompt_tokens", R.n_prompt},
+                {"usage", {{"prompt_tokens", R.n_input}, {"prompt_tokens_details", {{"cached_tokens", R.n_cached}}},
                            {"completion_tokens", R.n_gen},
-                           {"total_tokens", R.n_prompt + R.n_gen}}},
+                           {"total_tokens", R.n_input + R.n_gen}}},
                 {"timings", S.live.timings()}
             }.dump(2, ' ', false, json::error_handler_t::replace), "application/json");
             return;
@@ -1702,8 +1774,8 @@ int main(int argc, char ** argv) {
                 } else if (!ok) {
                     fprintf(stderr, "[qwfn-server] %s: generation failed after %d tokens: %s\n", id.c_str(), R.n_gen, e2.c_str());
                 } else {
-                    fprintf(stderr, "[qwfn-server] %s: prompt %d tok %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s%s\n",
-                            id.c_str(), R.n_prompt, R.t_prompt > 0 ? R.n_prompt / R.t_prompt : 0.0, R.n_gen, R.reasoning.size(),
+                    fprintf(stderr, "[qwfn-server] %s: prompt %d tok (%d cached) %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s%s\n",
+                            id.c_str(), R.n_prompt, R.n_cached, R.t_prompt > 0 ? R.n_prompt / R.t_prompt : 0.0, R.n_gen, R.reasoning.size(),
                             R.reasoning_budget_hit ? ", budget hit" : "", R.t_gen, R.t_gen > 0 ? R.n_gen / R.t_gen : 0.0, R.finish.c_str(),
                             R.n_pairs ? (" | drafts: " + std::to_string(R.n_accepted) + " of " + std::to_string(R.n_drafted) + " accepted over " + std::to_string(R.n_pairs) + " steps").c_str() : "");
                 }
@@ -1717,9 +1789,9 @@ int main(int argc, char ** argv) {
                               {"choices", json::array({ json{
                                   {"index", 0}, {"delta", json::object()},
                                   {"finish_reason", R.finish}} })},
-                              {"usage", {{"prompt_tokens", R.n_prompt},
+                              {"usage", {{"prompt_tokens", R.n_input}, {"prompt_tokens_details", {{"cached_tokens", R.n_cached}}},
                                          {"completion_tokens", R.n_gen},
-                                         {"total_tokens", R.n_prompt + R.n_gen}}},
+                                         {"total_tokens", R.n_input + R.n_gen}}},
                               {"timings", S.live.timings()}});
                 }
                 const std::string done = "data: [DONE]\n\n";
@@ -1765,8 +1837,8 @@ int main(int argc, char ** argv) {
             {"choices", json::array({ json{
                 {"index", 0}, {"text", R.reasoning + R.content},
                 {"finish_reason", R.finish}} })},
-            {"usage", {{"prompt_tokens", R.n_prompt}, {"completion_tokens", R.n_gen},
-                       {"total_tokens", R.n_prompt + R.n_gen}}}
+            {"usage", {{"prompt_tokens", R.n_input}, {"prompt_tokens_details", {{"cached_tokens", R.n_cached}}},
+                       {"completion_tokens", R.n_gen}, {"total_tokens", R.n_input + R.n_gen}}}
         }.dump(2, ' ', false, json::error_handler_t::replace), "application/json");
     });
 
