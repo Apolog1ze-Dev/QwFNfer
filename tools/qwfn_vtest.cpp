@@ -1,5 +1,6 @@
 // qwfn-vtest -- run the vision tower on one image and report the embeddings.
 #include "qwfn_vision.h"
+#include "qwfn_home.h"
 #include "ggml-backend.h"
 #include <chrono>
 #include <cmath>
@@ -19,7 +20,7 @@ int main(int argc, char ** argv) {
         else if (a == "--reps" && i + 1 < argc) reps = atoi(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) n_threads = atoi(argv[++i]);
     }
-    ggml_backend_load_all_from_path((std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin").c_str());
+    ggml_backend_load_all_from_path(qwfn::llama_backend_dir().c_str());
 
     ggml_backend_t be = nullptr;
     if (use_gpu) {

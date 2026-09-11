@@ -15,6 +15,7 @@
 // you cannot simply forget the tail of a scan.
 
 #include "qwfn_engine.h"
+#include "qwfn_home.h"
 #include "qwfn_model.h"
 #include "qwfn_vocab.h"
 #include "qwfn_vision.h"
@@ -24,22 +25,39 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <csignal>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
-#include <sys/stat.h>
-#include <execinfo.h>
-#include <csignal>
-#include <atomic>
-#include <pthread.h>
 #include <vector>
+
+#ifdef _WIN32
+// The stall watchdog and fatal-signal backtraces use POSIX signals and
+// glibc's execinfo. Windows keeps the fatal handlers (signal() exists and
+// SEGV/ABRT/FPE arrive); the STALL probe and stack dump degrade to a plain
+// message -- CaptureStackBackTrace from a signal handler is not safe to run
+// cross-thread, and the watchdog's purpose ("where is it stuck") is already
+// answered by the expert-cache wait state it logs right before.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#define pthread_t DWORD
+#define pthread_self() GetCurrentThreadId()
+#define pthread_kill(t, sig) (0)
+#else
+#include <execinfo.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace qwfn;
 using json = nlohmann::ordered_json;
@@ -549,15 +567,25 @@ struct tool_streamer {
 // fatal signal prints the dying thread's stack; SIGUSR2, sent by the stall
 // watchdog to the generating thread, prints where it is stuck.
 static void print_backtrace(const char * why) {
+#ifdef _WIN32
+    char head[160];
+    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: stuck in thread %lu ===\n", why, (unsigned long) pthread_self());
+    (void) !write(2, head, (unsigned) hl);
+#else
     void * frames[64];
     const int n = backtrace(frames, 64);
     char head[160];
     const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: backtrace of thread %lu (%d frames) ===\n", why, (unsigned long) pthread_self(), n);
     (void) !write(2, head, hl);
     backtrace_symbols_fd(frames, n, 2);
+#endif
 }
 static void on_fatal(int sig) {
+#ifdef _WIN32
+    print_backtrace(sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : sig == SIGFPE ? "SIGFPE" : "fatal signal");
+#else
     print_backtrace(sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : sig == SIGBUS ? "SIGBUS" : sig == SIGFPE ? "SIGFPE" : "fatal signal");
+#endif
     signal(sig, SIG_DFL); raise(sig);
 }
 static void on_stall_probe(int) { print_backtrace("STALL probe (SIGUSR2)"); }
@@ -814,8 +842,7 @@ int main(int argc, char ** argv) {
     // graph on the cores), so it takes no VRAM: nothing is reserved for it and
     // the expert tier is not lent while an image is encoded. Loaded after the
     // engine, which loads the ggml backends.
-    if (!S.eng.init(&S.mi, nullptr, cfg,
-                    std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!S.eng.init(&S.mi, nullptr, cfg, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", S.eng.memory_summary().c_str());
@@ -1285,8 +1312,11 @@ int main(int argc, char ** argv) {
     // trace) would get the connection cut without a trailer and without a log
     // line here -- "peer closed connection without sending complete message
     // body" on its side. A local server can afford to wait.
-    signal(SIGSEGV, on_fatal); signal(SIGABRT, on_fatal); signal(SIGBUS, on_fatal); signal(SIGFPE, on_fatal);
+    signal(SIGSEGV, on_fatal); signal(SIGABRT, on_fatal); signal(SIGFPE, on_fatal);
+#ifndef _WIN32
+    signal(SIGBUS, on_fatal);   // SIGBUS does not exist on Windows
     signal(SIGUSR2, on_stall_probe);
+#endif
     // A local web page (the console, a harness) may read /stats and /props
     // from another origin: allow it.
     svr.set_default_headers({{"Access-Control-Allow-Origin", "*"}, {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
@@ -1308,7 +1338,13 @@ int main(int argc, char ** argv) {
                 const int ws = S.eng.cache_wait_state();
                 fprintf(stderr, "[qwfn-server] STALL: no new token for %.0f s at generated token %d; expert cache waiting on %s (%zu reads)\n",
                         stalled, n, ws == 1 ? "demand reads" : ws == 2 ? "speculative reads" : "nothing (compute or lock)", S.eng.cache_wait_count());
-                if (g_gen_thread_set) pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
+                if (g_gen_thread_set)
+#ifdef _WIN32
+                    print_backtrace("STALL probe");   // from the watchdog thread: prints its own id, no cross-thread stack
+#else
+                    pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
+#endif
+
             }
         }
     }).detach();
