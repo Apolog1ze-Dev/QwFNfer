@@ -636,12 +636,15 @@ def start_server(model, s):
             return {"error": "no mmproj-*.gguf next to this model: download mmproj-F16.gguf into its snapshot directory, or turn Vision off"}
         # The memory the plan assumed may be gone (a browser, a build): say so before the engine
         # clamps the tier. Read twice: right after a stop the arena's pages are still coming back.
-        other = float(s.get("host_other_gb") or 10.0)
+        other = 10.0 if s.get("host_other_gb") is None else float(s["host_other_gb"])
         free = mem_available_gb()
         if free and s.get("ram") and free - float(s["ram"]) - other < 1.0:
             time.sleep(2.0); free = mem_available_gb()
         if free and s.get("ram") and free - float(s["ram"]) - other < 1.0:
-            s["ram"] = max(4, int(free - other - 1.0)); s["ram_note"] = "RAM tier reduced to %d GB: %.1f GB is available right now and the server needs %.1f GB besides the tier" % (s["ram"], free, other)
+            if s.get("keep_ram"):   # the caller insists (a measurement): warn, do not shrink
+                s["ram_note"] = "RAM tier kept at %d GB as asked: %.1f GB is available and the server needs ~%.1f GB besides the tier, so the machine will be short of memory at the worst point" % (int(s["ram"]), free, other)
+            else:
+                s["ram"] = max(4, int(free - other - 1.0)); s["ram_note"] = "RAM tier reduced to %d GB: %.1f GB is available right now and the server needs %.1f GB besides the tier" % (s["ram"], free, other)
         argv = server_argv(model, s)
         log = open(STATE["log"], "w")
         log.write("$ " + " ".join(argv) + "\n")
