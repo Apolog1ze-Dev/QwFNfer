@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "llama.h"
+#include "qwfn_platform.h"
+#include "qwfn_home.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -93,8 +95,7 @@ int main(int argc, char ** argv) {
 
     // The backend .so files live next to libllama; load them before any model.
     {
-        const char * home = getenv("HOME");
-        std::string dir = std::string(home ? home : ".") + "/.unsloth/llama.cpp/build/bin";
+        std::string dir = qwfn::llama_backend_dir();
         ggml_backend_load_all_from_path(dir.c_str());
     }
     llama_backend_init();

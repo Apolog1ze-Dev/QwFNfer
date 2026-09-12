@@ -14,7 +14,6 @@ Run a **125B** open-weight MoE on the gaming PC you already own, at interactive 
 **2026-09-11** — (Experimental)The console now tunes itself to the machine it runs on: it measures the drive, sweeps the CPU thread count live on a long-context run, sizes the RAM tier from the memory the server really needs, defaults the KV cache to q8_0 wherever the plan affords it, and its Stats page is live (prefill progress, input / cached / output tokens). The numbers below were re-measured today with those defaults, and an OpenCode agentic-coding run was added.
 Several optimizations and tweaks were introduced including fixing a MTP and vision bug.
 
-
 ## About
 
 qwfnfer is a purpose-built inference engine for Qwen3.8-Flash-Next (GGUF architecture `qwen4exp`): 48 layers, 512 routed experts with top-10 routing, DeltaNet recurrent layers and Qwen Sparse Attention. It is not a llama.cpp fork. It uses ggml's quantized kernels and CUDA backend and llama.cpp's tokenizer, and owns everything above them: the model graph, the memory hierarchy, the expert cache, prefill, the server and the console. Its core features:
@@ -34,7 +33,7 @@ qwfnfer is a purpose-built inference engine for Qwen3.8-Flash-Next (GGUF archite
 Reference machine: RTX 4080 SUPER 16 GB, 30 GB RAM, one NVMe. 163,840-token context and the console's plan for it (KV q8_0, batch 8192, indexer and KV cache in pinned RAM, speculative block, draft head and vision on), with a 15 GB RAM tier asked, 8 CPU threads and 768 MB of VRAM reserve; one run each through the server, measured 2026-09-11. The engine clamps the RAM tier to the memory the machine has: with the draft head's 2.7 GB of pinned experts it built 13.0 GB on Q4 (VRAM expert tier 8.1 GB, 2,591 experts) and 14.1 GB on Q3 (8.7 GB, 3,859 experts), and free memory went down to 1.0 and 0.4 GB at the worst point of the 155K-token prefill. The console's own sizing keeps 3 GB of headroom instead, a tier about 2 GB smaller (a GB of RAM tier is worth about 3% of decode).
 
 | | UD-Q4_K_XL (111 GB) | UD-Q3_K_XL (90 GB) |
-|---|---:|---:|
+| --- | ---: | ---: |
 | short chat, decode (thinking on) | 13.2–15.7 tok/s | 19.8–21.2 tok/s |
 | 155K-token document: prefill | 355 tok/s (7.3 min) | 348 tok/s (7.4 min) |
 | 155K-token document: decode, grounded answer | 12.9 tok/s | 17.7 tok/s |
@@ -46,7 +45,7 @@ The prefill runs at the batch the console picks for the context: it streams ever
 The two options the console exposes, on the same Q4 file and settings; both are on by default:
 
 | UD-Q4_K_XL, 160K context | short chat | 155K-token document, decode |
-|---|---:|---:|
+| --- | ---: | ---: |
 | speculative block and draft head off | 13.3–13.5 tok/s | 11.7 tok/s |
 | speculative block on, draft head off | 13.4–14.6 tok/s | 13.2 tok/s |
 | both on (the console's defaults) | 13.2–15.7 tok/s | 12.9 tok/s |
@@ -62,7 +61,7 @@ While it serves Q4 with the 13 GB arena: 29 of 31 GB of RAM in use system-wide (
 Server flags for this run: 262,144-token context, KV q4_0, a 15 GB RAM tier, 8 CPU threads, batch 16384, 768 MB of VRAM reserve, thinking `xhigh` with a 10,000-token budget, skip-miss off, speculative block on, draft head on, vision on, indexer and KV cache in pinned RAM. The engine built the full 15 GB arena and an 8.5 GB VRAM expert tier (2,730 experts). One run, measured 2026-09-11:
 
 | OpenCode, UD-Q4_K_XL at 256K context | |
-|---|---:|
+| --- | ---: |
 | task solved (7 of 7 tests pass) | yes, in 5 steps and 6 tool calls (bash, bash, read, read, edit, bash) |
 | wall time, prompt to final reply | 123 s |
 | decode | 947 tokens at 14.0 tok/s |
@@ -72,10 +71,9 @@ Server flags for this run: 262,144-token context, KV q4_0, a 15 GB RAM tier, 8 C
 
 The harness reads the numbers from the server's own `/stats` around the run. What a coding step costs is mostly its prefill: a tool result of a few hundred tokens takes 7–10 s through the batched path, a longer one a full expert sweep (~12 s), and the decode of a 100–300-token tool call 7–20 s on top.
 
-
 ## Getting Started
 
-Linux x86_64 with an NVIDIA GPU (driver 580 or newer) and Python 3. Windows is not supported yet: the engine reads the NVMe through io_uring, and that layer needs a port first.
+Linux x86_64 with an NVIDIA GPU (driver 580 or newer) and Python 3, or Windows 10/11 x64 with an NVIDIA GPU (driver 580 or newer) and Python 3. On Windows the NVMe layer runs over unbuffered overlapped reads (`FILE_FLAG_NO_BUFFERING`) with the same slice granularity, alignment and bounce-buffer contract as Linux's io_uring; the io layer's tests (`qwfn-io-test`) run identically on both platforms.
 
 **1. Install.** One command:
 
@@ -97,7 +95,7 @@ hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16
 qwfnfer
 ```
 
-It opens http://127.0.0.1:8090. Pick a downloaded quant and a tier: **Chat** (32K context), **Agentic coding** (128K), **Agentic coding+** (256K, the model's full trained context) or **Custom** (anything you set under *Advanced settings* and save). Press **Auto-tune & start**: the console measures the drive under the model (random 2 MiB reads, the pattern of an expert miss), plans every flag for your GPU and RAM with that rate (context; the KV cache at q8_0 whenever the plan can afford it, q4_0 only where it would not fit; the expert tiers, the prefill batch the tier can lend, the reserve, where the attention caches live; vision on when the `mmproj` file is next to the model, the draft head on when its file is there), starts the server, verifies it on a short chat and a 16K–32K-token document with a passphrase planted in it (prefill and decode tokens/s, and whether the answer found the passphrase), sweeps the CPU thread count live on that document's context (the physical cores unless another count measures over 3% faster), and measures the memory the server needs besides its RAM tier through the run, then re-sizes the tier to leave exactly the headroom you set (3 GB by default; a GB of tier is about 3% of decode) and restarts with it. About five minutes; the result is saved per model, the tier card then shows the measured speed instead of the prediction, and every tier for that model uses the measured thread count and drive rate from then on. **Start server** starts with the plan alone; **Self-test** measures a running server. The banner names the model, the tier and every flag it is running with; the Chat, Stats and Log tabs talk to it. Stats is live at one second: the prefill's progress inside a batch with the time left, input / cached / output tokens for the running request, the last request in full (how much of its prompt was reused, prefill and decode speed, why it finished), the session's totals, the cache hit rate and the endpoint. *Model locations* under the model list adds any folder that holds the shards. `qwfnfer --start` starts the last served model and tier as the console comes up. Stop it from the same page.
+It opens <http://127.0.0.1:8090>. Pick a downloaded quant and a tier: **Chat** (32K context), **Agentic coding** (128K), **Agentic coding+** (256K, the model's full trained context) or **Custom** (anything you set under *Advanced settings* and save). Press **Auto-tune & start**: the console measures the drive under the model (random 2 MiB reads, the pattern of an expert miss), plans every flag for your GPU and RAM with that rate (context; the KV cache at q8_0 whenever the plan can afford it, q4_0 only where it would not fit; the expert tiers, the prefill batch the tier can lend, the reserve, where the attention caches live; vision on when the `mmproj` file is next to the model, the draft head on when its file is there), starts the server, verifies it on a short chat and a 16K–32K-token document with a passphrase planted in it (prefill and decode tokens/s, and whether the answer found the passphrase), sweeps the CPU thread count live on that document's context (the physical cores unless another count measures over 3% faster), and measures the memory the server needs besides its RAM tier through the run, then re-sizes the tier to leave exactly the headroom you set (3 GB by default; a GB of tier is about 3% of decode) and restarts with it. About five minutes; the result is saved per model, the tier card then shows the measured speed instead of the prediction, and every tier for that model uses the measured thread count and drive rate from then on. **Start server** starts with the plan alone; **Self-test** measures a running server. The banner names the model, the tier and every flag it is running with; the Chat, Stats and Log tabs talk to it. Stats is live at one second: the prefill's progress inside a batch with the time left, input / cached / output tokens for the running request, the last request in full (how much of its prompt was reused, prefill and decode speed, why it finished), the session's totals, the cache hit rate and the endpoint. *Model locations* under the model list adds any folder that holds the shards. `qwfnfer --start` starts the last served model and tier as the console comes up. Stop it from the same page.
 
 <div align="center">
   <img alt="qwfn console" src="docs/img/console-serve.png" width=92%>
@@ -111,14 +109,23 @@ It opens http://127.0.0.1:8090. Pick a downloaded quant and a tier: **Chat** (32
 - Every response carries llama.cpp-style `timings`; `/stats` is what the console's live panel reads.
 - One request at a time: the engine keeps a single context, and a conversation that continues the previous one only prefills its new turn.
 
-**Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, liburing and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer (default `~/.unsloth/llama.cpp`, override with `-DLLAMA_CPP_ROOT`):
+**Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer (default `~/.unsloth/llama.cpp`, override with `-DLLAMA_CPP_ROOT`); on Linux also liburing:
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && scripts/console.sh
 ```
 
-`scripts/package.sh` builds the relocatable bundle the installer downloads (`-DQWFN_PORTABLE=ON`: baseline x86-64-v3 code, libraries next to the binaries, the glibc floor of the machine it is built on, 2.35 from the release workflow), and `.github/workflows/release.yml` does the same on a tag push and attaches the zip to the release.
+On Windows (MSVC or clang-cl; CUDA with `-DCMAKE_CUDA_ARCHITECTURES` for your GPU):
 
+```bat
+cmake -B build -G Ninja -DLLAMA_CPP_ROOT=<path-to-llama.cpp> -DLLAMA_CPP_BUILD=<path-to-llama.cpp>\build\bin -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && scripts\qwfnfer.cmd
+```
+
+`scripts\qwfnfer.cmd` is the Windows counterpart of the Linux `qwfnfer` launcher: it starts the console (or finds the one already running) and opens it in the browser; `python tools\qwfn_console.py` does the same without the browser handling. The ggml/llama DLLs are found next to the engine, in the engine's backend dir (`~/.unsloth/llama.cpp/build/bin`), or through `QWFN_BACKENDS`.
+
+`qwfn-io-test` runs the io layer's tests on either platform (`build/qwfn-io-test` / `build\qwfn-io-test.exe`).
+
+`scripts/package.sh` builds the relocatable bundle the installer downloads (`-DQWFN_PORTABLE=ON`: baseline x86-64-v3 code, libraries next to the binaries, the glibc floor of the machine it is built on, 2.35 from the release workflow), and `.github/workflows/release.yml` does the same on a tag push and attaches the zip to the release.
 
 ## How it works
 

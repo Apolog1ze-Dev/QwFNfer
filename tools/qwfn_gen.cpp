@@ -4,6 +4,7 @@
 // needing a tokenizer.
 
 #include "qwfn_engine.h"
+#include "qwfn_home.h"
 #include "qwfn_model.h"
 
 #include <algorithm>
@@ -134,7 +135,7 @@ int main(int argc, char ** argv) {
     }
 
     engine eng;
-    if (!eng.init(&mi, coldp, cfg, std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!eng.init(&mi, coldp, cfg, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     printf("%s\n\n", eng.memory_summary().c_str());

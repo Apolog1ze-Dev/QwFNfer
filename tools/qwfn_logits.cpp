@@ -6,6 +6,7 @@
 // but it isolates correctness from the memory-hierarchy work.
 
 #include "qwfn_graph.h"
+#include "qwfn_home.h"
 #include "qwfn_model.h"
 #include "qwfn_ple.h"
 #include "qwfn_state.h"
@@ -64,7 +65,7 @@ int main(int argc, char ** argv) {
     printf("%s\n\n", hp.summary().c_str());
 
     weights w;
-    if (!w.init(&mi, use_gpu, std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!w.init(&mi, use_gpu, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "backend: %s\n", err.c_str()); return 1;
     }
     printf("backend: %s\n", w.dev_name());

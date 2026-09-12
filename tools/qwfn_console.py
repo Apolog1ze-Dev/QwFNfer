@@ -22,7 +22,14 @@ import argparse, glob, http.server, json, math, mmap, os, random, signal, socket
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
 # The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
-SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server"))
+# The engine: bin/ in the release bundle, build/ in a source checkout (on
+# Windows a separate build-win/ is common to keep a Linux build around), or
+# QWFN_SERVER.
+_EXE = "qwfn-server" + (".exe" if os.name == "nt" else "")
+_CANDS = [os.path.join(ROOT, "bin", _EXE), os.path.join(ROOT, "build", _EXE)]
+if os.name == "nt":
+    _CANDS.append(os.path.join(ROOT, "build-win", _EXE))
+SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in _CANDS if os.path.exists(p)), _CANDS[1])
 LOG_DIR = os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
 os.makedirs(LOG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(LOG_DIR, "config.json")
@@ -116,16 +123,17 @@ def list_gguf(loc):
     if loc["kind"] == "hf":
         return glob.glob(os.path.join(p, "models--*", "snapshots", "*", "*.gguf")) + glob.glob(os.path.join(p, "models--*", "snapshots", "*", "*", "*.gguf"))
     out = []
-    base_depth = p.rstrip("/").count("/")
+    base_depth = p.rstrip("/\\").count("/") + p.rstrip("/\\").count("\\")
     for d, dirs, files in os.walk(p, followlinks=True):
         dirs[:] = [x for x in dirs if not x.startswith(".")]
-        if d.count("/") - base_depth >= 4: dirs[:] = []
+        depth = d.count("/") + d.count("\\")
+        if depth - base_depth >= 4: dirs[:] = []
         out += [os.path.join(d, f) for f in files if f.endswith(".gguf")]
     return out
 
 def repo_dirs(model_dir):
     """Every snapshot directory of the model's Hugging Face repo, when it is laid out that way."""
-    parts = model_dir.split(os.sep)
+    parts = os.path.normpath(model_dir).split(os.sep)   # normpath first: glob may hand back /
     if "snapshots" in parts:
         i = len(parts) - 1 - parts[::-1].index("snapshots")
         return glob.glob(os.path.join(os.sep.join(parts[:i]), "snapshots", "*"))
@@ -148,7 +156,7 @@ def find_mtp(model_dir):
     return None
 
 def repo_label(path, loc):
-    parts = path.split(os.sep)
+    parts = os.path.normpath(path).split(os.sep)
     for x in parts:
         if x.startswith("models--"): return x[8:].replace("--", "/")
     return os.path.relpath(os.path.dirname(path), loc["path"]) if loc["kind"] != "file" else os.path.dirname(path)
@@ -207,31 +215,74 @@ def hardware():
     except Exception:
         pass
     try:
-        mi = {}
-        for line in open("/proc/meminfo"):
-            k, v = line.split(":", 1); mi[k] = int(v.strip().split()[0])
-        hw["ram_total_gb"] = round(mi.get("MemTotal", 0) / 1048576, 1)
-        hw["ram_available_gb"] = round(mi.get("MemAvailable", 0) / 1048576, 1)
+        if os.name == "nt":
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                hw["ram_total_gb"] = round(ms.ullTotalPhys / (1024 ** 3), 1)
+                hw["ram_available_gb"] = round(ms.ullAvailPhys / (1024 ** 3), 1)
+        else:
+            mi = {}
+            for line in open("/proc/meminfo"):
+                k, v = line.split(":", 1); mi[k] = int(v.strip().split()[0])
+            hw["ram_total_gb"] = round(mi.get("MemTotal", 0) / 1048576, 1)
+            hw["ram_available_gb"] = round(mi.get("MemAvailable", 0) / 1048576, 1)
     except Exception:
         pass
     try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("model name"): hw["cpu"] = line.split(":", 1)[1].strip(); break
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                 "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            if out.isdigit(): hw["cpu_cores"] = int(out)
+            hw["cpu"] = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                 "(Get-CimInstance Win32_Processor)[0].Name"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        else:
+            for line in open("/proc/cpuinfo"):
+                if line.startswith("model name"): hw["cpu"] = line.split(":", 1)[1].strip(); break
     except Exception:
         pass
     # Physical cores: the thread count the CPU experts want (see the threads field).
-    try:
-        cores = set()
-        for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
-            pkg = p.replace("core_id", "physical_package_id")
-            cores.add((open(pkg).read().strip() if os.path.exists(pkg) else "0", open(p).read().strip()))
-        hw["cpu_cores"] = len(cores) or hw["cpu_threads"]
-    except Exception:
-        hw["cpu_cores"] = hw["cpu_threads"]
+    if os.name == "nt":
+        # Taken above through Win32_Processor; keep the thread fallback.
+        if not hw.get("cpu_cores"): hw["cpu_cores"] = hw["cpu_threads"]
+    else:
+        try:
+            cores = set()
+            for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
+                pkg = p.replace("core_id", "physical_package_id")
+                cores.add((open(pkg).read().strip() if os.path.exists(pkg) else "0", open(p).read().strip()))
+            hw["cpu_cores"] = len(cores) or hw["cpu_threads"]
+        except Exception:
+            hw["cpu_cores"] = hw["cpu_threads"]
     hw["smt"] = hw["cpu_threads"] > hw["cpu_cores"]
     return hw
 
 def mem_available_gb():
+    if os.name == "nt":
+        try:
+            # GlobalMemoryStatusEx through ctypes: the same number the engine's
+            # clamp_to_available reads (ullAvailPhys).
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return ms.ullAvailPhys / (1024 ** 3)
+        except Exception:
+            pass
+        return 0.0
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"): return int(line.split()[1]) / 1048576
@@ -240,9 +291,40 @@ def mem_available_gb():
     return 0.0
 
 def drive_info(path):
-    """The block device under a path (through /proc/self/mountinfo, since btrfs hides the
-    device behind an anonymous st_dev), its model and whether it spins."""
+    """The block device under a path: its model and whether it spins.
+    Linux reads /proc/self/mountinfo and /sys/class/block (btrfs hides the
+    device behind an anonymous st_dev); Windows asks each disk drive for its
+    model and SSD/rotation through the PowerShell storage cmdlets."""
     info = {"mount": "/", "device": None, "disk": None, "model": None, "rotational": None, "fstype": None}
+    if os.name == "nt":
+        try:
+            drive = os.path.splitdrive(os.path.abspath(path))[0] or "C:"
+            info["mount"] = drive + "\\"
+            fs = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-Volume -DriveLetter %s).FileSystemType" % drive.rstrip(":")],
+                capture_output=True, text=True, timeout=10).stdout.strip()
+            if fs: info["fstype"] = fs
+            num = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Partition -DriveLetter %s | Select-Object -ExpandProperty DiskNumber" % drive.rstrip(":")],
+                capture_output=True, text=True, timeout=10).stdout.strip()
+            if num.isdigit():
+                # DiskNumber maps to Get-Disk's Number (DeviceId in Get-PhysicalDisk
+                # is a different counter on some systems).
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Disk -Number %s | Select-Object Model,BusType | ConvertTo-Json -Compress" % num],
+                    capture_output=True, text=True, timeout=10).stdout
+                d = json.loads(out) if out.strip() else {}
+                if isinstance(d, list): d = d[0] if d else {}
+                if d.get("Model"):
+                    info["model"] = d["Model"].strip()
+                    info["disk"] = info["model"]
+                    info["rotational"] = (d.get("BusType") or "") == "ATA"   # SATA spinning disks report ATA; NVMe/USB report otherwise
+        except Exception:
+            pass
+        return info
     try:
         best = ("", None, None)
         for line in open("/proc/self/mountinfo"):
@@ -268,22 +350,79 @@ def drive_info(path):
     return info
 
 def probe_nvme(path, seconds=2.0, nth=8, bs=2 << 20):
-    """Random O_DIRECT reads of the model file at the size and depth the engine's expert
-    reads have (2 MiB blocks, 8 in flight): GB/s. The rate the cost model prices a miss at."""
+    """Random unbuffered reads of the model file at the size and depth the engine's
+    expert reads have (2 MiB blocks, 8 in flight): GB/s. The rate the cost model
+    prices a miss at. Linux: O_DIRECT+preadv; Windows: FILE_FLAG_NO_BUFFERING+
+    overlapped ReadFile through ctypes -- the same slice-shaped, cache-bypassing
+    reads the engine itself issues on each platform."""
     sz = os.path.getsize(path)
     if sz < bs * 64: return None
     tot = [0] * nth; err = [None] * nth
     deadline = time.time() + seconds
-    def w(i):
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-            buf = mmap.mmap(-1, bs)   # page-aligned, required by O_DIRECT
-            rng = random.Random(1000 + i); n = 0
-            while time.time() < deadline:
-                n += os.preadv(fd, [buf], rng.randrange(0, (sz - bs) // 4096) * 4096)
-            tot[i] = n; os.close(fd)
-        except Exception as e:
-            err[i] = repr(e)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        # use_last_error: ctypes must capture the thread's last error at the
+        # ReadFile call itself -- any intervening Python/WinAPI call (what the
+        # plain windll GetLastError() would see) has already overwritten it.
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        GENERIC_READ = 0x80000000; FILE_SHARE_READ = 1; OPEN_EXISTING = 3
+        FILE_FLAG_NO_BUFFERING = 0x20000000; FILE_FLAG_OVERLAPPED = 0x40000000
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        k32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.GetOverlappedResult.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # OVERLAPPED on x64: Internal/InternalHigh are ULONG_PTR (8 bytes);
+        # c_ulong would be 4 and hand ReadFile a malformed struct (error 87).
+        class OV(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_ulonglong), ("InternalHigh", ctypes.c_ulonglong),
+                        ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                        ("hEvent", ctypes.c_void_p)]
+        assert ctypes.sizeof(OV) == 32, "OVERLAPPED layout must match the x64 ABI"
+        def w(i):
+            try:
+                h = k32.CreateFileW(os.path.abspath(path), GENERIC_READ, FILE_SHARE_READ,
+                                    None, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, None)
+                if not h or h == ctypes.c_void_p(-1).value:
+                    err[i] = "CreateFileW failed"; return
+                ev = k32.CreateEventW(None, True, False, None)
+                # FILE_FLAG_NO_BUFFERING needs a sector-aligned buffer address;
+                # malloc (what create_string_buffer uses) only promises 16 B.
+                # Allocate with slack and round up to the next 4096 boundary.
+                raw = ctypes.create_string_buffer(bs + 4096)
+                base = (ctypes.addressof(raw) + 4095) & ~4095
+                buf = (ctypes.c_char * bs).from_buffer(raw, base - ctypes.addressof(raw))
+                rng = random.Random(1000 + i); n = 0
+                while time.time() < deadline:
+                    off = rng.randrange(0, (sz - bs) // 4096) * 4096
+                    ov = OV(0, 0, off & 0xFFFFFFFF, off >> 32, ev)
+                    got = wintypes.DWORD(0)
+                    ok = k32.ReadFile(h, buf, bs, ctypes.byref(got), ctypes.byref(ov))
+                    if not ok and ctypes.get_last_error() == 997:   # ERROR_IO_PENDING
+                        if not k32.GetOverlappedResult(h, ctypes.byref(ov), ctypes.byref(got), True):
+                            err[i] = "ReadFile failed"; break
+                    elif not ok:
+                        err[i] = "ReadFile error %d" % ctypes.get_last_error(); break
+                    n += got.value
+                tot[i] = n
+                k32.CloseHandle(h); k32.CloseHandle(ev)
+            except Exception as e:
+                err[i] = repr(e)
+    else:
+        def w(i):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                buf = mmap.mmap(-1, bs)   # page-aligned, required by O_DIRECT
+                rng = random.Random(1000 + i); n = 0
+                while time.time() < deadline:
+                    n += os.preadv(fd, [buf], rng.randrange(0, (sz - bs) // 4096) * 4096)
+                tot[i] = n; os.close(fd)
+            except Exception as e:
+                err[i] = repr(e)
     ts = [threading.Thread(target=w, args=(i,)) for i in range(nth)]
     t0 = time.time()
     for t in ts: t.start()
@@ -580,11 +719,25 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
 _ENGINES = {"t": 0.0, "v": []}
 def engines_running(max_age=0.0):
     if max_age and time.time() - _ENGINES["t"] < max_age: return _ENGINES["v"]
+    procs = []
     try:
-        out = subprocess.run(["pgrep", "-a", "-x", "qwfn-server"], capture_output=True, text=True, timeout=3).stdout
-        procs = [l for l in out.splitlines() if l.strip()]
-        out2 = subprocess.run(["pgrep", "-l", "qwfn-gen"], capture_output=True, text=True, timeout=3).stdout
-        procs += [l for l in out2.splitlines() if l.strip()]
+        if os.name == "nt":
+            # Windows: qwfn-server.exe / qwfn-gen.exe via tasklist (no pgrep).
+            # Emitted as "<pid> <name>" -- the same shape pgrep -l gives on Linux,
+            # which is what stop_server parses (l.split()[0]).
+            for name in ("qwfn-server.exe", "qwfn-gen.exe"):
+                out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + name, "/FO", "CSV", "/NH"],
+                                     capture_output=True, text=True, timeout=3).stdout
+                for l in out.splitlines():
+                    if name in l:
+                        f = [x for x in l.replace('"', "").split(",") if x]
+                        if len(f) >= 2:
+                            procs.append("%s %s" % (f[1], f[0]))   # pid first, like pgrep -l
+        else:
+            out = subprocess.run(["pgrep", "-a", "-x", "qwfn-server"], capture_output=True, text=True, timeout=3).stdout
+            procs = [l for l in out.splitlines() if l.strip()]
+            out2 = subprocess.run(["pgrep", "-l", "qwfn-gen"], capture_output=True, text=True, timeout=3).stdout
+            procs += [l for l in out2.splitlines() if l.strip()]
     except Exception:
         procs = []
     _ENGINES.update(t=time.time(), v=procs)
@@ -652,11 +805,24 @@ def start_server(model, s):
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
             log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
         log.flush()
-        # The bundle keeps ggml, the CUDA runtime and liburing next to the engine; the loader
-        # needs the directory for the libraries the CUDA backend dlopens.
+        # The bundle keeps ggml and the CUDA runtime next to the engine; the loader
+        # needs the directory on its search path (LD_LIBRARY_PATH on Linux, PATH on
+        # Windows, where the CUDA backend LoadLibrary's its DLLs). The bundle layout
+        # has the libs next to the binary; a source checkout instead uses the
+        # engine's own backend dir (~/.unsloth/llama.cpp/build/bin, the same place
+        # qwfn::llama_backend_dir() looks) or an explicit QWFN_BACKENDS.
         env = dict(os.environ); bindir = os.path.dirname(SERVER_BIN)
-        if os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
-            env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        lib_name = "libggml-base.so.0" if os.name != "nt" else "ggml-base.dll"
+        cands = [bindir]
+        if os.name == "nt":
+            cands.append(os.path.join(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "", ".unsloth", "llama.cpp", "build", "bin"))
+            if os.environ.get("QWFN_BACKENDS"): cands.append(os.environ["QWFN_BACKENDS"])
+        libdir = next((d for d in cands if d and os.path.exists(os.path.join(d, lib_name))), None)
+        if libdir:
+            if os.name == "nt":
+                env["PATH"] = libdir + os.pathsep + env.get("PATH", "")
+            else:
+                env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         try:
             proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
         except Exception as e:

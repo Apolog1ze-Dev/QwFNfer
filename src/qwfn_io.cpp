@@ -1,20 +1,59 @@
 #include "qwfn_io.h"
 
+#ifdef _WIN32
+// Windows port of the read engine. io_uring does not exist here; the thread
+// pool (the engine's default backend on Linux as well) becomes the only
+// backend. Direct I/O means FILE_FLAG_NO_BUFFERING: the same slice-sized,
+// unbuffered, positional reads the io_uring path issues, with the same
+// alignment contract (offset/length/destination follow the filesystem's
+// alignment, tracked by dio_align()).
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <filesystem>
+#else
 #include <liburing.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
-#include <unistd.h>
+#include <algorithm>
 
 namespace qwfn {
 
 static uint64_t g_dio_align = 512;
 uint64_t dio_align() { return g_dio_align; }
 void     set_dio_align(uint64_t a) { g_dio_align = a == QWFN_DIO_PAGE ? QWFN_DIO_PAGE : 512; }
+
+#ifdef _WIN32
+
+// --- aligned allocation ----------------------------------------------------
+// Same contract as the POSIX side: 4096-aligned, dio_align_up-sized, freeable
+// with dio_free. _aligned_malloc already rounds internally; the explicit
+// rounding keeps the *size* contract identical (>= dio_align_up(bytes)).
+void * dio_alloc(size_t bytes) {
+    const size_t sz = dio_align_up(bytes ? bytes : 1);
+    return _aligned_malloc(sz, 4096);
+}
+
+void dio_free(void * p) { _aligned_free(p); }
+
+// --- available memory ------------------------------------------------------
+// GlobalMemoryStatusEx's ullAvailPhys is the Windows analogue of
+// MemAvailable: what can be handed out without swapping to the pagefile.
+uint64_t mem_available_bytes() {
+    MEMORYSTATUSEX s;
+    s.dwLength = sizeof(s);
+    if (!GlobalMemoryStatusEx(&s)) return 0;
+    return s.ullAvailPhys;
+}
+
+#else // !_WIN32
 
 void * dio_alloc(size_t bytes) {
     void * p = nullptr;
@@ -37,6 +76,8 @@ uint64_t mem_available_bytes() {
     return kb * 1024ull;
 }
 
+#endif // _WIN32
+
 size_t clamp_to_available(size_t want, double frac, size_t headroom) {
     const uint64_t avail = mem_available_bytes();
     if (avail == 0) return want;                       // unknown: trust the caller
@@ -46,12 +87,201 @@ size_t clamp_to_available(size_t want, double frac, size_t headroom) {
     if ((uint64_t) want <= safe) return want;
     fprintf(stderr,
             "[qwfn] requested %.1f GB RAM tier but only %.1f GB is available; "
-            "clamping to %.1f GB (%.0f%% of MemAvailable minus %.1f GB headroom)\n",
+            "clamping to %.1f GB (%.0f%% of available memory minus %.1f GB headroom)\n",
             want / 1e9, avail / 1e9, safe / 1e9, frac * 100, headroom / 1e9);
     return (size_t) safe;
 }
 
 io_engine::~io_engine() { shutdown(); }
+
+#ifdef _WIN32
+
+// --- Windows backend -------------------------------------------------------
+// One handle per shard, opened with FILE_FLAG_NO_BUFFERING when direct I/O is
+// requested. Positional parallel reads go through ReadFile with a per-call
+// OVERLAPPED, which the OS serializes per handle without extra locking: each
+// worker owns its OVERLAPPED. On a synchronous handle (no FILE_FLAG_OVERLAPPED)
+// ReadFile + OVERLAPPED still positions the read but serializes callers, so
+// the file is opened overlapped to keep the workers actually parallel.
+
+bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_depth,
+                     bool direct_io, std::string & err, backend be) {
+    // io_uring does not exist on Windows; every backend enum value resolves to
+    // the thread pool, which is also the engine's default on Linux.
+    (void) be;
+    shutdown();
+    direct_ = direct_io;
+    be_     = backend::threads;
+    qd_     = queue_depth ? queue_depth : 256;
+
+    for (const auto & p : paths) {
+        const DWORD flags = direct_
+            ? FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
+            : FILE_FLAG_OVERLAPPED;
+        HANDLE h = CreateFileW(std::filesystem::path(p).wstring().c_str(), GENERIC_READ,
+                                FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+        if (h == INVALID_HANDLE_VALUE && direct_) {
+            // Some filesystems refuse unbuffered access; fall back, as on Linux.
+            h = CreateFileW(std::filesystem::path(p).wstring().c_str(), GENERIC_READ,
+                            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+            if (h != INVALID_HANDLE_VALUE) direct_ = false;
+        }
+        if (h == INVALID_HANDLE_VALUE) {
+            char buf[256];
+            const DWORD e = GetLastError();
+            FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                           nullptr, e, 0, buf, sizeof(buf), nullptr);
+            err = "open failed for " + p + ": " + buf;
+            shutdown();
+            return false;
+        }
+        fds_.push_back((int) (intptr_t) h);   // HANDLEs ride the same vector; closed in shutdown()
+    }
+
+    // 512-byte layout on a 4096-sector filesystem: read a page-aligned window
+    // into a worker buffer, then copy the payload into the slot -- same as the
+    // POSIX bounce path.
+    bounce_ = direct_ && dio_align() < QWFN_DIO_PAGE;
+
+    const unsigned n = qd_ ? std::min(qd_, 32u) : 8u;
+    stop_ = false;
+    for (unsigned i = 0; i < n; i++) workers_.emplace_back([this] { worker_loop(); });
+    return true;
+}
+
+void io_engine::shutdown() {
+    if (!workers_.empty()) {
+        { std::lock_guard<std::mutex> lk(mtx_); stop_ = true; }
+        cv_work_.notify_all();
+        for (auto & t : workers_) if (t.joinable()) t.join();
+        workers_.clear();
+        q_.clear(); done_.clear();
+        stop_ = false;
+    }
+    for (int fd : fds_) if (fd >= 0) CloseHandle((HANDLE) (intptr_t) fd);
+    fds_.clear();
+    in_flight_ = 0;
+}
+
+// A positional read on an overlapped handle. Each call carries its own
+// OVERLAPPED *with an event*: a NULL-event OVERLAPPED shared across threads
+// makes GetOverlappedResult unreliable (the classic pitfall), so a per-thread
+// event is created lazily and reused. ReadFile may return short; the loop
+// advances like the POSIX pread loop. Direct reads of a regular file either
+// complete fully or fail.
+static ssize_t read_at(HANDLE h, void * dst, size_t n, uint64_t off) {
+    static thread_local HANDLE ev = nullptr;
+    if (!ev) {
+        ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ev) return -1;
+    }
+    OVERLAPPED ov{};
+    ov.Offset     = (DWORD) (off & 0xFFFFFFFFull);
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    ov.hEvent     = ev;
+    size_t done = 0;
+    while (done < n) {
+        DWORD got = 0;
+        if (!ReadFile(h, (char *) dst + done, (DWORD) (n - done), &got, &ov)) {
+            if (GetLastError() == ERROR_IO_PENDING) {
+                if (!GetOverlappedResult(h, &ov, &got, TRUE)) return -1;
+            } else {
+                return -1;
+            }
+        }
+        if (got == 0) break;
+        done += got;
+        const uint64_t at = off + done;   // advance the position for a next short piece
+        ov.Offset     = (DWORD) (at & 0xFFFFFFFFull);
+        ov.OffsetHigh = (DWORD) (at >> 32);
+    }
+    return (ssize_t) done;
+}
+
+size_t io_engine::submit(const io_request * reqs, size_t n) {
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (size_t i = 0; i < n; i++) {
+            const io_request & r = reqs[i];
+            if (r.shard < 0 || (size_t) r.shard >= fds_.size() || !r.dst || r.nbytes == 0) continue;
+            uint64_t off = r.offset;
+            uint32_t len = r.nbytes;
+            if (direct_) { off = dio_align_down(r.offset); len = dio_padded_size(r.offset, r.nbytes); }
+            q_.push_back(job{ r.shard, off, len, r.dst, r.tag, r.offset, r.nbytes });
+            in_flight_++;
+        }
+    }
+    cv_work_.notify_all();
+    stat_t_prep += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return n;
+}
+
+size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete) {
+    size_t got = 0;
+    std::unique_lock<std::mutex> lk(mtx_);
+    while (got < max_tags) {
+        if (done_.empty()) {
+            if (got >= min_complete) break;
+            if (in_flight_ == 0) break;   // nothing outstanding: return short, never hang
+            cv_done_.wait(lk, [this] { return !done_.empty() || in_flight_ == 0; });
+            if (done_.empty()) break;
+        }
+        tags_out[got++] = done_.front();
+        done_.pop_front();
+    }
+    return got;
+}
+
+void io_engine::worker_loop() {
+    for (;;) {
+        job j;
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_work_.wait(lk, [this] { return stop_ || !q_.empty(); });
+            if (stop_ && q_.empty()) return;
+            j = q_.front();
+            q_.pop_front();
+        }
+        ssize_t got = 0;
+        if (bounce_) {
+            // Page-aligned window into this worker's buffer, then the payload
+            // goes where the 512-byte layout expects it.
+            static thread_local uint8_t * scratch = nullptr;
+            static thread_local size_t    scratch_bytes = 0;
+            const uint64_t w0 = j.ooff & ~(QWFN_DIO_PAGE - 1);
+            const uint64_t w1 = (j.ooff + j.onb + QWFN_DIO_PAGE - 1) & ~(QWFN_DIO_PAGE - 1);
+            const size_t   wl = (size_t) (w1 - w0);
+            if (scratch_bytes < wl) {
+                if (scratch) dio_free(scratch);
+                scratch_bytes = wl + (1u << 20);
+                scratch = (uint8_t *) dio_alloc(scratch_bytes);
+            }
+            const ssize_t need = (ssize_t) (j.ooff - w0 + j.onb);
+            if (scratch) {
+                got = read_at((HANDLE) (intptr_t) fds_[j.shard], scratch, wl, w0);
+                if (got >= need) {
+                    memcpy((char *) j.dst + dio_pad(j.ooff), scratch + (j.ooff - w0), j.onb);
+                    got = (ssize_t) j.len;
+                } else {
+                    got = 0;
+                }
+            }
+        } else {
+            got = read_at((HANDLE) (intptr_t) fds_[j.shard], j.dst, j.len, j.off);
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (got < (ssize_t) j.len) stat_errors++;
+            else { stat_reads++; stat_bytes += (uint64_t) got; }
+            done_.push_back(j.tag);
+            in_flight_--;
+        }
+        cv_done_.notify_all();
+    }
+}
+
+#else // !_WIN32 ---------------------------------------------------------------
 
 bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_depth,
                      bool direct_io, std::string & err, backend be) {
@@ -301,5 +531,7 @@ void io_engine::worker_loop() {
         cv_done_.notify_all();
     }
 }
+
+#endif // !_WIN32
 
 } // namespace qwfn

@@ -16,12 +16,20 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <random>
 #include <string>
+#include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <filesystem>
+#else
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <vector>
+#endif
 
 using namespace qwfn;
 using clk = std::chrono::steady_clock;
@@ -116,6 +124,21 @@ static void bench_mmap(model_index & mi, int n_tokens_equiv) {
     std::vector<void *> maps(mi.shard_paths().size(), nullptr);
     std::vector<size_t> sizes(mi.shard_paths().size(), 0);
     for (size_t i = 0; i < mi.shard_paths().size(); i++) {
+#ifdef _WIN32
+        // A read-only file mapping: the Windows equivalent of a private
+        // read-only mmap, demand-paged through the page cache just the same.
+        HANDLE f = CreateFileW(std::filesystem::path(mi.shard_paths()[i]).wstring().c_str(),
+                               GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) { printf("  open failed\n"); return; }
+        LARGE_INTEGER sz{}; GetFileSizeEx(f, &sz);
+        HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        CloseHandle(f);
+        if (!m) { printf("  mmap failed\n"); return; }
+        void * p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(m);
+        if (!p) { printf("  mmap failed\n"); return; }
+        maps[i] = p; sizes[i] = (size_t) sz.QuadPart;
+#else
         int fd = open(mi.shard_paths()[i].c_str(), O_RDONLY);
         if (fd < 0) { printf("  open failed\n"); return; }
         const off_t sz = lseek(fd, 0, SEEK_END);
@@ -124,6 +147,7 @@ static void bench_mmap(model_index & mi, int n_tokens_equiv) {
         if (p == MAP_FAILED) { printf("  mmap failed\n"); return; }
         madvise(p, (size_t) sz, MADV_RANDOM);
         maps[i] = p; sizes[i] = (size_t) sz;
+#endif
     }
 
     std::mt19937_64 g(1234);
@@ -146,7 +170,12 @@ static void bench_mmap(model_index & mi, int n_tokens_equiv) {
     const double dt = secs(t0, clk::now());
     printf("  demand paging: %6.2f GB/s -> %6.2f tok/s if every access misses  (checksum %" PRIu64 ")\n",
            bytes / dt / 1e9, n_tokens_equiv / dt, acc & 0xFF);
-    for (size_t i = 0; i < maps.size(); i++) if (maps[i]) munmap(maps[i], sizes[i]);
+    for (size_t i = 0; i < maps.size(); i++)
+#ifdef _WIN32
+        if (maps[i]) UnmapViewOfFile(maps[i]);
+#else
+        if (maps[i]) munmap(maps[i], sizes[i]);
+#endif
 }
 
 // ------------------------------------------------------- cached decode loop

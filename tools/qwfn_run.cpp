@@ -20,6 +20,7 @@
 // weights that never leave host RAM.
 
 #include "qwfn_expert_cache.h"
+#include "qwfn_home.h"
 #include "qwfn_graph.h"
 #include "qwfn_model.h"
 #include "qwfn_ple.h"
@@ -95,7 +96,7 @@ int main(int argc, char ** argv) {
     const int64_t hc = hp.hc_count, n_embd = hp.n_embd;
     const int64_t n_used = hp.n_expert_used;
 
-    const std::string bedir = std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin";
+    const std::string bedir = qwfn::llama_backend_dir();
 
     // Dense core -> GPU. It is 4.29B of the 6.65B active parameters, so this is
     // the difference between ~30 GB/s and 736 GB/s on most of the work.

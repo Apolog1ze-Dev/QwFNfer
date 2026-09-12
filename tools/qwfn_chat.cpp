@@ -21,6 +21,7 @@
 // only its own new tokens, not the conversation so far.
 
 #include "qwfn_engine.h"
+#include "qwfn_home.h"
 #include "qwfn_model.h"
 #include "qwfn_vocab.h"
 #include "qwfn_vision.h"
@@ -32,7 +33,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <io.h>
+#define isatty(f) _isatty(f)
+#define fileno(f) _fileno(f)
+#else
 #include <unistd.h>
+#endif
 #include <iostream>
 #include <random>
 #include <string>
@@ -145,7 +152,7 @@ static std::string expand_path(std::string p) {
         p = un;
     }
     if (p == "~" || p.rfind("~/", 0) == 0) {
-        const char * home = getenv("HOME");
+        const char * home = qwfn::home_env();
         if (home) p = std::string(home) + p.substr(1);
     }
     return p;
@@ -301,7 +308,7 @@ int main(int argc, char ** argv) {
     if (!mi.load(argv[1], err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
 
     engine eng;
-    if (!eng.init(&mi, nullptr, cfg, std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!eng.init(&mi, nullptr, cfg, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", eng.memory_summary().c_str());

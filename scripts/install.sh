@@ -15,7 +15,7 @@ BIN=${QWFN_BIN:-$HOME/.local/bin}
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf 'qwfnfer install: %s\n' "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = Linux ] || die "Linux only for now: the engine reads the NVMe through io_uring (Windows needs a port of that layer)"
+[ "$(uname -s)" = Linux ] || die "this installer delivers the Linux bundle; on Windows build from source instead (README, 'Building from source')"
 [ "$(uname -m)" = x86_64 ] || die "x86_64 only"
 command -v python3 >/dev/null || die "python3 is needed for the console (apt install python3 / dnf install python3)"
 command -v unzip >/dev/null || die "unzip is needed (apt install unzip / dnf install unzip)"
