@@ -22,7 +22,14 @@ import argparse, glob, http.server, json, math, mmap, os, random, signal, socket
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HF = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
 # The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
-SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server" + (".exe" if os.name == "nt" else "")), os.path.join(ROOT, "build", "qwfn-server" + (".exe" if os.name == "nt" else ""))) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server" + (".exe" if os.name == "nt" else "")))
+# The engine: bin/ in the release bundle, build/ in a source checkout (on
+# Windows a separate build-win/ is common to keep a Linux build around), or
+# QWFN_SERVER.
+_EXE = "qwfn-server" + (".exe" if os.name == "nt" else "")
+_CANDS = [os.path.join(ROOT, "bin", _EXE), os.path.join(ROOT, "build", _EXE)]
+if os.name == "nt":
+    _CANDS.append(os.path.join(ROOT, "build-win", _EXE))
+SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in _CANDS if os.path.exists(p)), _CANDS[1])
 LOG_DIR = os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
 os.makedirs(LOG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(LOG_DIR, "config.json")

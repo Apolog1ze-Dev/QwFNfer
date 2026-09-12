@@ -204,3 +204,44 @@ add_executable(qwfn-train-predictor tools/qwfn_train_predictor.cpp)
 target_link_libraries(qwfn-train-predictor PRIVATE qwfn_core)
 qwfn_opts(qwfn-train-predictor)
 target_compile_definitions(qwfn-train-predictor PRIVATE LLAMA_CPP_BUILD_DIR="${LLAMA_CPP_BUILD}")
+
+# --- Windows: stage the shared libraries next to the executables --------------------
+# The same contract as scripts/package.sh on Linux (its bundle copies every .so
+# into bin/): the loader, the engine's backend directory and the console's PATH
+# injection all find the libraries in one place without PATH setup. In a source
+# checkout that keeps a plain `cmake --build build-win` runnable everywhere.
+if(WIN32)
+  set(QWFN_STAGE_LIBS "")
+  foreach(dll ggml-base ggml ggml-cpu ggml-cuda llama)
+    if(EXISTS "${LLAMA_CPP_BUILD}/${dll}.dll")
+      list(APPEND QWFN_STAGE_LIBS "${LLAMA_CPP_BUILD}/${dll}.dll")
+    endif()
+  endforeach()
+  # ggml-cuda's cuBLAS imports (cudart is linked statically into it). CUDA
+  # 13.4 keeps the x64 runtimes in bin/x64; older toolkits put them in bin/.
+  set(_cuda_root "${CUDA_TOOLKIT_ROOT}")
+  if(NOT _cuda_root AND DEFINED ENV{CUDA_PATH})
+    set(_cuda_root "$ENV{CUDA_PATH}")
+  endif()
+  if(NOT _cuda_root)
+    set(_cuda_root "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4")
+  endif()
+  foreach(cub cublas64_13 cublasLt64_13)
+    foreach(sub x64 .)
+      if(EXISTS "${_cuda_root}/bin/${sub}/${cub}.dll")
+        list(APPEND QWFN_STAGE_LIBS "${_cuda_root}/bin/${sub}/${cub}.dll")
+        break()
+      endif()
+    endforeach()
+  endforeach()
+  if(QWFN_STAGE_LIBS)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/stage-dlls")
+    foreach(lib ${QWFN_STAGE_LIBS})
+      file(COPY "${lib}" DESTINATION "${CMAKE_BINARY_DIR}/stage-dlls")
+    endforeach()
+    add_custom_target(qwfn-stage-dlls ALL DEPENDS ${QWFN_STAGE_LIBS}
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${QWFN_STAGE_LIBS} $<TARGET_FILE_DIR:qwfn-server>
+      COMMENT "staging ggml/llama/CUDA DLLs next to the executables")
+    add_dependencies(qwfn-server qwfn-stage-dlls)
+  endif()
+endif()
