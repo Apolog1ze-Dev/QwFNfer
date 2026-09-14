@@ -125,7 +125,15 @@ Thinking comes back as `thinking` blocks and tool calls as `tool_use` blocks, st
 
 **Or additive, in the app you already use.** Claude Code takes one base URL, so `tools/qwfn_router.py` listens on it and forwards each request by the model it names: the local model's id goes to the engine, everything else goes to `api.anthropic.com` as it came, headers and body untouched, so the claude.ai login, prompt caching and the beta features keep working. `python3 tools/qwfn_router.py --configure` points Claude Code at it (`~/.claude/settings.json`: `env.ANTHROPIC_BASE_URL` and a `modelPicker` entry, a backup kept; `--unconfigure` reverts) and `--install-service` keeps it running as a systemd user service. The local model then shows in `/model` next to the Anthropic ones, in the same app and the same list of sessions, and each session picks. Side requests (titles, summaries) use the session's small model, so they go to Anthropic and leave the engine's prefix alone.
 
-**Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, liburing and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer (default `~/.unsloth/llama.cpp`, override with `-DLLAMA_CPP_ROOT`):
+**Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, liburing and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer — Unsloth's `b10798-mix-659e406`, the mix the forward pass is validated against:
+
+```bash
+git clone --depth 1 --branch b10798-mix-659e406 https://github.com/unslothai/llama.cpp ~/.unsloth/llama.cpp
+cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake --build ~/.unsloth/llama.cpp/build -j
+```
+
+Then the engine (`-DLLAMA_CPP_ROOT=<path>` if that tree is somewhere else; at run time the server looks for the ggml backends in `~/.unsloth/llama.cpp/build/bin`, or next to its own binary):
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && scripts/console.sh
