@@ -6,10 +6,22 @@
 # floor is the build machine's, written to the bundle's GLIBC file and refused by install.sh
 # on anything older -- so build on the oldest distribution you mean to support), ggml/llama.cpp's shared libraries from a portable build (GGML_NATIVE=OFF, every
 # CPU variant, CUDA architectures 75-120), the CUDA runtime libraries NVIDIA redistributes
-# (cudart, cublas, cublasLt), liburing and libgomp, the console, the launcher, the README.
+# (cudart, cublas, cublasLt), the console, the launcher, the README.
+#
+# The C++ and OpenMP runtimes and liburing are fetched from Ubuntu's archive rather than copied
+# off this machine, and cached in RUNTIME_LIBS. A copied library is built for the build machine's CPU,
+# and a distribution that compiles its packages for AVX-512 puts AVX-512 into all of them: into
+# libgomp and liburing as instructions that fault where they are not supported, and into
+# libstdc++.a and libgcc.a -- which QWFN_PORTABLE used to link statically -- as an ISA property
+# the linker ORs into every binary, marking it "x86-64-v4 needed" whatever -march the engine
+# itself was built with and leaving glibc's loader to refuse it on every CPU without AVX-512.
+# Ubuntu's amd64 packages are plain x86-64. The ISA check below fails the build if v4 reaches
+# the bundle anyway: the startup check cannot see it, running as it does on the one machine
+# guaranteed to support whatever it has just compiled.
 #
 #   scripts/package.sh                 uses the defaults below
 #   GGML_LIBS=... CUDA_LIBS=... VERSION=v0.3 scripts/package.sh
+#   RUNTIME_LIBS=/path/to/dir scripts/package.sh    four .so files you supply, instead of Ubuntu's
 #
 # Inputs:
 #   LLAMA_CPP_ROOT  llama.cpp source (ggml headers, vendor/)         default ~/.unsloth/llama.cpp
@@ -31,6 +43,16 @@
 #                   On a distribution whose compiler the CUDA toolkit refuses, add
 #                   CC=gcc-12 CXX=g++-12 and -DCMAKE_CUDA_HOST_COMPILER=g++-12.
 #   CUDA_LIBS       where libcudart/libcublas/libcublasLt live         default /opt/cuda/lib64 or /usr/local/cuda/lib64
+#   RUNTIME_LIBS    libstdc++.so.6, libgcc_s.so.1, libgomp.so.1,        default ~/.cache/qwfnfer-build/runtime
+#                   liburing.so.2. Downloaded on the first run and kept, each .deb checked
+#                   against the SHA256 in the archive's own index; put your own four .so files
+#                   there to skip the download entirely.
+#   RUNTIME_SUITE   the release they come from                          default noble (24.04 LTS)
+#   RUNTIME_MIRROR  the archive to take them from                       default https://archive.ubuntu.com/ubuntu
+#                   noble is GCC 14: libstdc++ carries GLIBCXX_3.4.33, which covers libllama's
+#                   3.4.31, and the four of them need no more than GLIBC_2.38, which is at or
+#                   below the floor the engine sets anyway. Both are checked before the zip is
+#                   written, so a different release that does not hold up fails the build.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 LLAMA_CPP_ROOT=${LLAMA_CPP_ROOT:-$HOME/.unsloth/llama.cpp}
@@ -40,6 +62,9 @@ if [ -z "${CUDA_LIBS:-}" ]; then
 fi
 : "${CUDA_LIBS:?no CUDA runtime libraries found; set CUDA_LIBS}"
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || date +%Y%m%d)}
+RUNTIME_LIBS=${RUNTIME_LIBS:-$HOME/.cache/qwfnfer-build/runtime}
+RUNTIME_SUITE=${RUNTIME_SUITE:-noble}
+RUNTIME_SOS="libstdc++.so.6 libgcc_s.so.1 libgomp.so.1 liburing.so.2"
 NAME=qwfnfer-linux-x86_64-cuda
 OUT=dist/$NAME
 
@@ -49,6 +74,45 @@ cmake -S . -B build-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DQWFN_PORTABLE
       -DLLAMA_CPP_ROOT="$LLAMA_CPP_ROOT" -DLLAMA_CPP_BUILD="$GGML_LIBS" > build-portable.cmake.log 2>&1 || { tail -20 build-portable.cmake.log; exit 1; }
 cmake --build build-portable --target qwfn-server qwfn-tok | tail -2
 
+have_runtime=yes
+for so in $RUNTIME_SOS; do [ -f "$RUNTIME_LIBS/$so" ] || have_runtime=no; done
+if [ "$have_runtime" = no ]; then
+    mirror=${RUNTIME_MIRROR:-https://archive.ubuntu.com/ubuntu}
+    echo "== runtime libraries ($RUNTIME_SUITE from $mirror -> $RUNTIME_LIBS)"
+    work=$RUNTIME_LIBS/.work; rm -rf "$work"; mkdir -p "$work"
+    curl -fsSL "$mirror/dists/$RUNTIME_SUITE/main/binary-amd64/Packages.xz" | xz -d > "$work/Packages" \
+        || { echo "cannot read the $RUNTIME_SUITE package index from $mirror" >&2; exit 1; }
+    for pkg in libstdc++6 libgcc-s1 libgomp1 liburing2; do
+        # the index gives the pool path, so nothing here has a package version baked into it
+        path=$(awk -v p="$pkg" '$1=="Package:"{c=($2==p)} c&&$1=="Filename:"{print $2; exit}' "$work/Packages")
+        sha=$(awk -v p="$pkg" '$1=="Package:"{c=($2==p)} c&&$1=="SHA256:"{print $2; exit}' "$work/Packages")
+        [ -n "$path" ] || { echo "$pkg is not in $RUNTIME_SUITE" >&2; exit 1; }
+        curl -fsSL -o "$work/$pkg.deb" "$mirror/$path" || { echo "cannot download $mirror/$path" >&2; exit 1; }
+        # these end up in a release, so take the index's word for what the file should be
+        [ -z "$sha" ] || echo "$sha  $work/$pkg.deb" | sha256sum -c --status \
+            || { echo "$pkg.deb does not match the SHA256 the index gives for it" >&2; exit 1; }
+        data=$(ar t "$work/$pkg.deb" | grep '^data\.tar' | head -1)
+        case $data in
+            *.xz)  ar p "$work/$pkg.deb" "$data" | tar -xJf - -C "$work" ;;
+            # Debian compresses data.tar with xz, Ubuntu with zstd, and tar shells out for it
+            *.zst) command -v zstd > /dev/null || { echo "$RUNTIME_SUITE ships $data; install zstd to unpack it" >&2; exit 1; }
+                   ar p "$work/$pkg.deb" "$data" | tar --zstd -xf - -C "$work" ;;
+            *)     ar p "$work/$pkg.deb" "$data" | tar -xzf - -C "$work" ;;
+        esac
+    done
+    for so in $RUNTIME_SOS; do
+        # The package ships the real file under its full version (libstdc++.so.6.0.33) and a
+        # symlink, so -type f picks the file. Searching the whole tree rather than a named
+        # libdir: a merged-/usr release has no lib/x86_64-linux-gnu, and find failing on a
+        # directory that is not there would take the build down through pipefail.
+        src=$(find "$work" -name "$so*" -type f 2>/dev/null | sort | head -1 || true)
+        [ -n "$src" ] || { echo "$so is not in the $RUNTIME_SUITE packages" >&2; exit 1; }
+        cp "$src" "$RUNTIME_LIBS/$so"
+    done
+    rm -rf "$work"
+    echo "fetched: $(cd "$RUNTIME_LIBS" && ls $RUNTIME_SOS | tr '\n' ' ')"
+fi
+
 echo "== bundle $OUT"
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/tools/console"
 cp build-portable/qwfn-server build-portable/qwfn-tok "$OUT/bin/"
@@ -56,8 +120,7 @@ cp build-portable/qwfn-server build-portable/qwfn-tok "$OUT/bin/"
 for so in libggml-base.so.0 libggml.so.0 libllama.so.0 libggml-cuda.so; do cp -L "$GGML_LIBS/$so" "$OUT/bin/"; done
 for so in "$GGML_LIBS"/libggml-cpu-*.so; do cp -L "$so" "$OUT/bin/"; done
 for so in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do cp -L "$CUDA_LIBS/$so" "$OUT/bin/"; done
-uring=$(ldd build-portable/qwfn-server | awk '/liburing/ {print $3}'); cp -L "$uring" "$OUT/bin/liburing.so.2"
-gomp=$(ldd "$GGML_LIBS/libggml-cpu-haswell.so" | awk '/libgomp/ {print $3}'); [ -n "$gomp" ] && cp -L "$gomp" "$OUT/bin/libgomp.so.1"
+for so in $RUNTIME_SOS; do cp -L "$RUNTIME_LIBS/$so" "$OUT/bin/"; done
 cp tools/qwfn_console.py tools/qwfn_router.py "$OUT/tools/"; cp tools/console/index.html "$OUT/tools/console/"
 cp scripts/qwfnfer "$OUT/qwfnfer"; chmod +x "$OUT/qwfnfer" "$OUT/bin/qwfn-server" "$OUT/bin/qwfn-tok"
 mkdir -p "$OUT/scripts"; cp scripts/claude-desktop.sh "$OUT/scripts/"; chmod +x "$OUT/scripts/claude-desktop.sh"
@@ -78,10 +141,40 @@ EOF
 echo "== checks"
 missing=$(LD_LIBRARY_PATH="$PWD/$OUT/bin" ldd "$OUT/bin/qwfn-server" "$OUT/bin/libggml-cuda.so" | grep "not found" || true)
 [ -z "$missing" ] || { echo "unresolved libraries:"; echo "$missing"; exit 1; }
-outside=$(LD_LIBRARY_PATH="$PWD/$OUT/bin" ldd "$OUT/bin/qwfn-server" "$OUT/bin/libggml-cuda.so" | sed -n 's/.*=> \(.*\) (0x.*/\1/p' | grep -v -F "$PWD/$OUT/bin/" | grep -v -E "/(libc|libm|libdl|libpthread|librt|libgcc_s|libstdc\+\+|libcuda|ld-linux)[.-]" | sort -u || true)
+outside=$(LD_LIBRARY_PATH="$PWD/$OUT/bin" ldd "$OUT/bin/qwfn-server" "$OUT/bin/libggml-cuda.so" | sed -n 's/.*=> \(.*\) (0x.*/\1/p' | grep -v -F "$PWD/$OUT/bin/" | grep -v -E "/(libc|libm|libdl|libpthread|librt|libcuda|ld-linux)[.-]" | sort -u || true)
 [ -z "$outside" ] || echo "note: resolved outside the bundle (expected only base-system libraries): $outside"
 floor=$(for f in "$OUT"/bin/*.so* "$OUT"/bin/qwfn-server; do objdump -T "$f" 2>/dev/null | grep -o "GLIBC_[0-9.]*"; done | sort -V | uniq | tail -1)
 echo "glibc floor of the bundle: $floor"; echo "${floor#GLIBC_}" > "$OUT/GLIBC"
+# grep finds nothing in a binary that imports no GLIBCXX at all, and pipefail would take the
+# whole build down with it, so every one of these is allowed to come back empty.
+cxxneed=$(for f in "$OUT"/bin/qwfn-server "$OUT"/bin/qwfn-tok "$OUT"/bin/libggml*.so* "$OUT"/bin/libllama.so.0; do objdump -T "$f" 2>/dev/null | grep -o "GLIBCXX_[0-9.]*" || true; done | sort -V | uniq | tail -1)
+cxxhave=$({ readelf -V "$OUT/bin/libstdc++.so.6" 2>/dev/null | grep -o "GLIBCXX_[0-9.]*" || true; } | sort -V | uniq | tail -1)
+if [ -n "$cxxneed" ] && [ "$(printf '%s\n%s\n' "$cxxneed" "$cxxhave" | sort -V | tail -1)" != "$cxxhave" ]; then
+    echo "the bundled libstdc++ carries $cxxhave, but the engine and the ggml libraries want $cxxneed" >&2
+    echo "take the runtime from a newer release: rm -rf $RUNTIME_LIBS && RUNTIME_SUITE=<newer> scripts/package.sh" >&2
+    exit 1
+fi
+echo "libstdc++: bundled $cxxhave, needed $cxxneed"
+# Every CPU the bundle claims to support must be able to load it: x86-64-v3 is the floor the
+# engine is compiled for, so anything marked v4 (AVX-512) here came off a machine that builds
+# for AVX-512, and would fail on Intel 12th-14th gen consumer parts and Zen 1-3.
+# libggml-cpu-*.so are exempt by design: ggml dlopens the variant the CPU supports.
+command -v readelf > /dev/null || { echo "readelf (binutils) is needed to check the bundle's ISA level" >&2; exit 1; }
+v4=""; checked=""
+for so in qwfn-server qwfn-tok libggml-base.so.0 libggml.so.0 libllama.so.0 libggml-cuda.so $RUNTIME_SOS; do
+    checked="$checked $so"
+    if readelf -n "$OUT/bin/$so" 2>/dev/null | grep -qE "x86 ISA (needed|used):.*x86-64-v4"; then v4="$v4 $so"; fi
+done
+if [ -n "$v4" ]; then
+    echo "AVX-512 (x86-64-v4) in:$v4" >&2
+    for so in $v4; do readelf -n "$OUT/bin/$so" | grep -oE "x86 ISA (needed|used):.*" | sed "s|^|  $so: |" >&2; done
+    echo "this bundle would not start, or would fault, on any CPU without AVX-512. The engine is" >&2
+    echo "built -march=x86-64-v3 and the ggml libraries GGML_NATIVE=OFF, so whatever is listed above" >&2
+    echo "was linked against, or copied from, something built for AVX-512. For libstdc++, libgcc_s," >&2
+    echo "libgomp or liburing: rm -rf $RUNTIME_LIBS and let the archive's be fetched again." >&2
+    exit 1
+fi
+echo "ISA level: x86-64-v3, no AVX-512 in$checked"
 if { "$OUT/bin/qwfn-server" 2>&1 || true; } | grep -q "usage: qwfn-server"; then echo "qwfn-server runs (libraries from bin/ via RUNPATH)"; else echo "qwfn-server does not start" >&2; exit 1; fi
 python3 - "$OUT" "dist/$NAME.zip" <<'EOF'
 import os, sys, zipfile, stat

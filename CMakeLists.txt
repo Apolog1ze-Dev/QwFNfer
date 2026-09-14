@@ -21,13 +21,23 @@ set(LLAMA_CPP_ROOT "$ENV{HOME}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source 
 set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build/bin"   CACHE PATH "llama.cpp built libraries")
 # QWFN_PORTABLE builds the release bundle (scripts/package.sh): baseline x86-64-v3 code
 # instead of this machine's -march=native, a glibc 2.34 floor (cmake/glibc_compat.h keeps
-# the pre-C23 strtol/sscanf symbols, -fno-math-errno the pre-2.43 sqrtf), libstdc++ and
-# libgcc linked in, and the ggml/CUDA libraries found next to the binaries ($ORIGIN).
+# the pre-C23 strtol/sscanf symbols, -fno-math-errno the pre-2.43 sqrtf), and the ggml/CUDA
+# libraries found next to the binaries ($ORIGIN). Every target the bundle ships takes
+# QWFN_ARCH_FLAGS, the -O2 ones included: without it they are built for whatever -march the
+# build machine's compiler happens to default to, which is nobody's guarantee of x86-64-v3.
+#
+# -static-libstdc++ -static-libgcc used to be here as well, to keep the bundle off the user's
+# C++ runtime. They also copy the build machine's runtime into the binaries, and the linker
+# ORs the ISA property of every object it links into the output: on a distribution that
+# compiles libstdc++.a and libgcc.a for AVX-512 that leaves the binaries marked "x86-64-v4
+# needed" whatever -march the engine itself was built with, after which glibc's loader
+# refuses to start them on any CPU without AVX-512. It bought little in return -- libllama
+# and the ggml libraries link libstdc++ dynamically, so the bundle needs the user's copy
+# either way -- and the C++ runtime is one thing every distribution has.
 option(QWFN_PORTABLE "Relocatable release build" OFF)
 if(QWFN_PORTABLE)
   set(QWFN_ARCH_FLAGS -march=x86-64-v3 -mtune=generic)
   add_compile_options(-include "${CMAKE_SOURCE_DIR}/cmake/glibc_compat.h" -fno-math-errno)
-  add_link_options(-static-libstdc++ -static-libgcc)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
   set(CMAKE_INSTALL_RPATH "$ORIGIN")
 else()
@@ -120,7 +130,7 @@ target_include_directories(qwfn-server PRIVATE
   "${LLAMA_CPP_ROOT}/vendor"
   "${LLAMA_CPP_ROOT}/vendor/cpp-httplib")
 target_link_libraries(qwfn-server PRIVATE qwfn_core llama_ref)
-target_compile_options(qwfn-server PRIVATE -O2)
+target_compile_options(qwfn-server PRIVATE -O2 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-chat tools/qwfn_chat.cpp src/qwfn_vocab.cpp)
 target_include_directories(qwfn-chat PRIVATE "${LLAMA_CPP_ROOT}/include")
@@ -130,7 +140,7 @@ target_compile_options(qwfn-chat PRIVATE -O3 ${QWFN_ARCH_FLAGS})
 add_executable(qwfn-tok tools/qwfn_tok.cpp src/qwfn_vocab.cpp)
 target_include_directories(qwfn-tok PRIVATE "${LLAMA_CPP_ROOT}/include")
 target_link_libraries(qwfn-tok PRIVATE qwfn_core llama_ref)
-target_compile_options(qwfn-tok PRIVATE -O2)
+target_compile_options(qwfn-tok PRIVATE -O2 ${QWFN_ARCH_FLAGS})
 
 add_executable(qwfn-gen tools/qwfn_gen.cpp)
 target_link_libraries(qwfn-gen PRIVATE qwfn_core)

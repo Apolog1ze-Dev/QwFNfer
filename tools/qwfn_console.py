@@ -697,8 +697,8 @@ def start_server(model, s):
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
             log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
         log.flush()
-        # The bundle keeps ggml, the CUDA runtime and liburing next to the engine; the loader
-        # needs the directory for the libraries the CUDA backend dlopens.
+        # The bundle keeps ggml, the CUDA and C++ runtimes and liburing next to the engine; the
+        # loader needs the directory for the libraries the CUDA backend dlopens.
         env = dict(os.environ); bindir = os.path.dirname(SERVER_BIN)
         if os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
             env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
