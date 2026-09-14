@@ -29,6 +29,8 @@
   .model { display:grid; grid-template-columns: 22px 1fr; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
   .model.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
   .model .name { font-weight:600 } .model .sub { color:var(--dim); font-size:12px } .badge { display:inline-block; font-size:10.5px; padding:1px 6px; border:1px solid var(--line); border-radius:6px; color:var(--dim); margin-left:6px; vertical-align:1px } .badge.ok { color:var(--ok); border-color:rgba(110,231,183,.4) }
+  .skipped { margin-top:10px; font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:4px }
+  .skipped > div { border-left:2px solid var(--line); padding-left:8px } .skipped code { font-family:var(--mono); font-size:11.5px; color:var(--fg); display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap } .skipped span { display:block; margin-top:1px }
   .locs { display:flex; flex-direction:column; gap:6px; margin-top:8px } .locrow { display:flex; gap:8px; align-items:center; font-size:12.5px } .locrow code { font-family:var(--mono); font-size:12px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 } .locrow .x { background:transparent; color:var(--dim); border:1px solid var(--line); padding:2px 8px; font-size:12px }
   .addloc { display:flex; gap:8px; margin-top:8px } .addloc input { flex:1 }
   .kv { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:10px }
@@ -263,6 +265,7 @@
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 let models = [], selected = null, reco = null, presetId = 'coding', customDirty = false, hist = [], peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }, lastStatus = null, lastLive = null, pageReady = false;
 const fmt = (n, d=1) => (n === undefined || n === null || isNaN(n)) ? '—' : Number(n).toFixed(d);
 const big = n => (n === undefined || n === null || isNaN(n)) ? '—' : n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(Math.round(n));
@@ -280,9 +283,9 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 try { const t = (location.hash || '').replace('#', '') || localStorage.getItem('qwfn.tab'); if (t) { const b = document.querySelector('nav button[data-tab="' + t + '"]'); if (b) b.click(); } } catch (e) {}
 
 // ---- models and locations ----
-let locations = [];
+let locations = [], skipped = [];
 async function loadModels() {
-  const d = await api('/api/models'); models = d.models; locations = d.locations || [];
+  const d = await api('/api/models'); models = d.models; locations = d.locations || []; skipped = d.skipped || [];
   if (!models.find(m => m.path === selected)) {
     const last = d.last && models.find(m => m.path === d.last.model);
     const q4 = models.find(m => m.quant === 'Q4_K_XL');
@@ -293,7 +296,18 @@ async function loadModels() {
 }
 function renderModels() {
   const el = $('models'); el.innerHTML = '';
-  if (!models.length) { el.innerHTML = '<span class="muted">no Qwen3.8-Flash-Next GGUF found. Download one (<code>hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"</code>) or add the folder that holds it under Model locations.</span>'; return; }
+  if (!models.length) {
+    // Nothing to serve. If the scan did find GGUFs and rejected them, the reason is the answer:
+    // show it, rather than telling someone who has just downloaded 111 GB that there is nothing there.
+    let h = '<span class="muted">no Qwen3.8-Flash-Next GGUF found in ' + locations.map(l => '<code>' + esc(l.path) + '</code>').join(', ') + '.</span>';
+    if (skipped.length) {
+      h += '<div class="skipped">Found, but not served:' + skipped.slice(0, 8).map(k =>
+        '<div><code title="' + esc(k.path) + '">' + esc(k.path.split('/').slice(-2).join('/')) + '</code><span>' + esc(k.why) + '</span></div>').join('') +
+        (skipped.length > 8 ? '<div class="muted">and ' + (skipped.length - 8) + ' more</div>' : '') + '</div>';
+    }
+    h += '<div class="muted" style="margin-top:8px">Download one (<code>hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"</code>) or add the folder that holds it under Model locations. The caches above are the ones <code>hf</code> uses (<code>HF_HUB_CACHE</code>, <code>HUGGINGFACE_HUB_CACHE</code>, <code>HF_HOME</code>, <code>XDG_CACHE_HOME</code>, then <code>~/.cache</code>); a download made with <code>--local-dir</code> sits outside all of them and needs adding.</div>';
+    el.innerHTML = h; return;
+  }
   let loc = null;
   models.forEach(m => {
     if (m.location !== loc) { loc = m.location; const l = document.createElement('div'); l.className = 'loc'; l.textContent = loc; l.title = loc; el.appendChild(l); }
@@ -309,7 +323,7 @@ function renderLocations() {
   locations.forEach(l => {
     const n = models.filter(m => m.location === l.path).length;
     const row = document.createElement('div'); row.className = 'locrow';
-    row.innerHTML = `<code title="${l.path}">${l.path}</code><span class="muted">${l.builtin ? 'Hugging Face cache · ' : ''}${l.exists ? n + ' model' + (n === 1 ? '' : 's') : 'missing'}</span>` + (l.builtin ? '' : '<button class="x">remove</button>');
+    row.innerHTML = `<code title="${l.path}">${l.path}</code><span class="muted">${l.builtin ? 'Hugging Face cache · ' : ''}${!l.exists ? 'missing' : (l.readable === false ? 'unreadable (permissions)' : n + ' model' + (n === 1 ? '' : 's'))}</span>` + (l.builtin ? '' : '<button class="x">remove</button>');
     const x = row.querySelector('.x'); if (x) x.onclick = async () => { await post('/api/locations', { remove: l.path }); await loadModels(); await loadReco(); };
     el.appendChild(row);
   });

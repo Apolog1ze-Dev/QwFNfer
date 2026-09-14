@@ -53,9 +53,14 @@ missing=$(LD_LIBRARY_PATH="$DEST/bin" ldd "$DEST/bin/qwfn-server" | grep "not fo
 [ -z "$missing" ] || die "libraries missing on this system: $missing"
 { LD_LIBRARY_PATH="$DEST/bin" "$DEST/bin/qwfn-server" 2>&1 || true; } | grep -q "usage: qwfn-server" || die "the engine did not start (run: LD_LIBRARY_PATH=$DEST/bin $DEST/bin/qwfn-server)"
 
-hf_hub=${HF_HOME:-$HOME/.cache/huggingface}/hub
-if ls "$hf_hub"/*Qwen3.8-Flash-Next*/snapshots/*/*/*.gguf >/dev/null 2>&1; then
-    say "Model found in the Hugging Face cache."
+# Where hf download actually puts it: HF_HUB_CACHE, HUGGINGFACE_HUB_CACHE, $HF_HOME/hub,
+# $XDG_CACHE_HOME/huggingface/hub, ~/.cache/huggingface/hub -- huggingface_hub honours all five.
+hf_hub=${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-${HF_HOME:+$HF_HOME/hub}}}
+hf_hub=${hf_hub:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface/hub}
+hf_hub=${hf_hub/#\~/$HOME}          # hf expands a leading tilde in HF_HOME; do the same
+found=$(ls -d "$hf_hub"/*Qwen3.8-Flash-Next*/snapshots/*/*.gguf "$hf_hub"/*Qwen3.8-Flash-Next*/snapshots/*/*/*.gguf 2>/dev/null | head -1 || true)
+if [ -n "$found" ]; then
+    say "Model found in the Hugging Face cache ($hf_hub)."
 else
     say "Get the model once (111 GB; UD-Q3_K_XL is the 90 GB faster choice):"
     echo "    pip install -U huggingface_hub"

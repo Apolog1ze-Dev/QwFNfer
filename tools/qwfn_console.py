@@ -20,7 +20,27 @@ tune results, the last served model), server.log, selftest.json.
 import argparse, glob, http.server, json, math, mmap, os, random, signal, socket, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HF = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+def _expand(p):
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(p)))
+
+def hf_hubs():
+    """Every Hugging Face cache on this machine, resolved the way huggingface_hub resolves it:
+    HF_HUB_CACHE, then HUGGINGFACE_HUB_CACHE, then $HF_HOME/hub, then $XDG_CACHE_HOME/huggingface/hub,
+    then ~/.cache/huggingface/hub. hf download honours all of those, so "the default location" is
+    not one path: we scan every candidate that exists, and always keep the first as the one to name."""
+    e = os.environ.get
+    out = []
+    for p in (e("HF_HUB_CACHE"), e("HUGGINGFACE_HUB_CACHE"),
+              os.path.join(e("HF_HOME"), "hub") if e("HF_HOME") else None,
+              os.path.join(e("XDG_CACHE_HOME"), "huggingface", "hub") if e("XDG_CACHE_HOME") else None,
+              "~/.cache/huggingface/hub"):
+        if not p: continue
+        p = _expand(p)
+        if p not in out: out.append(p)
+    return out
+
+HF_HUBS = hf_hubs()
+HF = HF_HUBS[0]          # the one the page names; the others are scanned too when they exist
 # The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
 SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server"))
 LOG_DIR = os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
@@ -103,11 +123,18 @@ def gguf_arch(path):
 def is_hf_hub(path):
     return os.path.isdir(path) and bool(glob.glob(os.path.join(path, "models--*")))
 
+def readable(p):
+    return os.access(p, os.R_OK | os.X_OK)
+
 def model_locations():
-    locs = [{"path": HF, "kind": "hf", "builtin": True, "exists": os.path.isdir(HF)}]
+    # The first Hugging Face cache is always shown (it is the path to name when nothing is found);
+    # the other candidates only when they exist, so a moved XDG or HF_HUB_CACHE is still scanned.
+    locs = [{"path": p, "kind": "hf", "builtin": True, "exists": os.path.isdir(p), "readable": readable(p)}
+            for i, p in enumerate(HF_HUBS) if i == 0 or os.path.isdir(p)]
+    builtin = {l["path"] for l in locs}
     for p in CONFIG["locations"]:
-        if p == HF: continue
-        locs.append({"path": p, "kind": "file" if os.path.isfile(p) else ("hf" if is_hf_hub(p) else "dir"), "builtin": False, "exists": os.path.exists(p)})
+        if p in builtin: continue
+        locs.append({"path": p, "kind": "file" if os.path.isfile(p) else ("hf" if is_hf_hub(p) else "dir"), "builtin": False, "exists": os.path.exists(p), "readable": readable(p)})
     return locs
 
 def list_gguf(loc):
@@ -153,10 +180,17 @@ def repo_label(path, loc):
         if x.startswith("models--"): return x[8:].replace("--", "/")
     return os.path.relpath(os.path.dirname(path), loc["path"]) if loc["kind"] != "file" else os.path.dirname(path)
 
-def scan_models():
+def scan_models(skipped=None):
+    """The models the console can serve. `skipped` collects every GGUF that was found but left
+    out, with the reason: a scan that finds a download and rejects it must say so, not go quiet."""
+    def skip(f, why):
+        if skipped is not None: skipped.append({"path": f, "why": why})
     out, seen = [], set()
     for loc in model_locations():
         if not loc["exists"]: continue
+        if not loc.get("readable", True):
+            skip(loc["path"], "this folder cannot be read by the user running the console (permissions)")
+            continue
         for f in sorted(list_gguf(loc)):
             base = os.path.basename(f)
             if base.startswith(("mmproj", "mtp-")) or ("-of-" in base and "-00001-of-" not in base): continue
@@ -164,18 +198,29 @@ def scan_models():
             if real in seen: continue
             d = os.path.dirname(f); stem = shard_stem(base)
             arch = gguf_arch(f)
-            if arch is not None and arch != ARCH: continue
-            if arch is None and "Qwen3.8-Flash-Next" not in f: continue
+            if arch is not None and arch != ARCH:
+                skip(f, f"a {arch} GGUF; this engine runs {ARCH} (Qwen3.8-Flash-Next)"); continue
+            if arch is None and "Qwen3.8-Flash-Next" not in f:
+                skip(f, "the GGUF header could not be read and the name is not Qwen3.8-Flash-Next" if os.path.exists(real)
+                        else "a broken symlink: the blob it points at is missing (re-run the hf download)"); continue
             seen.add(real)
             qdir = os.path.basename(d); key = quant_of(qdir) or quant_of(base)
-            if key in COLD_ONLY: continue
+            if key in COLD_ONLY:
+                skip(f, f"{key} is a cold tier only: it is served as the tail of --cold, never on its own. Download UD-Q3_K_XL or UD-Q4_K_XL to serve."); continue
             name = qdir if quant_of(qdir) else stem
             shards = [s for s in glob.glob(os.path.join(d, "*.gguf")) if os.path.basename(s).startswith(stem)]
+            # A half-finished hf download leaves the snapshot pointing at blobs that are not there.
+            # One missing shard used to raise here and empty the whole list; say it instead.
+            gone = [s for s in shards if not os.path.exists(s)]
+            if gone:
+                skip(f, "%d of %d shards are missing (an interrupted download: re-run the hf download)" % (len(gone), len(shards))); continue
             total = sum(os.stat(s).st_size for s in shards)
             # The first shard of a split GGUF can be tiny (this quant's holds 11 MB of metadata):
             # the drive probe reads the largest one, where the experts are.
             probe_file = max(shards, key=lambda s: os.stat(s).st_size) if shards else f
             mm = find_mmproj(d); mtp = find_mtp(d)
+            if mm and not os.path.exists(mm): mm = None
+            if mtp and not os.path.exists(mtp): mtp = None
             out.append({"id": len(out), "name": name, "path": f, "dir": d, "location": loc["path"], "repo": repo_label(f, loc),
                         "size_gb": round(total / 1e9, 1), "shards": len(shards), "probe_file": probe_file, "quant": key or name, "known_quant": bool(key),
                         "mmproj": mm, "mmproj_gb": round(os.stat(mm).st_size / 1e9, 2) if mm else 0.0,
@@ -1098,7 +1143,9 @@ class H(http.server.BaseHTTPRequestHandler):
             try: body = open(INDEX, "rb").read()
             except Exception: body = b"<h1>tools/console/index.html missing</h1>"
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-        if path == "/api/models": return self._json({"models": scan_models(), "hf": HF, "locations": model_locations(), "last": CONFIG["last"]})
+        if path == "/api/models":
+            sk = []; ms = scan_models(sk)
+            return self._json({"models": ms, "hf": HF, "hf_all": HF_HUBS, "skipped": sk, "locations": model_locations(), "last": CONFIG["last"]})
         if path == "/api/hardware": return self._json(hardware())
         if path == "/api/config": return self._json({"locations": model_locations(), "custom": CONFIG["custom"], "tune": CONFIG["tune"], "last": CONFIG["last"], "headroom_gb": headroom_gb()})
         if path == "/api/recommend":
@@ -1157,7 +1204,7 @@ def main():
     ap.add_argument("--model", help="with --start: a model path or name instead of the last one"); ap.add_argument("--preset", help="with --start: chat | coding | coding_plus | custom")
     a = ap.parse_args(); STATE["port"] = a.server_port
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), H)
-    print(f"qwfn console on http://127.0.0.1:{a.port}  (server port {a.server_port}, models from {HF}" + (" and %d more location(s)" % len(CONFIG["locations"]) if CONFIG["locations"] else "") + ")", flush=True)
+    print(f"qwfn console on http://127.0.0.1:{a.port}  (server port {a.server_port}, models from {', '.join(l['path'] for l in model_locations() if l['builtin'])}" + (" and %d more location(s)" % len(CONFIG["locations"]) if CONFIG["locations"] else "") + ")", flush=True)
     if a.start:
         models = scan_models(); last = CONFIG["last"]
         m = find_model(models, a.model or last.get("model")) or (models[0] if models else None)
