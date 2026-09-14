@@ -14,7 +14,7 @@ Run a **125B** open-weight MoE on the gaming PC you already own, at interactive 
 **2026-09-11** — (Experimental)The console now tunes itself to the machine it runs on: it measures the drive, sweeps the CPU thread count live on a long-context run, sizes the RAM tier from the memory the server really needs, defaults the KV cache to q8_0 wherever the plan affords it, and its Stats page is live (prefill progress, input / cached / output tokens). The numbers below were re-measured today with those defaults, and an OpenCode agentic-coding run was added.
 Several optimizations and tweaks were introduced including fixing a MTP and vision bug.
 
-**2026-09-11** — Claude Code runs on it: the server now serves the Anthropic Messages API (`POST /v1/messages`, streamed, with `count_tokens`) next to the OpenAI one, so `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` is all it takes. Thinking and tool calls stream as Anthropic blocks, and a replayed conversation continues the engine's prefix as before. **Claude Desktop** runs on it too: `scripts/claude-desktop.sh` (`qwfnfer-claude-desktop` from the bundle) starts the engine if it is not up and launches an instance of Claude Desktop.
+**2026-09-14** — Claude Code runs on it: the server now serves the Anthropic Messages API (`POST /v1/messages`, streamed, with `count_tokens`) next to the OpenAI one, so `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` is all it takes. Thinking and tool calls stream as Anthropic blocks, and a replayed conversation continues the engine's prefix as before. **Claude Desktop** runs on it too: `scripts/claude-desktop.sh` (`qwfnfer-claude-desktop` from the bundle) starts the engine if it is not up and launches an instance of Claude Desktop.
 
 
 ## About
