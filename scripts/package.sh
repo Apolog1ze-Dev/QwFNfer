@@ -160,6 +160,51 @@ echo "libstdc++: bundled $cxxhave, needed $cxxneed"
 # for AVX-512, and would fail on Intel 12th-14th gen consumer parts and Zen 1-3.
 # libggml-cpu-*.so are exempt by design: ggml dlopens the variant the CPU supports.
 command -v readelf > /dev/null || { echo "readelf (binutils) is needed to check the bundle's ISA level" >&2; exit 1; }
+# The CRT objects every executable links -- Scrt1.o, crti.o and crtn.o from glibc, crtbeginS.o
+# and crtendS.o from gcc -- come from the build machine's packages. Where those are compiled
+# for AVX-512 they carry GNU_PROPERTY_X86_ISA_1_NEEDED=v4 and almost no code at all, and the
+# linker ORs that property into everything linked against them: the binary is marked "needs
+# AVX-512" without holding a single AVX-512 instruction, and glibc's loader refuses it anyway.
+# The ISA *used* property is the arbiter. Where it shows no v4 the marker is false and its v4
+# bit is cleared here, leaving the rest of the note -- CET among it -- alone. Where it shows v4
+# there is real AVX-512 in the file and the check below fails the build, as it should.
+for eng in qwfn-server qwfn-tok; do
+    f="$OUT/bin/$eng"
+    needed=$(readelf -n "$f" 2>/dev/null | grep -oE "x86 ISA needed:.*" || true)
+    used=$(readelf -n "$f" 2>/dev/null | grep -oE "x86 ISA used:.*" || true)
+    case $needed in *x86-64-v4*) ;; *) continue ;; esac
+    case $used in *x86-64-v4*) continue ;; esac
+    objcopy --dump-section .note.gnu.property="$OUT/note.bin" "$f" 2>/dev/null || continue
+    if python3 - "$OUT/note.bin" <<'PY'
+import struct, sys
+# GNU_PROPERTY_X86_ISA_1_NEEDED, cumulative level bits: baseline 1, v2 2, v3 4, v4 8.
+# Rewritten in place, so the note keeps its size and every other property it carries.
+KEEP, ISA_NEEDED = 0x7, 0xc0008002
+b = bytearray(open(sys.argv[1], "rb").read())
+o, changed = 0, False
+while o + 12 <= len(b):
+    namesz, descsz, ntype = struct.unpack_from("<III", b, o)
+    name = o + 12; desc = name + ((namesz + 3) & ~3); end = desc + descsz
+    if ntype == 5 and bytes(b[name:name + 4]) == b"GNU\0":
+        q = desc
+        while q + 8 <= end:
+            ptype, psz = struct.unpack_from("<II", b, q)
+            if ptype == 0 and psz == 0: break
+            if ptype == ISA_NEEDED and psz == 4:
+                v, = struct.unpack_from("<I", b, q + 8)
+                nv = (v & KEEP) or 0x1
+                if nv != v: struct.pack_into("<I", b, q + 8, nv); changed = True
+            q = q + 8 + ((psz + 7) & ~7)
+    o = end + ((-end) & 7)
+open(sys.argv[1], "wb").write(b)
+sys.exit(0 if changed else 1)
+PY
+    then
+        objcopy --update-section .note.gnu.property="$OUT/note.bin" "$f"
+        echo "$eng: cleared a false x86-64-v4 marker left by this machine's CRT objects (the file has no AVX-512 instruction)"
+    fi
+    rm -f "$OUT/note.bin"
+done
 v4=""; checked=""
 for so in qwfn-server qwfn-tok libggml-base.so.0 libggml.so.0 libllama.so.0 libggml-cuda.so $RUNTIME_SOS; do
     checked="$checked $so"
