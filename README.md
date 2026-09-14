@@ -131,7 +131,7 @@ Thinking comes back as `thinking` blocks and tool calls as `tool_use` blocks, st
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && scripts/console.sh
 ```
 
-`scripts/package.sh` builds the relocatable bundle the installer downloads (`-DQWFN_PORTABLE=ON`: baseline x86-64-v3 code, libraries next to the binaries, the glibc floor of the machine it is built on, 2.35 from the release workflow), and `.github/workflows/release.yml` does the same on a tag push and attaches the zip to the release.
+`scripts/package.sh` builds the relocatable bundle the installer downloads (`-DQWFN_PORTABLE=ON`: baseline x86-64-v3 code, libraries next to the binaries, and the glibc floor of the machine it is built on — which is the floor the bundle then needs, so build it on the oldest distribution you mean to support). It writes `dist/qwfnfer-linux-x86_64-cuda.zip`, and that zip is what a release carries; its header has the one-time ggml build the bundle links against.
 
 
 ## How it works

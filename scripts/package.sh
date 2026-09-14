@@ -3,7 +3,8 @@
 #
 # The bundle carries everything but the NVIDIA driver: the engine and the tokenizer tool
 # (built with QWFN_PORTABLE: x86-64-v3 code, libraries next to the binaries; the glibc
-# floor is the build machine's, written to the bundle's GLIBC file, 2.35 from the workflow), ggml/llama.cpp's shared libraries from a portable build (GGML_NATIVE=OFF, every
+# floor is the build machine's, written to the bundle's GLIBC file and refused by install.sh
+# on anything older -- so build on the oldest distribution you mean to support), ggml/llama.cpp's shared libraries from a portable build (GGML_NATIVE=OFF, every
 # CPU variant, CUDA architectures 75-120), the CUDA runtime libraries NVIDIA redistributes
 # (cudart, cublas, cublasLt), liburing and libgomp, the console, the launcher, the README.
 #
@@ -13,10 +14,22 @@
 # Inputs:
 #   LLAMA_CPP_ROOT  llama.cpp source (ggml headers, vendor/)         default ~/.unsloth/llama.cpp
 #   GGML_LIBS       portable ggml/llama shared libraries              default ~/.cache/qwfnfer-build/ggml/bin
-#                   (cmake -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
-#                    -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120"
-#                    -DCMAKE_C_FLAGS="-include cmake/glibc_compat.h -fno-math-errno" (same for CXX,
-#                    and -Xcompiler for CUDA), library targets only; .github/workflows/release.yml has the exact lines)
+#                   Built once from Unsloth's llama.cpp (b10798-mix-659e406, the mix the engine
+#                   is validated against), library targets only:
+#
+#                     H=$PWD/cmake/glibc_compat.h
+#                     cmake -S ~/.unsloth/llama.cpp -B ~/.cache/qwfnfer-build/ggml -G Ninja \
+#                       -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
+#                       -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
+#                       -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
+#                       -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+#                       -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+#                       -DCMAKE_C_FLAGS="-include $H -fno-math-errno" -DCMAKE_CXX_FLAGS="-include $H -fno-math-errno" \
+#                       -DCMAKE_CUDA_FLAGS="-Xcompiler=-fno-math-errno -Xcompiler=-include,$H"
+#                     cmake --build ~/.cache/qwfnfer-build/ggml
+#
+#                   On a distribution whose compiler the CUDA toolkit refuses, add
+#                   CC=gcc-12 CXX=g++-12 and -DCMAKE_CUDA_HOST_COMPILER=g++-12.
 #   CUDA_LIBS       where libcudart/libcublas/libcublasLt live         default /opt/cuda/lib64 or /usr/local/cuda/lib64
 set -euo pipefail
 cd "$(dirname "$0")/.."
