@@ -46,6 +46,7 @@ chmod +x "$DEST/qwfnfer" "$DEST/bin/qwfn-server" "$DEST/bin/qwfn-tok"
 need=$(cat "$DEST/GLIBC" 2>/dev/null || echo 2.34)
 python3 -c "import sys; v=lambda x: tuple(map(int, x.split('.'))); sys.exit(0 if v('$glibc') >= v('$need') else 1)" || die "this bundle needs glibc $need (yours: $glibc): use a newer distribution, or build from source (README)"
 ln -sfn "$DEST/qwfnfer" "$BIN/qwfnfer"
+[ -f "$DEST/scripts/claude-desktop.sh" ] && ln -sfn "$DEST/scripts/claude-desktop.sh" "$BIN/qwfnfer-claude-desktop"
 
 # The engine must load: every library it needs is in bin/ except the driver's libcuda.
 missing=$(LD_LIBRARY_PATH="$DEST/bin" ldd "$DEST/bin/qwfn-server" | grep "not found" || true)

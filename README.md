@@ -4,7 +4,7 @@
 </div>
 
 <p align="center">
-| <a href="#getting-started"><b>Getting Started</b></a> | <a href="#results"><b>Results</b></a> | <a href="#how-it-works"><b>How it works</b></a> | <a href="#built-around-the-qwen4-architecture"><b>Qwen4</b></a> | <a href="https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF"><b>Model (Unsloth GGUF)</b></a> |
+| <a href="#getting-started"><b>Getting Started</b></a> | <a href="#results"><b>Results</b></a> | <a href="#how-it-works"><b>How it works</b></a> | <a href="#built-around-the-qwen4-architecture"><b>Qwen4</b></a> | <a href="#faq"><b>FAQ</b></a> | <a href="https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF"><b>Model (Unsloth GGUF)</b></a> |
 </p>
 
 Run a **125B** open-weight MoE on the gaming PC you already own, at interactive speed: **15–25 tok/s**.
@@ -14,6 +14,8 @@ Run a **125B** open-weight MoE on the gaming PC you already own, at interactive 
 **2026-09-11** — (Experimental)The console now tunes itself to the machine it runs on: it measures the drive, sweeps the CPU thread count live on a long-context run, sizes the RAM tier from the memory the server really needs, defaults the KV cache to q8_0 wherever the plan affords it, and its Stats page is live (prefill progress, input / cached / output tokens). The numbers below were re-measured today with those defaults, and an OpenCode agentic-coding run was added.
 Several optimizations and tweaks were introduced including fixing a MTP and vision bug.
 
+**2026-09-11** — Claude Code runs on it: the server now serves the Anthropic Messages API (`POST /v1/messages`, streamed, with `count_tokens`) next to the OpenAI one, so `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` is all it takes. Thinking and tool calls stream as Anthropic blocks, and a replayed conversation continues the engine's prefix as before. **Claude Desktop** runs on it too: `scripts/claude-desktop.sh` (`qwfnfer-claude-desktop` from the bundle) starts the engine if it is not up and launches an instance of Claude Desktop.
+
 
 ## About
 
@@ -21,7 +23,7 @@ qwfnfer is a purpose-built inference engine for Qwen3.8-Flash-Next (GGUF archite
 
 - **Three-tier expert runtime**: experts live in VRAM, in pinned RAM and on the NVMe. Reads happen at an expert's natural 0.6–1.2 MB size over io_uring/O_DIRECT (23× the bandwidth of 4 KiB demand paging on the same disk), VRAM-resident experts compute inside replayed CUDA graphs, and the next layer's routing is predicted from the residual and prefetched while the current layer computes.
 - **Long context that stays flat**: 163,840 tokens with q8_0 KV on 16 GB (262,144 with the attention state in pinned RAM). Decode attention costs the same 0.55 ms per layer at 4K and at 160K (sparse attention over pooled block keys), and a layer-major prefill streams experts through VRAM at 350–590 tok/s depending on the batch instead of paging them.
-- **OpenAI-compatible server**: streaming, thinking with `reasoning_effort` and a thinking budget, tool calling, vision, `/props`, `/stats`, `/slots`, `/metrics` and llama.cpp-style `timings`. Works with Unsloth Studio, Open WebUI or any OpenAI client.
+- **OpenAI-compatible server, and the Anthropic Messages API for Claude Code**: streaming, thinking with `reasoning_effort` and a thinking budget, tool calling, vision, `/props`, `/stats`, `/slots`, `/metrics` and llama.cpp-style `timings`. Works with Unsloth Studio, Open WebUI or any OpenAI client, and `POST /v1/messages` lets Claude Code run on it with one environment variable.
 - **Console**: a local page that finds the downloaded quants (the Hugging Face cache and any folder you add), sizes the flags for *your* GPU and RAM behind four tiers (Chat at 32K context, Agentic coding at 128K, Agentic coding+ at 256K, and a Custom tier you save), auto-tunes them on your hardware (the drive's read rate, a thread sweep on the running server, the KV precision the GPU has room for, the memory the RAM tier can take, then a measured verification), starts and stops the server, chats with it, and shows it live: prefill progress, input / cached / output tokens, tokens/s, the last request and the session's totals.
 - **Measured, not projected**: the forward pass is validated bit-exact against llama.cpp, and every number here is a real run on the reference machine, same file, same settings.
 
@@ -111,6 +113,18 @@ It opens http://127.0.0.1:8090. Pick a downloaded quant and a tier: **Chat** (32
 - Every response carries llama.cpp-style `timings`; `/stats` is what the console's live panel reads.
 - One request at a time: the engine keeps a single context, and a conversation that continues the previous one only prefills its new turn.
 
+**Claude Code** talks to it natively: the server also serves the Anthropic Messages API (`POST /v1/messages`, streamed, and `count_tokens`), so point Claude Code at the server itself rather than at `/v1`:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_MODEL=qwen3.8-flash-next claude
+```
+
+Thinking comes back as `thinking` blocks and tool calls as `tool_use` blocks, streamed as the model writes them; usage reports input, cached and output tokens; a replayed conversation continues the engine's prefix like any other. Claude Code's settings map onto the reasoning effort: `thinking` `disabled` is off, `/effort low` and `medium` are those levels, `high` (its default) is the level the server was started with, `max` is xhigh, and a `budget_tokens` caps under the server's own thinking budget. Its first request is about 17K tokens of system prompt and tool definitions, prefilled once (~25 s on the Q4 file at 680 tok/s) and continued from then on, so use the Agentic coding tier or larger. The model name is echoed, not checked.
+
+**Claude Desktop** has a third-party inference mode that takes the same server. `scripts/claude-desktop.sh` (`qwfnfer-claude-desktop` from the bundle) starts the engine through the console if it is not running, writes a Claude Desktop profile whose inference provider is the server, and launches Claude Desktop on that profile: a second instance, next to the one signed into your claude.ai account, with Chat and Code on the local model. The profile lives in `~/.config/Claude-qwfnfer` and `~/.config/Claude-qwfnfer-3p`; `--restart` relaunches it after a change, `--stop` quits it, `--reset` deletes it. The app only accepts model ids that look like Claude models, so the profile sends `claude-sonnet-5` and labels it with the model the server really serves; the server ignores the name. Doing it by hand instead: Help → Troubleshooting → Enable Developer Mode, then Developer → Configure Third-Party Inference, provider *gateway*, base URL `http://127.0.0.1:8080`, any API key, and a model entry named `claude-sonnet-5`.
+
+**Or additive, in the app you already use.** Claude Code takes one base URL, so `tools/qwfn_router.py` listens on it and forwards each request by the model it names: the local model's id goes to the engine, everything else goes to `api.anthropic.com` as it came, headers and body untouched, so the claude.ai login, prompt caching and the beta features keep working. `python3 tools/qwfn_router.py --configure` points Claude Code at it (`~/.claude/settings.json`: `env.ANTHROPIC_BASE_URL` and a `modelPicker` entry, a backup kept; `--unconfigure` reverts) and `--install-service` keeps it running as a systemd user service. The local model then shows in `/model` next to the Anthropic ones, in the same app and the same list of sessions, and each session picks. Side requests (titles, summaries) use the session's small model, so they go to Anthropic and leave the engine's prefix alone.
+
 **Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, liburing and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer (default `~/.unsloth/llama.cpp`, override with `-DLLAMA_CPP_ROOT`):
 
 ```bash
@@ -143,6 +157,44 @@ Qwen3.8-Flash-Next ships the Qwen4-generation design, `qwen4exp` in the GGUF, an
 - **The model card is followed** for the thinking template, the tool-call format, mrope for images and the sampling presets; the forward pass is checked node by node against llama.cpp's `qwen4exp`, which matters because this architecture is unusually sensitive to accumulation order.
 
 **What this means for the next Qwen releases.** Every hyper-parameter the engine uses is read from the GGUF metadata (layer count and interval, expert count and top-k, indexer geometry, DeltaNet sizes, PLE geometry, context and rope). Nothing is hard-coded to this checkpoint. A future checkpoint built from the same blocks at a different size (more experts, more layers, a bigger PLE, a longer context) is a metadata change; a new block is a graph change, validated against the reference the same way. What the engine needs from the hardware is set by the *active* path per token and by the tiers you can afford, not by the file size: the dense core and the KV/indexer state must fit in VRAM, and everything else streams through cache tiers sized to the GPU and RAM present. The console's cost model does that sizing for whatever machine it finds. Two things are still on the list: the checkpoint's multi-token-prediction head (the *Draft head* setting: the trunk verifies every draft, so the output is its own) pays in chat and in agentic coding but not yet on a 155K-token document, and the tiers have only been measured on the 16 GB / 30 GB reference machine; the console's auto-tune is what carries the sizing to other machines.
+
+## FAQ
+
+**Does it have to be this exact machine?** No — what matters is the shape, not the model numbers. VRAM has to hold the dense core (about 5 GB), and what is left over becomes the expert tier, which is what sets decode speed. The context's caches mostly do not compete for it: from 128K up the console keeps the KV and indexer caches in pinned RAM and gathers them over PCIe, because their VRAM is worth more as expert tier (about 4% of decode per GB at 131K, and at 256K the difference between having a tier and not). At 160K with q8_0 KV that moves 2.5 of the 2.8 GB of attention state off the device and leaves the pooled block keys and the DeltaNet state, under 0.3 GB. Below 64K it all stays in VRAM, where it is small anyway (0.6 GB at 32K); in between, only the indexer cache moves. What 16 GB has left at 160K is an 8.1–8.7 GB expert tier (2,591 experts on Q4, 3,859 on Q3; 62–77% of lookups served straight from VRAM). A smaller GPU gets a smaller tier and the console sizes for it; where there is no room for a tier at all, every expert comes from RAM or the NVMe, about 25% slower by the cost model. Every number in this README is one machine — RTX 4080 SUPER 16 GB, 30 GB of RAM, one NVMe — and the auto-tune is what carries the sizing to a different one.
+
+**How much RAM do I need?** Mostly as a cache tier rather than as a floor. The engine clamps that tier to what the machine really has free (0.75 × MemAvailable), and the console sizes it from the memory the server actually needed during the tune, leaving 3 GB of headroom — 13–15 GB here. A GB of tier is worth about 3% of decode, so less RAM costs speed rather than the ability to run. What is not elastic is the pinned memory the plan puts there on purpose: the attention caches at long context (2.5 GB at 160K) and the draft head's 2.7 GB of pinned experts when it is on — the console counts both before it sizes the tier.
+
+**Does the model have to sit on an NVMe?** In practice yes. A decoded token touches about 1.1 GB of expert weights; the tiers serve 95–99% of the lookups and the drive covers the rest, so decode follows the drive's *random* read rate, not its sequential one. The console probes it before planning (random 2 MiB O_DIRECT reads, the pattern of a miss) and warns below 2.5 GB/s; on a spinning disk it tells you to move the file. The engine only ever reads the model — no writes, no conversion step — and reads it with O_DIRECT, falling back to buffered reads on a filesystem that refuses it.
+
+**How much disk space?** The file itself: 111 GB for UD-Q4_K_XL, 90 GB for UD-Q3_K_XL. Vision adds the 0.9 GB `mmproj-F16.gguf` and the draft head the 2.6 GB `MTP/mtp-*.gguf`; the console picks both up when they sit next to the shards (`hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "MTP/*"`). Nothing is unpacked or converted — the GGUF shards are read in place.
+
+**Q4 or Q3?** Q4 for quality, Q3 for speed: 13.2–15.7 against 19.8–21.2 tok/s in chat, 12.9 against 17.7 on a 155K-token document, same machine and same plan. Q3's expert blocks are 2.27 MB against Q4's 3.13, so more of them fit in the same tiers and every miss reads less; that is most of the difference.
+
+**Windows?** In the works, not there yet. Today it is Linux x86_64 with an NVIDIA GPU, driver 580 or newer: the NVMe path is io_uring, so that layer is what has to be ported first — nothing above it is Linux-specific.
+
+**AMD or Intel GPU? Two GPUs?** One NVIDIA GPU: the dense core, the replayed graphs and the VRAM expert tier run on ggml's CUDA backend, and the engine builds for a single device. `--cpu` runs everything on the CPU path — the one the forward pass is validated bit-exact against — but that path exists for validation, not for use.
+
+**Can it run other models?** No. It reads the architecture out of the GGUF and refuses anything that is not `qwen4exp`; it implements that graph, not a general one. Its hyper-parameters all come from the file's metadata, so a future checkpoint built from the same blocks at another size is a metadata change, while a new block is a graph change.
+
+**Is this a llama.cpp fork?** No. It uses ggml's quantized kernels and CUDA backend, llama.cpp's tokenizer, and llama.cpp's own `qwen4exp` implementation as the reference the forward pass is checked against. The model graph, the memory hierarchy, the expert cache, the prefill and the server are about 12K lines of its own C++, with the console on top of them in Python.
+
+**Then why is it 7–10× faster than llama.cpp on the same file and GPU?** I/O granularity, mostly. The mmap path demand-pages experts 4 KiB at a time — 4.4 million reads per pass at 0.3 GB/s on this drive, essentially all of decode spent in page faults — while the same NVMe asked for whole 0.6–1.2 MB expert slices at queue depth 4 gives 7 GB/s. The tiers, the MoE inside the CUDA graph and the layer-ahead prefetch are all built on top of that factor of 23.
+
+**Do the speed options change what the model writes?** The two that are on by default do not. The speculative block only decides which experts to fetch early; whatever a token actually routes to is waited for, and the output is bit-identical with the block off. The draft head's tokens are verified by the trunk, so what is accepted is what the trunk itself would have produced. *Skip missed experts* (`--skip-miss`) is the one that trades: +16% decode at 4K and +22–29% at 128K for a measured quality cost (NLL +0.046 at 4K, within noise at 128K), and it is off by default. Independently of all three, GPU decode varies about 5% run to run on identical work.
+
+**Can several people share one server?** No — one engine, one request at a time, and a second request waits for the first. That is the model's shape rather than a missing feature: a single KV cache plus the DeltaNet recurrent state and the short-conv history are sequential accumulations over one sequence, and interleaving two conversations would corrupt both. What it does instead is continue the previous conversation's prefix, so a harness that replays the whole thread every turn only prefills the new turn.
+
+**Is it safe to put on the network?** It binds `127.0.0.1` and has no authentication — any API key works because none is checked, and CORS is open so the console page can reach it. `--host` will bind it wider; put something that authenticates in front of it before you do.
+
+**Why is the first request so much slower than the rest?** The tiers start cold: they fill from the routing of the text going through them, and that first prefill reads every expert it touches off the drive. A long system prompt is where it shows — Claude Code's ~17K-token first request costs about 25 s on the Q4 file, and every turn after it continues that prefix.
+
+**How long does the auto-tune take, and is it once?** About five minutes, and the result is saved per model: the measured thread count and drive rate then apply to every tier for that model, and the tier card shows the measured speed instead of the prediction. Re-run it when the hardware or the model file changes; **Start server** uses the saved plan without re-measuring.
+
+**Decode is slower than the numbers here — what do I check?** The Log tab prints what the engine actually built: the VRAM expert tier and its block count, the RAM arena, and a VRAM audit of what is left on the device after init. The usual causes are a RAM tier clamped down because the machine had less free memory than the plan assumed, another process holding VRAM (the console measures the desktop's use and subtracts it, but it measures it once), a drive slower at random 2 MiB reads than the plan assumed, and a cache that is simply still cold. `/stats` shows the hit rate and the VRAM-served share while it runs.
+
+**Does it phone home, and does it work offline?** Only the model download needs the internet. The engine, the server and the console page are local, and nothing is sent anywhere — `tools/qwfn_router.py` is the one exception, and only for the requests you point at Anthropic yourself.
+
+**How do I uninstall it?** Delete `~/.local/share/qwfnfer` and `~/.local/bin/qwfnfer`. The model files are yours and stay where you downloaded them.
 
 ## Acknowledgment
 

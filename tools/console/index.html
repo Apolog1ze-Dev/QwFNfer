@@ -210,7 +210,7 @@
     <section>
       <h2>Endpoint</h2>
       <div class="endpoint"><span>base URL <b id="endpoint">—</b> <span class="muted" id="modelid"></span></span><button class="secondary" id="copy">copy</button></div>
-      <div class="connect">Any OpenAI-compatible client works with any API key: base URL <code id="ep2">—</code>, model <code id="ep3">—</code>. Thinking is controlled per request with <code>reasoning_effort</code> (xhigh · medium · low · off) or by ending a message with <code>/think</code> or <code>/no_think</code>; every reply carries <code>usage</code> (input, cached and output tokens) and llama.cpp-style <code>timings</code>. <code>/stats</code> is what this page reads, once a second.</div>
+      <div class="connect">Any OpenAI-compatible client works with any API key: base URL <code id="ep2">—</code>, model <code id="ep3">—</code>. Thinking is controlled per request with <code>reasoning_effort</code> (xhigh · medium · low · off) or by ending a message with <code>/think</code> or <code>/no_think</code>; every reply carries <code>usage</code> (input, cached and output tokens) and llama.cpp-style <code>timings</code>. <code>/stats</code> is what this page reads, once a second. <b>Claude Code</b> connects natively (the server also serves the Anthropic Messages API): <code>ANTHROPIC_BASE_URL=<span id="ep4">—</span> ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_MODEL=<span id="ep5">—</span> claude</code>.</div>
     </section>
     <section>
       <h2>Now <span class="muted sub" id="nowsub">— polled every second</span></h2>
@@ -566,7 +566,7 @@ function renderLive(s) {
   lastLive = s;
   $('dot').className = 'dot ' + s.state; $('state').textContent = s.state + (s.external ? ' (external)' : '');
   $('uptime').textContent = s.uptime_s ? 'up ' + secs(s.uptime_s) : '';
-  $('endpoint').textContent = s.endpoint; $('ep2').textContent = s.endpoint;
+  $('endpoint').textContent = s.endpoint; $('ep2').textContent = s.endpoint; $('ep4').textContent = s.endpoint.replace(/\/v1$/, '');
   const chatable = s.state === 'ready' || s.state === 'busy';
   $('send').disabled = !chatable || chatting || !!s.selftest_running || !!(s.tune && s.tune.running); const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
   const st = s.stats;
@@ -627,7 +627,7 @@ async function pollLive() {
 async function poll() {
   let s; try { s = await api('/api/status'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
   lastStatus = s;
-  $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : ''; $('ep3').textContent = s.model_id || 'any';
+  $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : ''; $('ep3').textContent = s.model_id || 'any'; $('ep5').textContent = s.model_id || 'qwen3.8-flash-next';
   setLocked(s);
   // While a server runs, the cards and the settings show what is being served.
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
