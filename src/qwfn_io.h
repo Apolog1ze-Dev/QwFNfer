@@ -109,6 +109,14 @@ private:
     backend          be_ = backend::uring;
     io_uring *       ring_ = nullptr;
 
+    // Tags of requests rejected at submit time (bad shard index, null
+    // destination, zero length). Every caller here counts completions, not
+    // requests, so a request that vanished silently left reap() waiting for a
+    // CQE that could never arrive -- or, on the callers that retry a short
+    // submit from the same index, resubmitting the same bad request for ever.
+    // A rejected request is therefore completed, as an error, like any other.
+    std::vector<uint64_t> rejected_;
+
     // --- thread-pool backend ---
     struct job { int shard; uint64_t off; uint32_t len; void * dst; uint64_t tag; uint64_t ooff; uint32_t onb; };   // ooff/onb: the requested range, for the bounce path
     std::vector<std::thread>  workers_;
