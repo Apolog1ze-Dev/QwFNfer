@@ -125,10 +125,10 @@ Thinking comes back as `thinking` blocks and tool calls as `tool_use` blocks, st
 
 **Or additive, in the app you already use.** Claude Code takes one base URL, so `tools/qwfn_router.py` listens on it and forwards each request by the model it names: the local model's id goes to the engine, everything else goes to `api.anthropic.com` as it came, headers and body untouched, so the claude.ai login, prompt caching and the beta features keep working. `python3 tools/qwfn_router.py --configure` points Claude Code at it (`~/.claude/settings.json`: `env.ANTHROPIC_BASE_URL` and a `modelPicker` entry, a backup kept; `--unconfigure` reverts) and `--install-service` keeps it running as a systemd user service. The local model then shows in `/model` next to the Anthropic ones, in the same app and the same list of sessions, and each session picks. Side requests (titles, summaries) use the session's small model, so they go to Anthropic and leave the engine's prefix alone.
 
-**Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, liburing and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer — Unsloth's `b10798-mix-659e406`, the mix the forward pass is validated against:
+**Building from source** (only if you want to change the engine). Needs CMake, Ninja, CUDA, liburing and a built [llama.cpp](https://github.com/unslothai/llama.cpp) tree for the ggml backends and the tokenizer — Unsloth's llama.cpp that knows `qwen4exp`. Pin it by commit, not by tag: the `b10798-mix-659e406` tag this section used to name has since been moved to a commit without `qwen4exp` (and without `lazy_mode`), so a checkout of it builds the engine but every start fails with `unknown model architecture: 'qwen4exp'`, and `qwfn-refdump` does not compile. `ca14269` (branch `mtp/qwen4exp-nextn`, 2026-09-18) is verified end to end on Linux with CUDA:
 
 ```bash
-git clone --depth 1 --branch b10798-mix-659e406 https://github.com/unslothai/llama.cpp ~/.unsloth/llama.cpp
+git init ~/.unsloth/llama.cpp && git -C ~/.unsloth/llama.cpp fetch --depth 1 https://github.com/unslothai/llama.cpp ca1426903fabe9af26cd10c42034cb4bbd2e0e11 && git -C ~/.unsloth/llama.cpp checkout FETCH_HEAD
 cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
 cmake --build ~/.unsloth/llama.cpp/build -j
 ```

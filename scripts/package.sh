@@ -26,8 +26,8 @@
 # Inputs:
 #   LLAMA_CPP_ROOT  llama.cpp source (ggml headers, vendor/)         default ~/.unsloth/llama.cpp
 #   GGML_LIBS       portable ggml/llama shared libraries              default ~/.cache/qwfnfer-build/ggml/bin
-#                   Built once from Unsloth's llama.cpp (b10798-mix-659e406, the mix the engine
-#                   is validated against), library targets only:
+#                   Built once from Unsloth's llama.cpp (commit ca14269; the b10798-mix-659e406 tag
+#                   has been moved to a commit without qwen4exp, see README), library targets only:
 #
 #                     H=$PWD/cmake/glibc_compat.h
 #                     cmake -S ~/.unsloth/llama.cpp -B ~/.cache/qwfnfer-build/ggml -G Ninja \
