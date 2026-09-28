@@ -47,6 +47,10 @@ static double sec(clk::time_point a, clk::time_point b) {
 static uint16_t f16(float f) { ggml_fp16_t h = ggml_fp32_to_fp16(f); uint16_t o; memcpy(&o, &h, 2); return o; }
 
 int main(int argc, char ** argv) {
+    // Line-buffered: this tool is watched while it runs, and a crash used to take
+    // every line after the engine's own stderr with it (stdout is block-buffered
+    // when redirected, so a fault anywhere in the decode path printed nothing).
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     if (argc < 2) {
         fprintf(stderr,
             "usage: qwfn-run <shard.gguf> [tok,...] [--cold <shard>] [--ram GB] [--ctx N]\n");
@@ -188,7 +192,10 @@ int main(int argc, char ** argv) {
     for (int64_t i = 0; i < T; i++) pos[i] = pos[T + i] = pos[2 * T + i] = (int32_t) i;
     ggml_backend_tensor_set(inp_pos, pos.data(), 0, pos.size() * 4);
     std::vector<uint16_t> mask(T * mask_rows, f16(-INFINITY));
-    for (int64_t i = 0; i < T; i++) for (int64_t j = 0; j <= i; j++) mask[i * T + j] = f16(0.0f);
+    // Row stride is mask_rows, the tensor's ne[1] -- not T. Striding by T happens to
+    // stay inside the buffer while T <= mask_rows, so it looked fine on the single-token
+    // path every bench run uses, and put the causal mask in the wrong rows for T > 1.
+    for (int64_t i = 0; i < T; i++) for (int64_t j = 0; j <= i; j++) mask[i * mask_rows + j] = f16(0.0f);
     ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * 2);
 
     int sections[4] = { hp.mrope_sections[0], hp.mrope_sections[1], hp.mrope_sections[2], hp.mrope_sections[3] };
