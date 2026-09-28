@@ -1534,7 +1534,16 @@ int main(int argc, char ** argv) {
                         stalled, n, ws == 1 ? "demand reads" : ws == 2 ? "speculative reads" : "nothing (compute or lock)", S.eng.cache_wait_count());
                 if (g_gen_thread_set)
 #ifdef _WIN32
-                    print_backtrace("STALL probe");   // from the watchdog thread: prints its own id, no cross-thread stack
+                    // No cross-thread stack here: CaptureStackBackTrace is not safe to
+                    // call on another thread, and the SIGUSR2 path POSIX uses does not
+                    // exist. What print_backtrace() does on Windows is print the
+                    // CALLING thread's id -- the watchdog's -- so the line reads
+                    // "stuck in thread N" and sends whoever reads the log to the wrong
+                    // thread entirely. Name the thread that holds the generation and
+                    // say the stack is unavailable; the wait state above is the part
+                    // that actually says where the time is going.
+                    fprintf(stderr, "[qwfn-server] === STALL probe: the generating thread is %lu; no cross-thread stack on this platform ===\n",
+                            (unsigned long) g_gen_thread);
 #else
                     pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
 #endif
