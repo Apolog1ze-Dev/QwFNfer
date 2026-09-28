@@ -1681,15 +1681,31 @@ def log_tail(n=60):
 
 
 def log_tiers():
-    """What the engine actually built, from its log: the VRAM and RAM expert tiers."""
+    """What the engine actually built, from its log: the VRAM and RAM expert tiers.
+
+    A VRAM expert tier is optional, and when the engine cannot have one it says so
+    ("VRAM tier disabled: no device memory available") and prints no
+    "expert VRAM tier:" line at all. Absence is not zero, and reading it as
+    anything else leaves this returning the tier the console PLANNED: the cost
+    model then credits nearly every expert to the GPU, and the speed it reports is
+    one no run ever had. Measured on a 12 GB card with the prefill staging holding
+    the device memory: 17.3 tok/s predicted against 2.5 measured, with the engine
+    reporting vram_served 0.0 and 0 VRAM blocks. So the disabled line parses as a
+    zero tier, and the caller re-estimates against it.
+    """
     out = {}
     for l in log_tail(400):
-        if "expert VRAM tier:" in l:
+        if "VRAM tier disabled" in l:
+            out["vram_tier_gb"] = 0.0
+            out["vram_tier_blocks"] = 0
+            out["vram_tier_disabled"] = True
+        elif "expert VRAM tier:" in l:
             try:
                 out["vram_tier_gb"] = float(
                     l.split("expert VRAM tier:")[1].split("GB")[0]
                 )
                 out["vram_tier_blocks"] = int(l.split("GB,")[1].split("blocks")[0])
+                out.pop("vram_tier_disabled", None)
             except Exception:
                 pass
         if "expert RAM tier:" in l:
@@ -2250,6 +2266,17 @@ def run_tune(model, preset, settings_in):
         port = st["port"]
         built = log_tiers()
         result["built"] = built
+        if built.get("vram_tier_disabled"):
+            # The engine had no device memory for a tier, so every expert the RAM
+            # tier does not hold is computed on the CPU. The cost model prices the
+            # tier this plan asked for, so its number describes a run that did not
+            # happen; it is dropped below rather than reported next to a measurement
+            # it cannot explain.
+            result["notes"].append(
+                "the engine could not build a VRAM expert tier (no device memory): "
+                "every expert the RAM tier does not hold is computed on the CPU, and "
+                "the speed estimate for this plan does not apply"
+            )
         if built.get("vram_tier_gb") is not None:
             log(
                 "engine built a %.1f GB VRAM expert tier (planned %.1f) and a %.1f GB RAM tier (planned %d)"
@@ -2364,6 +2391,11 @@ def run_tune(model, preset, settings_in):
             log("thread sweep skipped: %d CPU threads" % hw.get("cpu_threads"), 0.92)
         stats = fetch_json(f"http://127.0.0.1:{port}/stats", 3.0) or {}
         c = stats.get("expert_cache") or {}
+        # With no VRAM tier built, the estimate describes a run that did not happen:
+        # report it as unknown instead of beside a measurement it cannot explain.
+        no_tier = bool(built.get("vram_tier_disabled"))
+        pred_chat = None if no_tier else plan["estimates"]["decode_tps_short"]
+        pred_doc = None if no_tier else plan["estimates"]["decode_tps_long_doc"]
         result["verify"] = {
             "chat_tps": chat["tok_s"],
             "chat_n": chat["n"],
@@ -2374,17 +2406,17 @@ def run_tune(model, preset, settings_in):
             "found": doc["found"],
             "hit": round(c.get("hit_rate", 0), 3),
             "vram_served": round(c.get("vram_served", 0), 3),
-            "predicted_chat": plan["estimates"]["decode_tps_short"],
-            "predicted_doc": plan["estimates"]["decode_tps_long_doc"],
+            "predicted_chat": pred_chat,
+            "predicted_doc": pred_doc,
         }
         log(
-            "chat %.1f tok/s (predicted %.1f) · document prefill %.0f tok/s, decode %.1f tok/s (predicted %.1f) · passphrase %s"
+            "chat %.1f tok/s (predicted %s) · document prefill %.0f tok/s, decode %.1f tok/s (predicted %s) · passphrase %s"
             % (
                 chat["tok_s"],
-                plan["estimates"]["decode_tps_short"],
+                "n/a, no VRAM tier" if no_tier else "%.1f" % pred_chat,
                 doc["prefill_tok_s"],
                 doc["tok_s"],
-                plan["estimates"]["decode_tps_long_doc"],
+                "n/a, no VRAM tier" if no_tier else "%.1f" % pred_doc,
                 "found" if doc["found"] else "NOT found",
             ),
             0.96,
