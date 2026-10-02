@@ -16,6 +16,8 @@ Several optimizations and tweaks were introduced including fixing a MTP and visi
 
 **2026-09-14** — Claude Code runs on it: the server now serves the Anthropic Messages API (`POST /v1/messages`, streamed, with `count_tokens`) next to the OpenAI one, so `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` is all it takes. Thinking and tool calls stream as Anthropic blocks, and a replayed conversation continues the engine's prefix as before. **Claude Desktop** runs on it too: `scripts/claude-desktop.sh` (`qwfnfer-claude-desktop` from the bundle) starts the engine if it is not up and launches an instance of Claude Desktop.
 
+**2026-10-02** — **Windows is released.** [v0.3.0](https://github.com/Apolog1ze-Dev/QwFNfer/releases/tag/v0.3.0) ships `qwfnfer-windows-x86_64-cuda.zip` next to the Linux bundle: unzip it anywhere and run `qwfnfer.cmd` (Windows 10/11 x64, an NVIDIA GPU with driver 580 or newer, Python 3). It is the same engine running natively, not through WSL2, with unbuffered overlapped reads in place of O_DIRECT, the VRAM expert tier kept out of shared system memory, and no EcoQoS throttling; **Windows?** in the FAQ has the two driver settings that matter for its speed. Both bundles are now built by GitHub Actions, and each is unpacked and run on a machine with no GPU, its engine checked token for token against llama.cpp, before it is published. The Linux bundle runs on Ubuntu 22.04 (glibc 2.35) and newer, and the engine no longer starts more CPU threads than the machine has, which made decode on CPUs with fewer than 8 threads many times slower.
+
 
 ## About
 
