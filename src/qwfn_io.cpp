@@ -77,6 +77,19 @@ uint64_t mem_available_bytes() {
 
 #endif // _WIN32
 
+void disable_power_throttling() {
+#ifdef _WIN32
+    // PROCESS_POWER_THROTTLING_STATE {Version 1, ControlMask EXECUTION_SPEED, StateMask 0}
+    // for ProcessPowerThrottling (4), spelled out and looked up at run time: the call is
+    // Windows 10 1709+, and older SDK and MinGW headers do not declare the struct.
+    struct { ULONG version, control_mask, state_mask; } st = { 1, 0x1, 0 };
+    using set_info_t = BOOL (WINAPI *)(HANDLE, int, LPVOID, DWORD);
+    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+        if (auto fn = (set_info_t) (void *) GetProcAddress(k32, "SetProcessInformation"))
+            fn(GetCurrentProcess(), 4, &st, (DWORD) sizeof st);
+#endif
+}
+
 size_t clamp_to_available(size_t want, double frac, size_t headroom) {
     const uint64_t avail = mem_available_bytes();
     if (avail == 0) return want;                       // unknown: trust the caller

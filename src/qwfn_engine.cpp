@@ -80,6 +80,7 @@ void engine::set_n_threads(int n) {
 bool engine::init(const model_index * hot, const model_index * cold,
                   const engine_config & cfg, const std::string & backend_dir, std::string & err) {
     ggml_log_set(qwfn_ggml_log, nullptr);
+    disable_power_throttling();   // Windows only: see qwfn_io.h
     mi_  = hot;
     cfg_ = cfg;
     hp_  = hot->hp();

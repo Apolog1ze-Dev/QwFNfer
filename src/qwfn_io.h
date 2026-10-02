@@ -171,6 +171,14 @@ void   dio_free(void * p);
 // Returns 0 if it cannot be read.
 uint64_t mem_available_bytes();
 
+// Windows: opt this process out of power throttling (EcoQoS). Windows 11 applies it
+// to processes it judges to be in the background -- a server the console starts with
+// no window of its own is one -- and then runs their threads at reduced clocks or on
+// the efficiency cores of a hybrid CPU: the thread launching the GPU graphs, the CPU
+// experts and the read workers alike. llama.cpp opts its compute threads out for the
+// same reason. A no-op elsewhere.
+void disable_power_throttling();
+
 // Largest arena we are willing to take: `frac` of MemAvailable, minus a fixed
 // headroom for activations, CUDA host buffers and the rest of the desktop.
 // Never returns more than `want`.
