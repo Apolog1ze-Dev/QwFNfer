@@ -129,36 +129,68 @@ void io_engine::shutdown() {
     }
     for (int fd : fds_) if (fd >= 0) ::close(fd);
     fds_.clear();
+    rejected_.clear();
     in_flight_ = 0;
+    min_expect_ = 0;
 }
 
 size_t io_engine::submit(const io_request * reqs, size_t n) {
     if (be_ == backend::threads) {
         const auto t0 = std::chrono::steady_clock::now();
+        size_t queued_jobs = 0;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             for (size_t i = 0; i < n; i++) {
                 const io_request & r = reqs[i];
-                if (r.shard < 0 || (size_t) r.shard >= fds_.size() || !r.dst || r.nbytes == 0) continue;
+                if (r.shard < 0 || (size_t) r.shard >= fds_.size() || !r.dst || r.nbytes == 0) {
+                    // Completed here as an error rather than dropped: see rejected_.
+                    // Returning n while quietly queueing fewer jobs is what used to
+                    // leave fetch_end() waiting on a completion nothing would produce.
+                    stat_errors++;
+                    done_.push_back(r.tag);
+                    in_flight_++;
+                    continue;
+                }
                 uint64_t off = r.offset;
                 uint32_t len = r.nbytes;
                 if (direct_) { off = dio_align_down(r.offset); len = dio_padded_size(r.offset, r.nbytes); }
                 q_.push_back(job{ r.shard, off, len, r.dst, r.tag, r.offset, r.nbytes });
                 in_flight_++;
+                queued_jobs++;
             }
         }
-        cv_work_.notify_all();
+        // notify_all(), not one notify_one() per job. Waking exactly as many
+        // workers as there are jobs looks cheaper, but it was measured slower:
+        // k notify_one() calls are k futex syscalls made serially by the
+        // submitting thread, and the workers they wake start one after another,
+        // while a single notify_all() starts them together. On an i9-12900H /
+        // RTX 3080 Ti Laptop, UD-Q4_K_XL, 128-token decode, the per-job version
+        // raised the per-token read wait from 63 to 68 ms (7.92 -> 7.75 tok/s).
+        if (queued_jobs) cv_work_.notify_all();
+        if (queued_jobs < n) cv_done_.notify_all();   // the rejected ones are already in done_
         stat_t_prep += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         return n;
     }
 
     if (!ring_) return 0;
-    size_t queued = 0;
+    // `prepped` counts SQEs; `accepted` counts requests this call takes
+    // responsibility for completing, which includes the rejected ones.
+    size_t prepped = 0, accepted = 0;
     const auto t_prep0 = std::chrono::steady_clock::now();
 
     for (size_t i = 0; i < n; i++) {
         const io_request & r = reqs[i];
-        if (r.shard < 0 || (size_t) r.shard >= fds_.size() || !r.dst || r.nbytes == 0) continue;
+        if (r.shard < 0 || (size_t) r.shard >= fds_.size() || !r.dst || r.nbytes == 0) {
+            // Completed here as an error rather than dropped: see rejected_.
+            // Skipping it used to shift every later request's position in the
+            // caller's retry loop, which then resubmitted the same bad request
+            // for ever.
+            stat_errors++;
+            rejected_.push_back(r.tag);
+            in_flight_++;
+            accepted++;
+            continue;
+        }
 
         io_uring_sqe * sqe = io_uring_get_sqe(ring_);
         if (!sqe) break;   // ring full; caller should reap and retry
@@ -172,23 +204,30 @@ size_t io_engine::submit(const io_request * reqs, size_t n) {
 
         io_uring_prep_read(sqe, registered_files ? r.shard : fds_[r.shard], r.dst, len, off);
         if (registered_files) sqe->flags |= IOSQE_FIXED_FILE;
-        expect_[queued & 1023] = len;
+        expect_[prepped & 1023] = len;
         if (min_expect_ == 0 || len < min_expect_) min_expect_ = len;
         io_uring_sqe_set_data64(sqe, r.tag);
-        queued++;
+        prepped++;
+        accepted++;
     }
 
     const auto t_prep1 = std::chrono::steady_clock::now();
     stat_t_prep += std::chrono::duration<double>(t_prep1 - t_prep0).count();
 
-    if (queued) {
-        int rc = io_uring_submit(ring_);
+    if (prepped) {
+        const int rc = io_uring_submit(ring_);
         stat_t_submit_syscall += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_prep1).count();
-        if (rc < 0) { stat_errors++; return 0; }
-        in_flight_ += queued;
+        // A short or failed submit does NOT lose the entries: liburing has
+        // already advanced the SQ tail, so whatever the kernel did not take
+        // stays in the ring and goes out on the next io_uring_submit(). They
+        // will therefore all complete, and all of them count as in flight --
+        // what used to hang the decode loop was that nothing called submit()
+        // again before the wait, so reap() flushes the ring before waiting.
+        if (rc < 0 || (size_t) rc < prepped) stat_errors++;
+        in_flight_ += prepped;
     }
-    return queued;
+    return accepted;
 }
 
 size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete) {
@@ -215,6 +254,30 @@ size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete
 
     size_t got = 0;
     if (min_complete > in_flight_) min_complete = in_flight_;
+
+    // Requests rejected at submit: complete in the only sense the caller tracks.
+    while (got < max_tags && !rejected_.empty()) {
+        tags_out[got++] = rejected_.back();
+        rejected_.pop_back();
+        in_flight_--;
+    }
+    if (in_flight_ == 0) return got;
+
+    // io_uring_submit() takes as many SQEs as the kernel will accept and leaves
+    // the rest in the ring for the next submit. Nothing else calls submit()
+    // between the caller's last one and the wait below, so a short submit would
+    // park entries the kernel never saw and io_uring_wait_cqe() would block on
+    // completions that cannot arrive. Flush first.
+    if (io_uring_sq_ready(ring_) > 0) {
+        const int rc = io_uring_submit(ring_);
+        if (rc <= 0 && io_uring_sq_ready(ring_) > 0) {
+            // The ring will not drain. Hand back what is already there rather
+            // than waiting for ever; the caller reports a short read, which is
+            // recoverable, where a hang is not.
+            stat_errors++;
+            min_complete = 0;
+        }
+    }
 
     while (got < max_tags) {
         io_uring_cqe * cqe = nullptr;

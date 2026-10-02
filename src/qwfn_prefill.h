@@ -33,6 +33,11 @@
 
 namespace qwfn {
 
+// Reads the streamer keeps in flight while sweeping a layer's experts. The
+// io_engine has to be able to hold this many at once, which is a different
+// number from the worker count and used to be confused with it.
+static constexpr size_t PREFILL_READ_WINDOW = 32;
+
 class prefill_streamer {
 public:
     ~prefill_streamer();
