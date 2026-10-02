@@ -16,6 +16,7 @@
 // you cannot simply forget the tail of a scan.
 
 #include "qwfn_engine.h"
+#include "qwfn_files.h"
 #include "qwfn_home.h"
 #include "qwfn_model.h"
 #include "qwfn_vocab.h"
@@ -739,6 +740,28 @@ static bool render_content(server & S, const json & content, std::string & text,
             imgs.emplace_back(text.size(), std::move(pi));   // marker position in text
             continue;
         }
+        if (ty == "file" || ty == "input_file") {
+            // A file, inline: Chat Completions' {"type":"file","file":{"filename","file_data"}} or
+            // the Responses API's {"type":"input_file","filename","file_data"}, file_data a data: URL
+            // or bare base64. Text files and zip archives of them read as text (qwfn_files.h);
+            // anything else, and a file sent by id (this server keeps no uploads), is named so the
+            // model knows what it was not given.
+            const json & f = part.contains("file") && part["file"].is_object() ? part["file"] : part;
+            const std::string name = f.value("filename", "attachment");
+            std::string data = f.value("file_data", "");
+            if (data.empty()) { text += "[attached file not read: " + name + " (sent by file id; this server keeps no uploaded files)]\n"; continue; }
+            std::string media;
+            if (data.rfind("data:", 0) == 0) {
+                const size_t comma = data.find(',');
+                if (comma == std::string::npos) { err = "bad data: URL in file_data"; return false; }
+                media = data.substr(5, data.find(';') < comma ? data.find(';') - 5 : comma - 5);
+                data = data.substr(comma + 1);
+            }
+            std::vector<uint8_t> raw;
+            if (!b64_decode(data, raw)) { err = "bad base64 in file_data"; return false; }
+            text += file_as_text(name, media, raw.data(), raw.size());
+            continue;
+        }
     }
     return true;
 }
@@ -781,10 +804,18 @@ static bool anthropic_part(const json & b, json & part, std::string & err) {
         return true;
     }
     if (ty == "document") {
-        // A text document reads as text; anything else (a PDF) is named, so the
-        // model knows what it was not given, instead of failing the turn.
-        const std::string text = src.value("type", "") == "text" ? src.value("data", "")
-                               : "[document not available: " + src.value("media_type", "unknown type") + " is not supported by this server]";
+        // A text document reads as text, a base64 one through file_as_text (text files and zip
+        // archives of them read; anything else, a PDF say, is named, so the model knows what it
+        // was not given instead of the turn failing).
+        const std::string kind = src.value("type", "");
+        std::string text;
+        if (kind == "text") text = src.value("data", "");
+        else if (kind == "content") text = anthropic_text(src.value("content", json::array()));
+        else if (kind == "base64") {
+            std::vector<uint8_t> raw;
+            if (!b64_decode(src.value("data", ""), raw)) { err = "bad base64 in a document block"; return false; }
+            text = file_as_text(b.value("title", "document"), src.value("media_type", ""), raw.data(), raw.size());
+        } else text = "[document not available: a " + (kind.empty() ? std::string("missing") : kind) + " source is not supported by this server]";
         part = json{{"type", "text"}, {"text", text}};
         return true;
     }

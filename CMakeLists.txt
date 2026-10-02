@@ -127,6 +127,7 @@ add_library(qwfn_core STATIC
   src/qwfn_engine.cpp
   src/qwfn_prefill.cpp
   src/qwfn_vision.cpp
+  src/qwfn_files.cpp
 )
 target_include_directories(qwfn_core PUBLIC
   "${LLAMA_CPP_ROOT}/vendor/stb"
@@ -170,6 +171,12 @@ add_executable(qwfn-io-test tools/qwfn_io_test.cpp)
 target_link_libraries(qwfn-io-test PRIVATE qwfn_core)
 qwfn_opts(qwfn-io-test)
 add_test(NAME io COMMAND qwfn-io-test)
+
+# Attachments as text (text files, zip archives), for the chat endpoints' file parts.
+add_executable(qwfn-files-test tools/qwfn_files_test.cpp)
+target_link_libraries(qwfn-files-test PRIVATE qwfn_core)
+qwfn_opts(qwfn-files-test)
+add_test(NAME files COMMAND qwfn-files-test)
 
 add_executable(qwfn-inspect tools/qwfn_inspect.cpp)
 target_link_libraries(qwfn-inspect PRIVATE qwfn_core)
