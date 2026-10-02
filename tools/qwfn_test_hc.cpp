@@ -3,6 +3,7 @@
 
 #include "qwfn_graph.h"
 #include "qwfn_model.h"
+#include "qwfn_home.h"
 #include "qwfn_weights.h"
 
 #include <cstdio>
@@ -34,7 +35,7 @@ int main(int argc, char ** argv) {
     const hparams & hp = mi.hp();
 
     weights w;
-    if (!w.init(&mi, /*prefer_gpu=*/true, std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!w.init(&mi, /*prefer_gpu=*/true, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "backend init: %s\n", err.c_str()); return 1;
     }
     printf("backend: %s (gpu=%d)\n", w.dev_name(), (int) w.on_gpu());
