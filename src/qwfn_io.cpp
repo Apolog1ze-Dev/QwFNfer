@@ -361,7 +361,7 @@ size_t io_engine::submit(const io_request * reqs, size_t n) {
         if (registered_files) sqe->flags |= IOSQE_FIXED_FILE;
         expect_[prepped & 1023] = len;
         if (min_expect_ == 0 || len < min_expect_) min_expect_ = len;
-        io_uring_sqe_set_data64(sqe, r.tag);
+        sqe->user_data = r.tag;   // io_uring_sqe_set_data64, which liburing 2.1 (Ubuntu 22.04, the release build) lacks
         prepped++;
         accepted++;
     }
@@ -456,7 +456,7 @@ size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete
             stat_bytes += (uint64_t) cqe->res;
             if ((uint32_t) cqe->res < min_expect_) stat_short++;
         }
-        tags_out[got++] = io_uring_cqe_get_data64(cqe);
+        tags_out[got++] = cqe->user_data;
         io_uring_cqe_seen(ring_, cqe);
         in_flight_--;
         if (in_flight_ == 0) break;
