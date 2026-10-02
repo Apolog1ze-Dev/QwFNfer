@@ -123,6 +123,11 @@ bool weights::init(const model_index * mi, bool prefer_gpu,
 
     if (backend_dir.empty()) ggml_backend_load_all();
     else                     ggml_backend_load_all_from_path(backend_dir.c_str());
+    // The default directory is a source checkout's (~/.unsloth/llama.cpp/build/bin). When it
+    // holds no backends, take ggml's own search -- the executable's directory, where a release
+    // bundle and a Windows build keep them, then the working directory -- rather than fail with
+    // no device at all. The server never gets here empty: libllama loads them for the tokenizer.
+    if (ggml_backend_dev_count() == 0) ggml_backend_load_all();
 
     if (prefer_gpu) {
         dev_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
