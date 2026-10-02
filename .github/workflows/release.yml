@@ -36,7 +36,7 @@ env:
   GGML_FLAGS: >-
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
     -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON
-    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
+    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
 
 jobs:
   linux:
@@ -57,7 +57,7 @@ jobs:
             git ca-certificates curl wget gnupg xz-utils zstd binutils file python3 python3-pip \
             zip unzip gcc-12 g++-12 liburing-dev
           python3 -m pip install --no-cache-dir cmake ninja
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -85,7 +85,7 @@ jobs:
       # later step fails (the combined action saves only at the end of a successful job)
       - name: Cached portable ggml build
         id: ggml-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/ggml-build/bin
           key: release-linux-ggml-${{ env.LLAMA_SHA }}-cuda13.3-sm75-120-${{ hashFiles('cmake/glibc_compat.h') }}-v1
@@ -99,7 +99,7 @@ jobs:
             -DCMAKE_C_FLAGS="-include $H -fno-math-errno" -DCMAKE_CXX_FLAGS="-include $H -fno-math-errno" \
             -DCMAKE_CUDA_FLAGS="-Xcompiler=-fno-math-errno -Xcompiler=-include,$H"
           cmake --build "$HOME/ggml-build"
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         with:
           path: ~/ggml-build/bin
@@ -110,7 +110,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="$GITHUB_REF_NAME"; fi
           LLAMA_CPP_ROOT="$HOME/llama.cpp" GGML_LIBS="$HOME/ggml-build/bin" \
             CUDA_LIBS="$CUDA_HOME/targets/x86_64-linux/lib" bash scripts/package.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: qwfnfer-linux-x86_64-cuda
           path: dist/qwfnfer-linux-x86_64-cuda.zip
@@ -122,7 +122,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 330
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: ./.github/actions/windows-setup-cuda
@@ -136,7 +136,7 @@ jobs:
           git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
       - name: Cached portable ggml build
         id: ggml-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ${{ runner.temp }}\ggml-build\bin
@@ -151,7 +151,7 @@ jobs:
           if ($LASTEXITCODE) { exit 1 }
           cmake --build "$env:RUNNER_TEMP\ggml-build"
           if ($LASTEXITCODE) { exit 1 }
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         with:
           path: |
@@ -168,7 +168,7 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:VERSION = $env:GITHUB_REF_NAME }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
           if ($LASTEXITCODE) { exit 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: qwfnfer-windows-x86_64-cuda
           path: dist/qwfnfer-windows-x86_64-cuda.zip
@@ -182,7 +182,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true

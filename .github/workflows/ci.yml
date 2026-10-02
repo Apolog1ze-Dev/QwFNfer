@@ -21,14 +21,14 @@ env:
   LLAMA_SHA: ca1426903fabe9af26cd10c42034cb4bbd2e0e11   # Unsloth's llama.cpp, mtp/qwen4exp-nextn (README, "Building from source")
   LLAMA_CPU_FLAGS: >-
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
-    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
+    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
 
 jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Toolchain and liburing
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build liburing-dev
       - name: llama.cpp source
@@ -38,16 +38,16 @@ jobs:
           git -C "$HOME/llama.cpp" checkout -q FETCH_HEAD
       - name: Cached llama.cpp CPU build
         id: llama-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/llama-cpu/bin
-          key: ci-linux-llama-cpu-${{ env.LLAMA_SHA }}-v1
+          key: ci-linux-llama-cpu-${{ env.LLAMA_SHA }}-v2
       - name: llama.cpp CPU build
         if: steps.llama-cache.outputs.cache-hit != 'true'
         run: |
           cmake -S "$HOME/llama.cpp" -B "$HOME/llama-cpu" -G Ninja $LLAMA_CPU_FLAGS
           cmake --build "$HOME/llama-cpu"
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         if: steps.llama-cache.outputs.cache-hit != 'true'
         with:
           path: ~/llama-cpu/bin
@@ -67,6 +67,7 @@ jobs:
       - name: Console API over a model cache
         run: |
           python3 -m py_compile tools/qwfn_console.py tools/qwfn_router.py tools/make_synth_gguf.py
+          python3 .github/scripts/console_units.py
           snap="$RUNNER_TEMP/hf/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/0000000/UD-Q4_K_XL"
           mkdir -p "$snap" && cp synth.gguf "$snap/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00001.gguf"
           HF_HUB_CACHE="$RUNNER_TEMP/hf" python3 tools/qwfn_console.py --port 18090 > console.log 2>&1 &
@@ -76,7 +77,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/windows-msvc-env
       - name: Ninja
         run: choco install ninja -y --no-progress
@@ -87,13 +88,13 @@ jobs:
           git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
       - name: Cached llama.cpp CPU build
         id: llama-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ${{ runner.temp }}\llama-cpu\bin
             ${{ runner.temp }}\llama-cpu\ggml\src\*.lib
             ${{ runner.temp }}\llama-cpu\src\*.lib
-          key: ci-windows-llama-cpu-${{ env.LLAMA_SHA }}-v1
+          key: ci-windows-llama-cpu-${{ env.LLAMA_SHA }}-v2
       - name: llama.cpp CPU build (MSVC)
         if: steps.llama-cache.outputs.cache-hit != 'true'
         run: |
@@ -102,7 +103,7 @@ jobs:
           if ($LASTEXITCODE) { exit 1 }
           cmake --build "$env:RUNNER_TEMP\llama-cpu"
           if ($LASTEXITCODE) { exit 1 }
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v5
         if: steps.llama-cache.outputs.cache-hit != 'true'
         with:
           path: |
@@ -133,6 +134,8 @@ jobs:
       - name: Console API over a model cache
         run: |
           python -m py_compile tools\qwfn_console.py tools\qwfn_router.py tools\make_synth_gguf.py
+          if ($LASTEXITCODE) { exit 1 }
+          python .github\scripts\console_units.py
           if ($LASTEXITCODE) { exit 1 }
           $snap = "$env:RUNNER_TEMP\hf\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\0000000\UD-Q4_K_XL"
           New-Item -ItemType Directory -Force $snap | Out-Null

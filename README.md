@@ -110,6 +110,7 @@ It opens http://127.0.0.1:8090. Pick a downloaded quant and a tier: **Chat** (32
 **4. Point your tools at it.** The console shows the endpoint, `http://127.0.0.1:8080/v1` by default; any OpenAI-compatible client works with any API key (Unsloth Studio as a custom provider, Open WebUI, your own scripts). What the server accepts:
 
 - Chat completions with streaming; the model id is `qwen3.8-flash-next`. Images go in as OpenAI content parts (base64 `data:` URLs) when vision is on, up to 4,096 image tokens each; the projector runs on the CPU so it takes no VRAM; a 1400×1000 screenshot is 1,364 tokens and encodes in about 15 s on 8 cores, a 1280×720 one in 7-8 s.
+- Files go in as OpenAI `file` parts (base64 `file_data`) or Anthropic `document` blocks: a text file reads as text and a `.zip` as the text files inside it, each under its path, up to 16 MB of text an attachment; anything else, a PDF say, is named to the model as not read rather than dropped. Whether a client lets you attach a zip at all is up to the client.
 - Thinking is `xhigh` by default; change it per request with `reasoning_effort` (`xhigh` | `medium` | `low` | `off`) or `reasoning_budget`, or with `/think` and `/no_think` in a message. Reasoning comes back separately in `reasoning_content`.
 - Sampling presets follow the model card (thinking and non-thinking) unless you pass `temperature`, `top_p`, `top_k`, `min_p` or the penalties; tool calling follows the OpenAI `tools` / `tool_choice` shape, and a call streams as `tool_calls` deltas while the model is still writing it, so a harness sees the code arrive instead of a minutes-long silence (Unsloth Studio drops a stream after 300 s without bytes; the server also sends an SSE keepalive whenever nothing else has gone out for 15 s).
 - Every response carries llama.cpp-style `timings`; `/stats` is what the console's live panel reads.
@@ -131,9 +132,11 @@ Thinking comes back as `thinking` blocks and tool calls as `tool_use` blocks, st
 
 ```bash
 git init ~/.unsloth/llama.cpp && git -C ~/.unsloth/llama.cpp fetch --depth 1 https://github.com/unslothai/llama.cpp ca1426903fabe9af26cd10c42034cb4bbd2e0e11 && git -C ~/.unsloth/llama.cpp checkout FETCH_HEAD
-cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DLLAMA_BUILD_APP=OFF
 cmake --build ~/.unsloth/llama.cpp/build -j
 ```
+
+`-DLLAMA_BUILD_APP=OFF` leaves out llama.cpp's unified `llama` binary, which the engine does not use and whose target in this tree compiles before the `build-info.h` and include paths it needs exist, so a parallel build fails on it now and then.
 
 Then the engine (`-DLLAMA_CPP_ROOT=<path>` if that tree is somewhere else; at run time the server looks for the ggml backends in `~/.unsloth/llama.cpp/build/bin`, or next to its own binary):
 
@@ -145,7 +148,7 @@ On Windows, the same two steps in a *x64 Native Tools Command Prompt for VS 2022
 
 ```bat
 git init %USERPROFILE%\.unsloth\llama.cpp && git -C %USERPROFILE%\.unsloth\llama.cpp fetch --depth 1 https://github.com/unslothai/llama.cpp ca1426903fabe9af26cd10c42034cb4bbd2e0e11 && git -C %USERPROFILE%\.unsloth\llama.cpp checkout FETCH_HEAD
-cmake -S %USERPROFILE%\.unsloth\llama.cpp -B %USERPROFILE%\.unsloth\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON
+cmake -S %USERPROFILE%\.unsloth\llama.cpp -B %USERPROFILE%\.unsloth\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON -DLLAMA_BUILD_APP=OFF
 cmake --build %USERPROFILE%\.unsloth\llama.cpp\build
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_ROOT=%USERPROFILE%\.unsloth\llama.cpp -DLLAMA_CPP_BUILD=%USERPROFILE%\.unsloth\llama.cpp\build\bin
 cmake --build build && build\qwfn-io-test.exe && python tools\qwfn_console.py
