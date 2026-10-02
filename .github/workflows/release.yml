@@ -126,7 +126,12 @@ jobs:
         run: |
           export CC=gcc-12 CXX=g++-12
           if [ -n "$RELEASE_TAG" ]; then export VERSION="$RELEASE_TAG"; fi
-          LLAMA_CPP_ROOT="$HOME/llama.cpp" GGML_LIBS="$HOME/ggml-build/bin" \
+          # The runtime the bundle ships is this Ubuntu 22.04 container's own: gcc-12's libstdc++
+          # and libgomp, which built the engine and ggml, and liburing 2.1. package.sh's default,
+          # noble's, needs glibc 2.38, past the 2.35 floor this container is here to keep.
+          rt="$HOME/runtime-jammy"; mkdir -p "$rt"
+          for so in libstdc++.so.6 libgcc_s.so.1 libgomp.so.1 liburing.so.2; do cp -L "/usr/lib/x86_64-linux-gnu/$so" "$rt/"; done
+          LLAMA_CPP_ROOT="$HOME/llama.cpp" GGML_LIBS="$HOME/ggml-build/bin" RUNTIME_LIBS="$rt" \
             CUDA_LIBS="$CUDA_HOME/targets/x86_64-linux/lib" bash scripts/package.sh
       - name: The zip, unpacked, on the CPU (.github/scripts/bundle_check.py)
         run: |
