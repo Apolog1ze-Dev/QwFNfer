@@ -463,6 +463,9 @@ private:
     ggml_tensor *         p_vslot_ = nullptr, * p_vmask_ = nullptr;
     std::vector<uint64_t> vslot_ver_;
     int                   n_late_ = 0;   // slots of the late fold (experts promoted this token)
+    int64_t               late_zero_rows_ = 0;         // leading rows of t_gids_/t_gw_ known zero on the device
+    const ggml_tensor *   pc_zero_t_ = nullptr;        // t_pc_ whose leading pc_zero_rows_ rows are known zero
+    int64_t               pc_zero_rows_ = 0;
     // Learned routing predictor: per layer an F16 [n_embd, n_expert] head and an
     // F32 bias, used in place of that layer's router when predicting its routing.
     ggml_context *        predctx_ = nullptr; ggml_backend_buffer_t predbuf_ = nullptr;
@@ -606,6 +609,9 @@ private:
     bool     have_expert_map_ = false;
 
     std::vector<float>   logits_, xfer_, zeros_;
+    std::vector<int32_t>  cb_scratch_, bc_scratch_, bp_scratch_;   // QSA index arrays, reused across chunks
+    std::vector<uint16_t> mask_scratch_;   // reused across chunks: the causal mask is ~95 GB/prefill
+    std::vector<float>    bias_scratch_;   // reused across chunks: QSA per-block bias
     std::vector<int32_t> sel_, ids_;
     std::vector<float>   wgt_;
     std::vector<int32_t> pred_;   // last layer's prediction for this one

@@ -138,6 +138,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         hpm_.full_attention_interval = hpm_.n_layer;   // in this index only the last block, the nextn block, is attention
         hpm_.ssm_dt_rank = 1;                           // the index's 48 trunk slots carry no state here; keep theirs tiny
         hpm_.hc_inject_prescaled = false;               // its inject weights are Q8_0 and are not folded
+        hpm_.hc_down_prescaled   = false;               // nor its down weights
         state_config scm; scm.n_ctx = cfg.n_ctx; scm.type_k = cfg.type_k; scm.type_v = cfg.type_v;
         if (!st_mtp_.init(&hpm_, scm, w_.buft(), err)) return false;
         mtp_on_ = true;
@@ -249,27 +250,48 @@ bool engine::init(const model_index * hot, const model_index * cold,
             for (const char * n : { "hc_attn_norm", "hc_ffn_norm", "ple_norm_key", "ple_norm_query", "ple_norm_conv" })
                 reshape_gamma(b + n + ".weight");
         }
-        // Fold the 1/hc of hc_combine's gate into the F32 inject weights: 0.25 is a
-        // power of two, so every product and partial sum rounds exactly as before
-        // and the scale kernel disappears. Only if every inject weight is F32.
-        bool all_f32 = true; std::vector<ggml_tensor *> inj;
-        for (uint32_t l = 0; l < hp_.n_layer && all_f32; l++)
-            for (const char * n : { "hc_attn_inject", "hc_ffn_inject" }) {
-                ggml_tensor * t = w_.get("blk." + std::to_string(l) + "." + n + ".weight");
+        // Fold the 1/hc scales of the hyper-connections into their weights: hc_combine's
+        // gate (inject) and hc_mix's low-rank branch (down). 0.25 is a power of two, so
+        // every product and partial sum rounds exactly as before and the scale kernels
+        // disappear (three per decode layer graph). F32, BF16 and F16 weights: scaling a
+        // 16-bit float by a power of two only moves its exponent. Each set is folded only
+        // if every tensor in it can be, so a flag never describes a half-folded model.
+        auto fold_set = [&](const std::vector<std::string> & names, const char * what) -> bool {
+            std::vector<ggml_tensor *> ts;
+            for (const std::string & nm : names) {
+                ggml_tensor * t = w_.get(nm);
                 if (!t) continue;
-                if (t->type != GGML_TYPE_F32) { all_f32 = false; break; }
-                inj.push_back(t);
+                if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F16) return false;
+                if (!ggml_is_contiguous(t)) return false;
+                ts.push_back(t);
             }
-        if (all_f32 && !inj.empty() && !getenv("QWFN_NO_INJECT_FOLD")) {
-            std::vector<float> buf;
-            for (ggml_tensor * t : inj) {
-                buf.resize(ggml_nelements(t));
-                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
-                for (float & v : buf) v *= 1.0f / (float) hc;
-                ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
+            if (ts.empty()) return false;
+            std::vector<uint8_t> raw; std::vector<float> f;
+            for (ggml_tensor * t : ts) {
+                const int64_t n = ggml_nelements(t);
+                raw.resize(ggml_nbytes(t)); f.resize(n);
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                if (t->type == GGML_TYPE_F32)       memcpy(f.data(), raw.data(), n * sizeof(float));
+                else if (t->type == GGML_TYPE_BF16) ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), f.data(), n);
+                else                                ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), f.data(), n);
+                for (float & v : f) v *= 1.0f / (float) hc;
+                if (t->type == GGML_TYPE_F32)       memcpy(raw.data(), f.data(), n * sizeof(float));
+                else if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(f.data(), (ggml_bf16_t *) raw.data(), n);
+                else                                ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t *) raw.data(), n);
+                ggml_backend_tensor_set(t, raw.data(), 0, raw.size());
             }
-            hp_.hc_inject_prescaled = true;
+            fprintf(stderr, "[qwfn] hc fold: %s scaled by 1/%lld in %zu tensors (%s)\n", what, (long long) hc, ts.size(), ggml_type_name(ts[0]->type));
+            return true;
+        };
+        std::vector<std::string> inj_names, down_names;
+        for (uint32_t l = 0; l < hp_.n_layer; l++) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            inj_names.push_back(b + "hc_attn_inject.weight"); inj_names.push_back(b + "hc_ffn_inject.weight");
+            down_names.push_back(b + "hc_attn_down.weight");  down_names.push_back(b + "hc_ffn_down.weight");
         }
+        down_names.push_back("output_hc_down.weight");
+        if (!getenv("QWFN_NO_INJECT_FOLD")) hp_.hc_inject_prescaled = fold_set(inj_names, "inject");
+        if (!getenv("QWFN_NO_DOWN_FOLD"))   hp_.hc_down_prescaled   = fold_set(down_names, "down");
     }
     constexpr int64_t MAXT = 1 + MTP_MAX_DRAFTS;   // positions of the longest verify step
     pack_n_ = MAXT * (n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX);   // room for a multi-token step
@@ -648,7 +670,7 @@ static ggml_tensor * moe_id_graph(ggml_context * c, const tier_view & tv,
         // summation order, so only the GPU graphs ask for it; the CPU path keeps
         // the sequential sum it is validated with. Batched over the T positions.
         ggml_tensor * dt = ggml_reshape_3d(c, ggml_cont(c, ggml_permute(c, down, 1, 0, 2, 3)), n, n_embd, T);   // [n, n_embd, T]
-        ggml_tensor * wv = ggml_reshape_3d(c, ggml_cont(c, w), n, 1, T);                                       // [n, 1, T]
+        ggml_tensor * wv = ggml_reshape_3d(c, ggml_is_contiguous(w) ? w : ggml_cont(c, w), n, 1, T);          // [n, 1, T]; a cont is a kernel even on contiguous input
         return ggml_reshape_2d(c, ggml_mul_mat(c, dt, wv), n_embd, T);                                          // [n_embd, T]
     }
     ggml_tensor * wd   = ggml_mul(c, down, w);
@@ -876,11 +898,29 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
     const int64_t n_kv = n_past_c + Tc;
     ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 16; ip.no_alloc = true;
     ai.ctx = ggml_init(ip);
-    ai.kq_mask = ggml_new_tensor_2d(ai.ctx, GGML_TYPE_F16, n_kv, Tc);
+    // QWFN_DEV_MASK: leave the mask null and let the graph builder generate it on
+    // the device. The QSA block structures below are still built on the host -- they
+    // are ~1/64 the bytes of the mask.
+    static const bool dev_mask = getenv("QWFN_DEV_MASK") != nullptr;
+    ai.kq_mask = dev_mask ? nullptr : ggml_new_tensor_2d(ai.ctx, GGML_TYPE_F16, n_kv, Tc);
     ai.ratio = cfg_.use_qsa ? qsa_ratio_ : 0;
     const uint32_t ratio = ai.ratio;
     const int64_t n_blocks = ratio ? (n_kv + ratio - 1) / ratio : 0;
-    if (ratio) {
+    // QWFN_QSA_PACK: one upload per chunk instead of four. The bias is pure position
+    // geometry and is built on the device (graph_builder::qsa_bias_dev); cell_blk is
+    // never read by the prefill graph and is not built at all; blk_cells and blk_pos
+    // are views of a single packed I32 tensor. At 89K this runs ~1,030 times (12
+    // attention layers x ~86 chunks), and each sync tensor_set drains the queue and
+    // bounces through a fresh host allocation.
+    static const bool qsa_pack = getenv("QWFN_QSA_PACK") != nullptr;
+    ggml_tensor * qsa_packed = nullptr;
+    if (ratio && qsa_pack) {
+        qsa_packed       = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, (int64_t) (ratio + 4) * n_blocks);
+        ai.qsa.blk_cells = ggml_view_1d(ai.ctx, qsa_packed, ratio * n_blocks, 0);
+        ai.qsa.blk_pos   = ggml_view_1d(ai.ctx, qsa_packed, 4 * n_blocks, (size_t) ratio * n_blocks * sizeof(int32_t));
+        ai.qsa.ratio     = ratio;
+        ai.qsa.n_blocks  = n_blocks;
+    } else if (ratio) {
         ai.qsa.cell_blk  = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, n_kv);
         ai.qsa.blk_cells = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, ratio * n_blocks);
         ai.qsa.blk_pos   = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, 4 * n_blocks);
@@ -888,28 +928,62 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
         ai.qsa.ratio     = ratio;
         ai.qsa.n_blocks  = n_blocks;
     }
-    ai.buf = ggml_backend_alloc_ctx_tensors_from_buft(ai.ctx, w_.buft());
-    if (!ai.buf) { ggml_free(ai.ctx); ai.ctx = nullptr; err = "failed to allocate per-chunk attention inputs"; return false; }
+    // With dev_mask and no QSA the context holds no tensors at all; alloc would
+    // return null for an empty context, which is not an error.
+    const bool want_alloc = !dev_mask || ratio != 0;
+    ai.buf = want_alloc ? ggml_backend_alloc_ctx_tensors_from_buft(ai.ctx, w_.buft()) : nullptr;
+    if (want_alloc && !ai.buf) { ggml_free(ai.ctx); ai.ctx = nullptr; err = "failed to allocate per-chunk attention inputs"; return false; }
     // These are O(n_kv * Tc) per chunk and at 128K ran for a third of the
     // prefill when written element by element. Row-wise fills: a row is a
     // run of zeros then a run of -inf (F16 0x0000 / 0xFC00).
-    {
-        std::vector<uint16_t> m((size_t) n_kv * Tc);
+    if (!dev_mask) {
+        // The buffer is reused across chunks rather than reallocated: a fresh ~100 MB
+        // allocation per chunk costs a page-fault storm plus the kernel's own zero-fill.
+        const size_t need = (size_t) n_kv * Tc;
+        if (mask_scratch_.size() < need) mask_scratch_.resize(need);
+        uint16_t * m = mask_scratch_.data();
         const uint16_t ninf = f16_of(-INFINITY);
         for (int64_t i = 0; i < Tc; i++) {
-            uint16_t * row = m.data() + i * n_kv;
+            uint16_t * row = m + i * n_kv;
             const int64_t vis = std::min<int64_t>(n_kv, n_past_c + i + 1);
             memset(row, 0, (size_t) vis * 2);
             std::fill(row + vis, row + n_kv, ninf);
         }
-        ggml_backend_tensor_set(ai.kq_mask, m.data(), 0, m.size() * 2);
+        ggml_backend_tensor_set(ai.kq_mask, m, 0, need * 2);
     }
-    if (ratio) {
+    if (ratio && qsa_pack) {
+        // Same values as the unpacked path below for blk_cells and blk_pos, written
+        // into one contiguous scratch laid out as the packed tensor: [bc | bp].
+        const int64_t n_bid = n_kv / ratio;
+        const size_t bc_n = (size_t) ratio * n_blocks, bp_n = (size_t) 4 * n_blocks;
+        if (bc_scratch_.size() < bc_n + bp_n) bc_scratch_.resize(bc_n + bp_n);
+        int32_t * bc = bc_scratch_.data();
+        int32_t * bp = bc + bc_n;
+        memset(bc, 0, (bc_n + bp_n) * sizeof(int32_t));     // scratch is reused: dirty
+        for (int64_t b = 0; b < n_bid; b++) {
+            for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
+        }
+        ggml_backend_tensor_set(qsa_packed, bc, 0, (bc_n + bp_n) * 4);
+    } else if (ratio) {
         const int64_t n_bid = n_kv / ratio;
         const bool have_dead = n_bid < n_blocks;
         const int64_t dead = have_dead ? n_bid : n_blocks - 1;
-        std::vector<int32_t> cb(n_kv), bc((size_t) ratio * n_blocks, 0), bp((size_t) 4 * n_blocks, 0);
-        std::vector<float> bi((size_t) n_blocks * Tc);
+        // Persistent scratch, reused across chunks and therefore DIRTY -- and unlike the causal mask the loops below do not cover
+        // every entry (bc writes [0, n_bid*ratio), bp writes [0, n_bid) per section),
+        // so the arrays are zeroed explicitly. The original relied on vector zero-init.
+        const size_t cb_n = (size_t) n_kv, bc_n = (size_t) ratio * n_blocks, bp_n = (size_t) 4 * n_blocks;
+        if (cb_scratch_.size() < cb_n) cb_scratch_.resize(cb_n);
+        if (bc_scratch_.size() < bc_n) bc_scratch_.resize(bc_n);
+        if (bp_scratch_.size() < bp_n) bp_scratch_.resize(bp_n);
+        int32_t * cb = cb_scratch_.data();
+        int32_t * bc = bc_scratch_.data();
+        int32_t * bp = bp_scratch_.data();
+        memset(bc, 0, bc_n * sizeof(int32_t));
+        memset(bp, 0, bp_n * sizeof(int32_t));
+        const size_t bneed = (size_t) n_blocks * Tc;
+        if (bias_scratch_.size() < bneed) bias_scratch_.resize(bneed);
+        float * bi_p = bias_scratch_.data();
         for (int64_t j = 0; j < n_bid * (int64_t) ratio; j++) cb[j] = (int32_t) (j / ratio);
         for (int64_t j = n_bid * (int64_t) ratio; j < n_kv; j++) cb[j] = (int32_t) dead;
         for (int64_t b = 0; b < n_bid; b++) {
@@ -929,7 +1003,7 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
         // n_bid. A block after q must not be forced: in a prefill chunk it would take one
         // of the selection's slots from a past block, and the causal mask empties it.
         for (int64_t i = 0; i < Tc; i++) {
-            float * row = bi.data() + i * n_blocks;
+            float * row = bi_p + i * n_blocks;
             const int64_t q = n_past_c + i;
             const int64_t tail_b = std::min<int64_t>(n_bid, ((q + 1) / ratio));   // first block at/after the tail
             std::fill(row, row + tail_b, 0.0f);
@@ -939,10 +1013,10 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
             for (int64_t b = tail_b; b < n_blocks; b++)
                 if (row[b] > 0.0f && b * (int64_t) ratio > q) row[b] = -1e9f;
         }
-        ggml_backend_tensor_set(ai.qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
-        ggml_backend_tensor_set(ai.qsa.blk_cells, bc.data(), 0, bc.size() * 4);
-        ggml_backend_tensor_set(ai.qsa.blk_pos,   bp.data(), 0, bp.size() * 4);
-        ggml_backend_tensor_set(ai.qsa.bias,      bi.data(), 0, bi.size() * 4);
+        ggml_backend_tensor_set(ai.qsa.cell_blk,  cb,   0, cb_n * 4);
+        ggml_backend_tensor_set(ai.qsa.blk_cells, bc,   0, bc_n * 4);
+        ggml_backend_tensor_set(ai.qsa.blk_pos,   bp,   0, bp_n * 4);
+        ggml_backend_tensor_set(ai.qsa.bias,      bi_p, 0, bneed * 4);
     }
     return true;
 }
@@ -1470,7 +1544,10 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
             }
             t_pf_moe += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
         }
-        ggml_backend_tensor_set(t_pg_, zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
+        // Device-side fill: this used to upload n_embd*T*4 bytes of host zeros
+        // per layer (910 MB at T=88826, ~43.7 GB per prefill) through ggml-sycl's
+        // sync set_tensor path, which also does a full queue wait and a double copy.
+        ggml_backend_tensor_memset(t_pg_, 0, 0, (size_t) n_embd * T * sizeof(float));
 
         if (cfg_.prefill_warm > 0) {
             const auto tw0 = std::chrono::steady_clock::now();
@@ -1555,6 +1632,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // at T == 1, so forcing it there checks the permutation logic in isolation.
     static const bool force_batched = getenv("QWFN_FORCE_BATCHED") != nullptr;
     const bool decode = (T == 1 || (force_decode && T <= 1 + MTP_MAX_DRAFTS)) && !force_batched;   // a verify step: a token and its drafts
+    // Zero-upload skips trust only this call's own uploads.
+    late_zero_rows_ = 0; pc_zero_t_ = nullptr;
     if (mtp_on_ && T > 1 && !force_decode && n_past > 0 && mtp_kv_valid_) {
         // A later turn: the head's row for the last decoded position pairs its
         // wide residual (still in t_hlast_) with this batch's first token.
@@ -2324,17 +2403,23 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // through pinned staging on the compute stream -- after the
                     // promotion copies, before the graph that reads them.
                     if ((int) late_gpu.size() > n_late_) { fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), n_late_); abort(); }
-                    std::vector<int32_t> gids((size_t) U * T, 0); std::vector<float> gw((size_t) U * T, 0.0f);
-                    for (int64_t j = 0; j < T; j++)
-                        for (size_t k = 0; k < late_gpu.size(); k++) { gids[j * U + k] = eh[late_gpu[k]].slot; gw[j * U + k] = w_tok(late_gpu[k], j); }
-                    if (p_gids_) {
-                        memcpy(p_gids_->data, gids.data(), gids.size() * sizeof(int32_t));
-                        memcpy(p_gw_->data,   gw.data(),   gw.size() * sizeof(float));
-                        ggml_backend_tensor_set_async(w_.backend(), t_gids_, p_gids_->data, 0, gids.size() * sizeof(int32_t));
-                        ggml_backend_tensor_set_async(w_.backend(), t_gw_,   p_gw_->data,   0, gw.size() * sizeof(float));
-                    } else {
-                        ggml_backend_tensor_set(t_gids_, gids.data(), 0, gids.size() * sizeof(int32_t));
-                        ggml_backend_tensor_set(t_gw_,   gw.data(),   0, gw.size() * sizeof(float));
+                    // Nothing late and the rows already zero on the device from an earlier layer:
+                    // the fold reads the same zeros without two more copies.
+                    static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
+                    if (!(upload_skip && late_gpu.empty() && late_zero_rows_ >= T)) {
+                        std::vector<int32_t> gids((size_t) U * T, 0); std::vector<float> gw((size_t) U * T, 0.0f);
+                        for (int64_t j = 0; j < T; j++)
+                            for (size_t k = 0; k < late_gpu.size(); k++) { gids[j * U + k] = eh[late_gpu[k]].slot; gw[j * U + k] = w_tok(late_gpu[k], j); }
+                        if (p_gids_) {
+                            memcpy(p_gids_->data, gids.data(), gids.size() * sizeof(int32_t));
+                            memcpy(p_gw_->data,   gw.data(),   gw.size() * sizeof(float));
+                            ggml_backend_tensor_set_async(w_.backend(), t_gids_, p_gids_->data, 0, gids.size() * sizeof(int32_t));
+                            ggml_backend_tensor_set_async(w_.backend(), t_gw_,   p_gw_->data,   0, gw.size() * sizeof(float));
+                        } else {
+                            ggml_backend_tensor_set(t_gids_, gids.data(), 0, gids.size() * sizeof(int32_t));
+                            ggml_backend_tensor_set(t_gw_,   gw.data(),   0, gw.size() * sizeof(float));
+                        }
+                        late_zero_rows_ = late_gpu.empty() ? std::max(late_zero_rows_, (int64_t) T) : 0;
                     }
                     n_exp_gpu += which.size() + late_gpu.size();
                     t_moe_gpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
@@ -2349,6 +2434,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // ones not in VRAM point at slot 0 with weight 0.
                     std::vector<int32_t> gids(U, 0); std::vector<float> gw(U, 0.0f);
                     for (int e : which) { gids[e] = eh[e].slot; gw[e] = wgt_[e]; }
+                    late_zero_rows_ = 0;
                     ggml_backend_tensor_set(t_gids_, gids.data(), 0, (size_t) U * sizeof(int32_t));
                     ggml_backend_tensor_set(t_gw_,   gw.data(),   0, (size_t) U * sizeof(float));
                     if (!ggml_gallocr_alloc_graph(gM_[il].ga, gM_[il].gf)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
@@ -2602,11 +2688,18 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // the staging is next written only after that graph has run
             // synchronously, so the DMA has long completed. Pageable memory would
             // make cudaMemcpyAsync block the caller anyway (see the promotions).
-            if (p_pc_ && nfl * sizeof(float) <= ggml_nbytes(p_pc_)) {
-                memcpy(p_pc_->data, acc.data(), nfl * sizeof(float));
-                ggml_backend_tensor_set_async(w_.backend(), t_pc_, p_pc_->data, 0, nfl * sizeof(float));
-            } else {
-                ggml_backend_tensor_set(t_pc_, acc.data(), 0, nfl * sizeof(float));
+            // No CPU experts leaves acc bitwise zero; skip it when t_pc_ already holds zeros.
+            const bool pc_zero = memcmp(acc.data(), zeros_.data(), nfl * sizeof(float)) == 0;
+            static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
+            if (!(upload_skip && decode && pc_zero && pc_zero_t_ == t_pc_ && pc_zero_rows_ >= T)) {
+                if (p_pc_ && nfl * sizeof(float) <= ggml_nbytes(p_pc_)) {
+                    memcpy(p_pc_->data, acc.data(), nfl * sizeof(float));
+                    ggml_backend_tensor_set_async(w_.backend(), t_pc_, p_pc_->data, 0, nfl * sizeof(float));
+                } else {
+                    ggml_backend_tensor_set(t_pc_, acc.data(), 0, nfl * sizeof(float));
+                }
+                pc_zero_rows_ = !pc_zero ? 0 : pc_zero_t_ == t_pc_ ? std::max(pc_zero_rows_, (int64_t) T) : (int64_t) T;
+                pc_zero_t_ = pc_zero ? t_pc_ : nullptr;
             }
             upload_vtable(il + 1);                 // next layer's residency, after this layer's promotions
         } else if (cbatch) {
@@ -2754,6 +2847,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 n_exp_gpu += n;
             }
             ec_.settle_promotions();
+            pc_zero_t_ = nullptr;
             ggml_backend_tensor_set(t_pc_, zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
         } else {
             // ---- prefill: expert-major permutation over the whole batch -----
@@ -2929,6 +3023,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 }
                 (void) h;
             }
+            pc_zero_t_ = nullptr;
             ggml_backend_tensor_set(t_pc_,   xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
             ggml_backend_tensor_set(t_pg_,      zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
 

@@ -421,6 +421,9 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
                 for (uint32_t e = 0; e < n_expert; e++)
                     ggml_backend_tensor_set(xfer_, src + (size_t) e * slice_[q],
                             dev_off_[q] + (size_t) e * dev_slice_[q], slice_[q]);
+            } else if (dev_slice_[q] == slice_[q]) {
+                // Equal strides: one contiguous copy (backends without a 2D copy, e.g. SYCL, would loop n_expert copies).
+                ggml_backend_tensor_set_async(dev_backend_, xfer_, src, dev_off_[q], (size_t) n_expert * slice_[q]);
             } else {
                 ggml_backend_tensor_set_2d_async(dev_backend_, xfer_, src,
                         dev_off_[q], slice_[q], n_expert, dev_slice_[q], slice_[q]);

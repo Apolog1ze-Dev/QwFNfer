@@ -84,6 +84,11 @@ public:
 
     // 12 of 48 layers. Lightning indexer picks 2051 cells, then GQA over them.
     // `qsa` may be null, in which case attention is dense over the whole cache.
+    // Build the causal mask on the device (see qwfn_graph.cpp). Used when the
+    // engine passes a null kq_mask, i.e. when it skipped the host-side build.
+    ggml_tensor * causal_mask_dev(int64_t n_kv, int64_t T);
+    ggml_tensor * qsa_bias_dev(int64_t n_blocks, int64_t r, int64_t T);
+
     ggml_tensor * sparse_attn(ggml_tensor * cur, ggml_tensor * inp_pos,
                               ggml_tensor * kq_mask, const int sections[4], int il,
                               const qsa_inputs * qsa = nullptr);

@@ -931,6 +931,7 @@ int main(int argc, char ** argv) {
         if (a == "--ctx"    && i + 1 < argc) { cfg.n_ctx = (uint32_t) atoi(next()); continue; }
         if (a == "--batch"  && i + 1 < argc) { cfg.n_batch = (uint32_t) atoi(next()); continue; }
         if (a == "--ubatch-kv" && i + 1 < argc) { cfg.ubatch_kv_product = (uint64_t)(atof(next()) * 1e6); continue; }
+        if (a == "--prefill-chunk" && i + 1 < argc) { cfg.prefill_chunk = (uint32_t) atoi(next()); continue; }
         if (a == "--indexer-top-k" && i + 1 < argc) { cfg.indexer_top_k = (uint32_t) atoi(next()); continue; }
         if (a == "--ram"    && i + 1 < argc) { cfg.ram_bytes = (size_t)(atof(next()) * 1e9); continue; }
         if (a == "--vram"   && i + 1 < argc) { cfg.vram_bytes = (size_t)(atof(next()) * 1e9); continue; }

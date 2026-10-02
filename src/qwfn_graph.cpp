@@ -62,7 +62,7 @@ ggml_tensor * graph_builder::hc_mix_w(ggml_tensor * x, ggml_tensor * w_norm, ggm
     }
 
     ggml_tensor * lo = ggml_mul_mat(ctx0, w_down, xn);                 // [hc_lr, T]
-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+    lo = ggml_silu(ctx0, hp_->hc_down_prescaled ? lo : ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, w_up, lo));  // [hc_dim, T]
 
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
@@ -290,7 +290,7 @@ ggml_tensor * graph_builder::qsa_top_k(ggml_tensor * cur, ggml_tensor * inp_pos,
     score = ggml_sum_rows(ctx0, score);                                              // [1, n_blk, T]
     score = ggml_reshape_2d(ctx0, score, n_blocks, T);
 
-    score = ggml_add(ctx0, score, qsa.bias);
+    score = ggml_add(ctx0, score, qsa.bias ? qsa.bias : qsa_bias_dev(n_blocks, r, T));
 
     // Select whole BLOCKS -- ceil(width / r) of them, 513 here -- and expand to
     // their cells. Every cell of a block inherits its block's score, so this is
@@ -306,6 +306,44 @@ ggml_tensor * graph_builder::qsa_top_k(ggml_tensor * cur, ggml_tensor * inp_pos,
     return ggml_cont(ctx0, ggml_reshape_2d(ctx0, cells, r * kb, T));                  // [r*kb, T]
 }
 
+// The causal mask is pure position geometry -- mask[j, i] = 0 for key j <= n_past_ + i
+// and -inf beyond -- with no dependence on token values or weights. Building it on the
+// host costs ~95 GB of F16 writes plus the same again over PCIe for an 89K prefill
+// (measured: 45-53 s, ~18% of prefill). Here it is built on the device instead:
+// columns [0, n_past_) are fully visible, and the [T, T] square at column n_past_
+// carries a strict-upper -inf triangle (tri UPPER keeps src where key index > query
+// index, verified against ggml's reference implementation).
+// tri and diag_mask_inf are F32-only on ggml-sycl -- and supports_op returns true for
+// F16 anyway, so an F16 triangle would build and then abort at execution -- so the
+// triangle is F32 and is cast on the way into the F16 mask. It spans only the square,
+// so the temporary is ~16 MB at T=2048 rather than n_kv*T.
+// The QSA block bias, built on the device (QWFN_QSA_PACK). bias[b, i] is 0 when block b
+// lies wholly at or before query q = n_past_ + i -- (b+1)*r <= q+1 -- and 1e9 otherwise,
+// which forces the tail block and any later whole blocks into the selection (the causal
+// mask then removes their future cells). This equals the host fill exactly: its -inf
+// branch covers b >= n_kv/r, and with n_blocks = ceil(n_kv/r) the only such b is the
+// dead block, which it then overwrites with 1e9 -- as here, since (n_bid+1)*r > n_kv.
+// Every intermediate is an integer below 2^24 plus a half, so F32 is exact.
+ggml_tensor * graph_builder::qsa_bias_dev(int64_t n_blocks, int64_t r, int64_t T) {
+    ggml_tensor * col = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);                     // b
+    col = ggml_scale_bias(ctx0, col, (float) r, (float) r - 1.5f);                             // (b+1)*r - 1.5
+    col = ggml_repeat_4d(ctx0, ggml_reshape_2d(ctx0, col, n_blocks, 1), n_blocks, T, 1, 1);
+    ggml_tensor * q = ggml_arange(ctx0, (float) n_past_, (float) (n_past_ + T), 1.0f);         // q
+    ggml_tensor * x = ggml_sub(ctx0, col, ggml_reshape_2d(ctx0, q, 1, T));                    // > 0 <=> (b+1)*r > q+1
+    return ggml_scale(ctx0, ggml_step(ctx0, x), 1e9f);
+}
+
+ggml_tensor * graph_builder::causal_mask_dev(int64_t n_kv, int64_t T) {
+    ggml_tensor * m = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, T), 0.0f);
+    ggml_build_forward_expand(gf_, m);
+    ggml_tensor * sq = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T), -INFINITY);
+    sq = ggml_tri(ctx0, sq, GGML_TRI_TYPE_UPPER);
+    ggml_tensor * dst = ggml_view_2d(ctx0, m, T, T, m->nb[1],
+                                     (size_t) n_past_ * ggml_type_size(GGML_TYPE_F16));
+    ggml_build_forward_expand(gf_, ggml_cpy(ctx0, sq, dst));
+    return m;
+}
+
 ggml_tensor * graph_builder::sparse_attn(ggml_tensor * cur, ggml_tensor * inp_pos,
                                          ggml_tensor * kq_mask, const int sections[4], int il,
                                          const qsa_inputs * qsa) {
@@ -314,6 +352,9 @@ ggml_tensor * graph_builder::sparse_attn(ggml_tensor * cur, ggml_tensor * inp_po
     const int64_t nh_kv = hp_->n_head_kv;       // 2
     const int64_t T     = cur->ne[1];
     const int64_t n_kv  = n_past_ + T;
+
+    // A null mask means the engine skipped the host build (QWFN_DEV_MASK): make it here.
+    if (!kq_mask) kq_mask = causal_mask_dev(n_kv, T);
 
     // The indexer reads the same block input as q/k/v; no ratio means dense.
     ggml_tensor * top_k = (qsa && qsa->ratio > 0)
@@ -484,7 +525,7 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
                         1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     ggml_tensor * pool_v = ggml_view_2d(ctx0, pc_w, idx_dim, NB, pc_w->nb[1], 0);      // after the write
     ggml_tensor * score = ggml_mul_mat(ctx0, pool_v,
-            ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h));              // [NB, 4]
+            ggml_reshape_2d(ctx0, ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q), idx_dim, n_idx_h));   // [NB, 4]
     score = ggml_relu(ctx0, score);
     score = ggml_cont(ctx0, ggml_transpose(ctx0, score));                             // [4, NB]
     score = ggml_sum_rows(ctx0, score);                                               // [1, NB]
@@ -529,9 +570,8 @@ ggml_tensor * graph_builder::sparse_attn_decode(ggml_tensor * cur, ggml_tensor *
 
     auto gather = [&](ggml_tensor * cache_w) {
         ggml_tensor * g = ggml_get_rows(ctx0, cache_w, cells);                        // F32 [kv_dim, NC]
-        g = ggml_cast(ctx0, g, GGML_TYPE_F16);
-        g = ggml_reshape_3d(ctx0, g, hd, nh_kv, NC);
-        return ggml_cont(ctx0, ggml_permute(ctx0, g, 0, 2, 1, 3));                    // [hd, NC, nh_kv]
+        g = ggml_permute(ctx0, ggml_reshape_3d(ctx0, g, hd, nh_kv, NC), 0, 2, 1, 3);  // [hd, NC, nh_kv]
+        return ggml_cast(ctx0, g, GGML_TYPE_F16);                                     // the cast lays it out contiguously
     };
     ggml_tensor * Kg = gather(kc_w);
     ggml_tensor * Vg = gather(vc_w);
@@ -650,7 +690,7 @@ ggml_tensor * graph_builder::ple(ggml_tensor * emb, ggml_tensor * hidden, int il
         conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
     }
     conv_out = ggml_silu(ctx0, conv_out);
-    conv_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_out), n_embd, hc, T);
+    conv_out = ggml_reshape_3d(ctx0, ggml_is_contiguous(conv_out) ? conv_out : ggml_cont(ctx0, conv_out), n_embd, hc, T);
 
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
 }

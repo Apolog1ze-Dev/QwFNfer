@@ -59,6 +59,8 @@ struct hparams {
     // The engine scales hc_*_inject.weight by 1/hc at load (exact: a power of two),
     // so hc_combine skips that scale. Tools that build graphs without the engine leave it false.
     bool hc_inject_prescaled = false;
+    // Likewise hc_*_down.weight (and output_hc_down) by 1/hc, so hc_mix skips the scale of its low-rank branch.
+    bool hc_down_prescaled = false;
     uint32_t hc_low_rank  = 320;
 
     // -- PLE (per-layer / n-gram embeddings) ------------------------------
