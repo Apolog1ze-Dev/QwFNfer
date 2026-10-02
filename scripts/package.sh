@@ -72,7 +72,8 @@ OUT=dist/$NAME
 echo "== engine (portable build against $GGML_LIBS)"
 cmake -S . -B build-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DQWFN_PORTABLE=ON \
       -DLLAMA_CPP_ROOT="$LLAMA_CPP_ROOT" -DLLAMA_CPP_BUILD="$GGML_LIBS" > build-portable.cmake.log 2>&1 || { tail -20 build-portable.cmake.log; exit 1; }
-cmake --build build-portable --target qwfn-server qwfn-tok | tail -2
+cmake --build build-portable --target qwfn-server qwfn-tok > build-portable.log 2>&1 || { grep -A 12 -E "FAILED|error:" build-portable.log | head -60; exit 1; }
+tail -1 build-portable.log
 
 have_runtime=yes
 for so in $RUNTIME_SOS; do [ -f "$RUNTIME_LIBS/$so" ] || have_runtime=no; done

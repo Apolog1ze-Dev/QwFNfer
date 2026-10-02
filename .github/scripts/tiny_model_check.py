@@ -4,7 +4,7 @@
      within 0.02, on a 300-token prompt where the sparse attention selects 68 of 300 cells;
   2. the engine itself (qwfn-gen --cpu: the expert cache, direct-I/O reads, the PLE gather, prefill
      and decode) continues that prompt greedily with exactly llama.cpp's 16 tokens, through the
-     token-by-token prompt path and the streamed one in several chunks, with the file's tensors
+     token-by-token prompt path, the streamed one in several chunks and (Linux) io_uring reads, with the file's tensors
      laid out for the engine's 512-byte bounce path and for its page layout.
 
 usage: tiny_model_check.py <build dir> [work dir]
@@ -62,9 +62,13 @@ for align in (32, 4096):
               "the graph's top-10 tokens are llama.cpp's, logits within 0.02 (max diff %.4f)%s" %
               (diff, "" if set(top) == set(want) else "; ours %s, llama.cpp %s" % (sorted(top), sorted(want))))
 
-    for label, extra in (("token-by-token prompt", []),
-                         ("streamed prompt, 3 chunks of 128", ["--prefill-decode-max", "1", "--batch", "128"])):
+    paths = [("token-by-token prompt", []),
+             ("streamed prompt, 3 chunks of 128", ["--prefill-decode-max", "1", "--batch", "128"])]
+    if os.name != "nt": paths.append(("io_uring reads", ["--io-uring"]))   # the thread pool is the default
+    for label, extra in paths:
         g = run([exe("qwfn-gen"), model, "--prompt", prompt, "--gen", "16", "--cpu", "--ram", "2", "--ctx", "1024"] + extra)
+        if "io_uring_queue_init failed" in g.stdout + g.stderr:   # a container's seccomp, an old kernel
+            print("skip  engine, %s: io_uring is not available here" % label, flush=True); continue
         got = generated(g.stdout)
         check(g.returncode == 0 and got == ref_gen, "engine, %s: %s" % (label, got))
 
