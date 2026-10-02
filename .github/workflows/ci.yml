@@ -139,6 +139,8 @@ jobs:
           if ($LASTEXITCODE -or $out -notmatch 'less than 1 GB') { $out; "qwfn-iobench with a refused RAM tier exited with $LASTEXITCODE"; exit 1 }
           $out = (cmd /c "build\qwfn-server.exe 2>&1") -join "`n"
           if ($out -notmatch 'usage: qwfn-server') { $out; throw 'qwfn-server does not start (missing DLL?)' }
+          # the usage exits 1, and the runner's wrapper ends the step with `exit $LASTEXITCODE`
+          exit 0
       - name: Tiny model, the engine against llama.cpp
         # no ~/.unsloth tree here: the tools take the ggml backends staged next to them
         run: |
