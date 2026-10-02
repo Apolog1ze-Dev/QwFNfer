@@ -21,8 +21,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <filesystem>
 #else
@@ -64,7 +68,11 @@ static void pick_experts(const zipf & z, std::mt19937_64 & g, uint32_t n_expert,
 
 // ---------------------------------------------------------------- raw ceiling
 static void bench_ceiling(model_index & mi, unsigned qd, int n_tokens_equiv) {
+#ifdef _WIN32
+    printf("\n== raw expert-slice fetch, unbuffered overlapped reads (no cache, every access a miss) ==\n");
+#else
     printf("\n== raw expert-slice fetch over io_uring (no cache, every access a miss) ==\n");
+#endif
     std::string err;
     io_engine io;
     if (!io.init(mi.shard_paths(), qd, true, err)) { printf("  init failed: %s\n", err.c_str()); return; }

@@ -47,12 +47,14 @@
 // message -- CaptureStackBackTrace from a signal handler is not safe to run
 // cross-thread, and the watchdog's purpose ("where is it stuck") is already
 // answered by the expert-cache wait state it logs right before.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
-#define pthread_t DWORD
-#define pthread_self() GetCurrentThreadId()
-#define pthread_kill(t, sig) (0)
+#include <io.h>
 #else
 #include <execinfo.h>
 #include <pthread.h>
@@ -567,16 +569,23 @@ struct tool_streamer {
 // Backtraces without a debugger (ptrace is restricted on this machine): a
 // fatal signal prints the dying thread's stack; SIGUSR2, sent by the stall
 // watchdog to the generating thread, prints where it is stuck.
+#ifdef _WIN32
+using thread_id = DWORD;
+static thread_id current_thread() { return GetCurrentThreadId(); }
+#else
+using thread_id = pthread_t;
+static thread_id current_thread() { return pthread_self(); }
+#endif
 static void print_backtrace(const char * why) {
 #ifdef _WIN32
     char head[160];
-    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: stuck in thread %lu ===\n", why, (unsigned long) pthread_self());
-    (void) !write(2, head, (unsigned) hl);
+    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s in thread %lu (no stack on this platform) ===\n", why, (unsigned long) current_thread());
+    (void) !_write(2, head, (unsigned) hl);
 #else
     void * frames[64];
     const int n = backtrace(frames, 64);
     char head[160];
-    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: backtrace of thread %lu (%d frames) ===\n", why, (unsigned long) pthread_self(), n);
+    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: backtrace of thread %lu (%d frames) ===\n", why, (unsigned long) current_thread(), n);
     (void) !write(2, head, hl);
     backtrace_symbols_fd(frames, n, 2);
 #endif
@@ -590,7 +599,7 @@ static void on_fatal(int sig) {
     signal(sig, SIG_DFL); raise(sig);
 }
 static void on_stall_probe(int) { print_backtrace("STALL probe (SIGUSR2)"); }
-static pthread_t g_gen_thread;
+static thread_id g_gen_thread;
 static std::atomic<bool> g_gen_thread_set{false};
 
 struct live_stats {
@@ -1281,7 +1290,7 @@ int main(int argc, char ** argv) {
         // Whatever way this returns (an eval error, a client that went away), the
         // counters must not say "busy" forever.
         struct busy_guard { live_stats & L; ~busy_guard() { std::lock_guard<std::mutex> lk(L.mu); L.busy = false; L.prefilling = false; } } guard{S.live};
-        g_gen_thread = pthread_self(); g_gen_thread_set = true;
+        g_gen_thread = current_thread(); g_gen_thread_set = true;
         smp.gen.clear();
 
         const auto tp = clk::now();

@@ -34,69 +34,73 @@ set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build/bin"   CACHE PATH "llama.cpp built 
 # refuses to start them on any CPU without AVX-512. It bought little in return -- libllama
 # and the ggml libraries link libstdc++ dynamically, so the bundle needs the user's copy
 # either way -- and the C++ runtime is one thing every distribution has.
-# Windows carries no portable bundle yet: the flag set is Linux-only and stays gated.
+#
+# Windows builds with MSVC or clang-cl (MSVC is true for both) or with MinGW-w64; the flags
+# follow the compiler, the platform pieces (no liburing, DLLs and import libraries) follow
+# WIN32. There, portable or not, the target is AVX2 (/arch:AVX2, -march=x86-64-v3): MSVC has
+# no -march=native, and it is the baseline the Linux bundle already requires.
 option(QWFN_PORTABLE "Relocatable release build" OFF)
-if(QWFN_PORTABLE AND NOT WIN32)
+if(MSVC)
+  set(QWFN_ARCH_FLAGS /arch:AVX2)
+  # The POSIX getenv/fopen/strerror calls this code keeps portable trip the CRT's
+  # deprecation warnings; /wd4100 is -Wno-unused-parameter.
+  add_compile_options(/wd4996 /wd4100)
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
+elseif(WIN32)
+  set(QWFN_ARCH_FLAGS -march=x86-64-v3 -mtune=generic)
+elseif(QWFN_PORTABLE)
   set(QWFN_ARCH_FLAGS -march=x86-64-v3 -mtune=generic)
   add_compile_options(-include "${CMAKE_SOURCE_DIR}/cmake/glibc_compat.h" -fno-math-errno)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
   set(CMAKE_INSTALL_RPATH "$ORIGIN")
-elseif(NOT WIN32)
-  set(QWFN_ARCH_FLAGS -march=native)
 else()
-  # clang-cl / MSVC: the toolchain's own optimization flags; no -march (the
-  # user's /clang:-march flags arrive through CMAKE_CXX_FLAGS when wanted).
-  set(QWFN_ARCH_FLAGS "")
-  # getenv/fopen POSIX usage (and the CRT's other "secure" variants of calls
-  # this project deliberately keeps portable) trip MSVC's deprecation wall.
-  add_compile_options(/W4 /wd4996)
+  set(QWFN_ARCH_FLAGS -march=native)
 endif()
 
 if(NOT EXISTS "${LLAMA_CPP_ROOT}/ggml/include/ggml.h")
   message(FATAL_ERROR "ggml headers not found under ${LLAMA_CPP_ROOT}. Pass -DLLAMA_CPP_ROOT=<path>.")
 endif()
 
-# The imported ggml/llama libraries carry the platform's own suffix and name.
-# Windows: the DLLs land in bin/, the import libraries (.lib) one directory up;
-# link through the .lib, find the DLL at runtime (same dir as our binaries).
-if(WIN32)
-  set(GGML_BASE_LIB "${LLAMA_CPP_BUILD}/ggml-base.dll")
-  set(GGML_BASE_IMPLIB "${LLAMA_CPP_BUILD}/../ggml/src/ggml-base.lib")
-  set(GGML_ALL_LIB  "${LLAMA_CPP_BUILD}/ggml.dll")
-  set(GGML_ALL_IMPLIB  "${LLAMA_CPP_BUILD}/../ggml/src/ggml.lib")
-  set(LLAMA_LIB     "${LLAMA_CPP_BUILD}/llama.dll")
-  set(LLAMA_IMPLIB     "${LLAMA_CPP_BUILD}/../src/llama.lib")
-else()
-  set(GGML_BASE_LIB "${LLAMA_CPP_BUILD}/libggml-base.so.0")
-  set(GGML_ALL_LIB  "${LLAMA_CPP_BUILD}/libggml.so.0")
-  set(LLAMA_LIB     "${LLAMA_CPP_BUILD}/libllama.so.0")
-endif()
-if(NOT EXISTS "${GGML_BASE_LIB}" AND NOT EXISTS "${GGML_BASE_IMPLIB}")
-  message(FATAL_ERROR "built ggml not found under ${LLAMA_CPP_BUILD} (${GGML_BASE_LIB}). Build llama.cpp first or pass -DLLAMA_CPP_BUILD=<dir>.")
-endif()
+# The ggml/llama shared libraries, under the platform's names. On Windows the DLLs are in
+# LLAMA_CPP_BUILD and are linked through import libraries that llama.cpp's build writes
+# elsewhere: <build>/ggml/src and <build>/src (Release/ under them with a multi-config
+# generator, whose DLLs are then in bin/Release), lib/ in an installed tree; name.lib from
+# MSVC and clang-cl, libname.dll.a from MinGW.
+function(qwfn_import_lib target name subdir)
+  add_library(${target} SHARED IMPORTED)
+  if(WIN32)
+    set(implib "")
+    foreach(d "${LLAMA_CPP_BUILD}/../${subdir}" "${LLAMA_CPP_BUILD}/../../${subdir}/Release"
+              "${LLAMA_CPP_BUILD}/../../${subdir}/RelWithDebInfo" "${LLAMA_CPP_BUILD}/../lib" "${LLAMA_CPP_BUILD}")
+      foreach(f "${name}.lib" "lib${name}.dll.a")
+        if(NOT implib AND EXISTS "${d}/${f}")
+          get_filename_component(implib "${d}/${f}" ABSOLUTE)
+        endif()
+      endforeach()
+    endforeach()
+    set(dll "${LLAMA_CPP_BUILD}/${name}.dll")
+    if(NOT EXISTS "${dll}")
+      set(dll "${LLAMA_CPP_BUILD}/lib${name}.dll")   # MinGW names libllama this way
+    endif()
+    if(NOT implib OR NOT EXISTS "${dll}")
+      message(FATAL_ERROR "${name}.dll or its import library not found from ${LLAMA_CPP_BUILD}. "
+                          "Build llama.cpp with -DBUILD_SHARED_LIBS=ON first, and pass -DLLAMA_CPP_BUILD=<the directory holding ${name}.dll>.")
+    endif()
+    set_target_properties(${target} PROPERTIES IMPORTED_IMPLIB "${implib}" IMPORTED_LOCATION "${dll}")
+  else()
+    if(NOT EXISTS "${LLAMA_CPP_BUILD}/lib${name}.so.0")
+      message(FATAL_ERROR "lib${name}.so.0 not found in ${LLAMA_CPP_BUILD}. Build llama.cpp first or pass -DLLAMA_CPP_BUILD=<dir>.")
+    endif()
+    set_target_properties(${target} PROPERTIES IMPORTED_LOCATION "${LLAMA_CPP_BUILD}/lib${name}.so.0")
+  endif()
+endfunction()
 
-add_library(ggml_base SHARED IMPORTED)
-if(WIN32)
-  set_target_properties(ggml_base PROPERTIES IMPORTED_IMPLIB "${GGML_BASE_IMPLIB}" IMPORTED_LOCATION "${GGML_BASE_LIB}")
-else()
-  set_target_properties(ggml_base PROPERTIES IMPORTED_LOCATION "${GGML_BASE_LIB}")
-endif()
-add_library(ggml_all SHARED IMPORTED)
-if(WIN32)
-  set_target_properties(ggml_all PROPERTIES IMPORTED_IMPLIB "${GGML_ALL_IMPLIB}" IMPORTED_LOCATION "${GGML_ALL_LIB}")
-else()
-  set_target_properties(ggml_all PROPERTIES IMPORTED_LOCATION "${GGML_ALL_LIB}")
-endif()
-
+qwfn_import_lib(ggml_base ggml-base ggml/src)
+qwfn_import_lib(ggml_all  ggml      ggml/src)
 # Two things need libllama: qwfn-refdump drives llama.cpp's own graph to produce
 # the reference intermediates our graph is bisected against, and qwfn-chat
 # borrows its tokenizer (opened vocab_only, so no weights are loaded).
-add_library(llama_ref SHARED IMPORTED)
-if(WIN32)
-  set_target_properties(llama_ref PROPERTIES IMPORTED_IMPLIB "${LLAMA_IMPLIB}" IMPORTED_LOCATION "${LLAMA_LIB}")
-else()
-  set_target_properties(llama_ref PROPERTIES IMPORTED_LOCATION "${LLAMA_LIB}")
-endif()
+qwfn_import_lib(llama_ref llama     src)
 
 find_package(Threads REQUIRED)
 
@@ -130,21 +134,21 @@ target_include_directories(qwfn_core PUBLIC
   "${LLAMA_CPP_ROOT}/ggml/include"
   "${LLAMA_CPP_ROOT}/ggml/src"       # ggml-impl.h: the graph struct, for the per-node profiler only
 )
+target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads)
 if(NOT WIN32)
   target_include_directories(qwfn_core PUBLIC "${URING_INCLUDE_DIR}")
-  target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}")
-  target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
+  target_link_libraries(qwfn_core PUBLIC "${URING_LIBRARY}")
+endif()
+if(MSVC)
+  target_compile_options(qwfn_core PRIVATE /O2 ${QWFN_ARCH_FLAGS} /W4 /permissive-)
 else()
-  target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads)
-  target_compile_options(qwfn_core PRIVATE /O2 /W4 /permissive- /wd4100)   # /wd4100 = unused parameter, matches -Wno-unused-parameter
+  target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# Per-tool optimization flags: GNU flags on Linux, MSVC/clang-cl flags on
-# Windows. clang-cl accepts -O2/-O3 directly; /W4 replaces -Wall -Wextra for
-# the tools (qwfn_core carries the full warning set above).
+# Per-tool optimization flags, in the compiler's own syntax.
 function(qwfn_opts target)
-  if(WIN32)
-    target_compile_options(${target} PRIVATE /O2 /W4 /permissive-)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /O2 ${QWFN_ARCH_FLAGS} /permissive-)
   else()
     target_compile_options(${target} PRIVATE -O3 ${QWFN_ARCH_FLAGS})
   endif()
@@ -154,9 +158,12 @@ add_executable(qwfn-iobench tools/qwfn_iobench.cpp)
 target_link_libraries(qwfn-iobench PRIVATE qwfn_core)
 qwfn_opts(qwfn-iobench)
 
-# Public-seam tests for the io layer (runs identically on Linux and Windows).
+# Public-seam tests for the io layer (runs identically on Linux and Windows): ctest, or
+# build/qwfn-io-test directly.
+enable_testing()
 add_executable(qwfn-io-test tools/qwfn_io_test.cpp)
 target_link_libraries(qwfn-io-test PRIVATE qwfn_core)
+qwfn_opts(qwfn-io-test)
 add_test(NAME io COMMAND qwfn-io-test)
 
 add_executable(qwfn-inspect tools/qwfn_inspect.cpp)
@@ -194,6 +201,9 @@ target_include_directories(qwfn-server PRIVATE
   "${LLAMA_CPP_ROOT}/vendor"
   "${LLAMA_CPP_ROOT}/vendor/cpp-httplib")
 target_link_libraries(qwfn-server PRIVATE qwfn_core llama_ref)
+if(WIN32)
+  target_link_libraries(qwfn-server PRIVATE ws2_32)   # httplib's sockets; MSVC links it by pragma, MinGW does not
+endif()
 qwfn_opts(qwfn-server)
 
 add_executable(qwfn-chat tools/qwfn_chat.cpp src/qwfn_vocab.cpp)
@@ -216,42 +226,32 @@ qwfn_opts(qwfn-train-predictor)
 target_compile_definitions(qwfn-train-predictor PRIVATE LLAMA_CPP_BUILD_DIR="${LLAMA_CPP_BUILD}")
 
 # --- Windows: stage the shared libraries next to the executables --------------------
-# The same contract as scripts/package.sh on Linux (its bundle copies every .so
-# into bin/): the loader, the engine's backend directory and the console's PATH
-# injection all find the libraries in one place without PATH setup. In a source
-# checkout that keeps a plain `cmake --build build-win` runnable everywhere.
+# The same contract as scripts/package.sh on Linux (its bundle copies every .so into
+# bin/): the loader, ggml's backend search (the executable's directory) and the console
+# all find the libraries in one place, so a plain build runs with no PATH setup. Every
+# ggml/llama DLL of the llama.cpp build -- the CPU backend may be several, one per ISA
+# level -- and, when the CUDA backend is there, the CUDA runtime DLLs NVIDIA lets
+# applications redistribute (cudart, cublas, cublasLt), from CUDA_PATH's bin/ or bin/x64/
+# (where CUDA 13 keeps them).
 if(WIN32)
-  set(QWFN_STAGE_LIBS "")
-  foreach(dll ggml-base ggml ggml-cpu ggml-cuda llama)
-    if(EXISTS "${LLAMA_CPP_BUILD}/${dll}.dll")
-      list(APPEND QWFN_STAGE_LIBS "${LLAMA_CPP_BUILD}/${dll}.dll")
+  file(GLOB QWFN_STAGE_LIBS "${LLAMA_CPP_BUILD}/ggml*.dll" "${LLAMA_CPP_BUILD}/llama*.dll" "${LLAMA_CPP_BUILD}/libllama*.dll")
+  if(EXISTS "${LLAMA_CPP_BUILD}/ggml-cuda.dll")
+    set(_cuda_root "${CUDAToolkit_ROOT}")
+    if(NOT _cuda_root AND DEFINED ENV{CUDA_PATH})
+      file(TO_CMAKE_PATH "$ENV{CUDA_PATH}" _cuda_root)
     endif()
-  endforeach()
-  # ggml-cuda's cuBLAS imports (cudart is linked statically into it). CUDA
-  # 13.4 keeps the x64 runtimes in bin/x64; older toolkits put them in bin/.
-  set(_cuda_root "${CUDA_TOOLKIT_ROOT}")
-  if(NOT _cuda_root AND DEFINED ENV{CUDA_PATH})
-    set(_cuda_root "$ENV{CUDA_PATH}")
+    if(_cuda_root)
+      file(GLOB _cuda_dlls "${_cuda_root}/bin/x64/cudart64_*.dll" "${_cuda_root}/bin/x64/cublas64_*.dll" "${_cuda_root}/bin/x64/cublasLt64_*.dll"
+                           "${_cuda_root}/bin/cudart64_*.dll" "${_cuda_root}/bin/cublas64_*.dll" "${_cuda_root}/bin/cublasLt64_*.dll")
+      list(APPEND QWFN_STAGE_LIBS ${_cuda_dlls})
+    else()
+      message(WARNING "ggml-cuda.dll found but not the CUDA toolkit (set CUDA_PATH): the CUDA runtime DLLs are not staged")
+    endif()
   endif()
-  if(NOT _cuda_root)
-    set(_cuda_root "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.4")
-  endif()
-  foreach(cub cublas64_13 cublasLt64_13)
-    foreach(sub x64 .)
-      if(EXISTS "${_cuda_root}/bin/${sub}/${cub}.dll")
-        list(APPEND QWFN_STAGE_LIBS "${_cuda_root}/bin/${sub}/${cub}.dll")
-        break()
-      endif()
-    endforeach()
-  endforeach()
   if(QWFN_STAGE_LIBS)
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/stage-dlls")
-    foreach(lib ${QWFN_STAGE_LIBS})
-      file(COPY "${lib}" DESTINATION "${CMAKE_BINARY_DIR}/stage-dlls")
-    endforeach()
-    add_custom_target(qwfn-stage-dlls ALL DEPENDS ${QWFN_STAGE_LIBS}
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${QWFN_STAGE_LIBS} $<TARGET_FILE_DIR:qwfn-server>
-      COMMENT "staging ggml/llama/CUDA DLLs next to the executables")
+    add_custom_target(qwfn-stage-dlls ALL
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${QWFN_STAGE_LIBS} "$<TARGET_FILE_DIR:qwfn-server>"
+      COMMENT "staging the ggml/llama/CUDA DLLs next to the executables")
     add_dependencies(qwfn-server qwfn-stage-dlls)
   endif()
 endif()
