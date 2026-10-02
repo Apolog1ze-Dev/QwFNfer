@@ -77,7 +77,7 @@ The harness reads the numbers from the server's own `/stats` around the run. Wha
 
 ## Getting Started
 
-Linux x86_64 with an NVIDIA GPU (driver 580 or newer) and Python 3. Windows is not supported yet: the engine reads the NVMe through io_uring, and that layer needs a port first.
+Linux x86_64 or Windows 10/11 x64, with an NVIDIA GPU (driver 580 or newer) and Python 3.
 
 **1. Install.** One command:
 
@@ -86,6 +86,8 @@ curl -fsSL https://raw.githubusercontent.com/Apolog1ze-Dev/QwFN/master/scripts/i
 ```
 
 Or download `qwfnfer-linux-x86_64-cuda.zip` from the [Releases](https://github.com/Apolog1ze-Dev/QwFN/releases) page, unzip it anywhere and run `./qwfnfer`. The bundle carries the engine, the console and every library it needs (ggml, the CUDA runtime, the C++ and OpenMP runtimes, liburing); only the NVIDIA driver comes from your system. The installer puts it under `~/.local/share/qwfnfer` and links `~/.local/bin/qwfnfer`; delete those two paths to uninstall.
+
+On Windows the bundle is `qwfnfer-windows-x86_64-cuda.zip`: unzip it anywhere and run `qwfnfer.cmd`. It carries the same pieces, with the Visual C++ runtime in place of the Linux ones; Python 3 comes from [python.org](https://www.python.org/downloads/). Two settings matter for its speed on Windows; see **Windows?** in the FAQ.
 
 **2. Get the model.** The console finds Qwen3.8-Flash-Next GGUFs in your Hugging Face cache (wherever `HF_HUB_CACHE`, `HF_HOME` or `XDG_CACHE_HOME` put it), or in any folder you add under *Model locations*. UD-Q4_K_XL is the quality choice, UD-Q3_K_XL the faster one; the `mmproj` file adds vision.
 
@@ -108,6 +110,7 @@ It opens http://127.0.0.1:8090. Pick a downloaded quant and a tier: **Chat** (32
 **4. Point your tools at it.** The console shows the endpoint, `http://127.0.0.1:8080/v1` by default; any OpenAI-compatible client works with any API key (Unsloth Studio as a custom provider, Open WebUI, your own scripts). What the server accepts:
 
 - Chat completions with streaming; the model id is `qwen3.8-flash-next`. Images go in as OpenAI content parts (base64 `data:` URLs) when vision is on, up to 4,096 image tokens each; the projector runs on the CPU so it takes no VRAM; a 1400×1000 screenshot is 1,364 tokens and encodes in about 15 s on 8 cores, a 1280×720 one in 7-8 s.
+- Files go in as OpenAI `file` parts (base64 `file_data`) or Anthropic `document` blocks: a text file reads as text and a `.zip` as the text files inside it, each under its path, up to 16 MB of text an attachment; anything else, a PDF say, is named to the model as not read rather than dropped. Whether a client lets you attach a zip at all is up to the client.
 - Thinking is `xhigh` by default; change it per request with `reasoning_effort` (`xhigh` | `medium` | `low` | `off`) or `reasoning_budget`, or with `/think` and `/no_think` in a message. Reasoning comes back separately in `reasoning_content`.
 - Sampling presets follow the model card (thinking and non-thinking) unless you pass `temperature`, `top_p`, `top_k`, `min_p` or the penalties; tool calling follows the OpenAI `tools` / `tool_choice` shape, and a call streams as `tool_calls` deltas while the model is still writing it, so a harness sees the code arrive instead of a minutes-long silence (Unsloth Studio drops a stream after 300 s without bytes; the server also sends an SSE keepalive whenever nothing else has gone out for 15 s).
 - Every response carries llama.cpp-style `timings`; `/stats` is what the console's live panel reads.
@@ -129,9 +132,11 @@ Thinking comes back as `thinking` blocks and tool calls as `tool_use` blocks, st
 
 ```bash
 git init ~/.unsloth/llama.cpp && git -C ~/.unsloth/llama.cpp fetch --depth 1 https://github.com/unslothai/llama.cpp ca1426903fabe9af26cd10c42034cb4bbd2e0e11 && git -C ~/.unsloth/llama.cpp checkout FETCH_HEAD
-cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DLLAMA_BUILD_APP=OFF
 cmake --build ~/.unsloth/llama.cpp/build -j
 ```
+
+`-DLLAMA_BUILD_APP=OFF` leaves out llama.cpp's unified `llama` binary, which the engine does not use and whose target in this tree compiles before the `build-info.h` and include paths it needs exist, so a parallel build fails on it now and then.
 
 Then the engine (`-DLLAMA_CPP_ROOT=<path>` if that tree is somewhere else; at run time the server looks for the ggml backends in `~/.unsloth/llama.cpp/build/bin`, or next to its own binary):
 
@@ -139,7 +144,23 @@ Then the engine (`-DLLAMA_CPP_ROOT=<path>` if that tree is somewhere else; at ru
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && scripts/console.sh
 ```
 
+On Windows, the same two steps in a *x64 Native Tools Command Prompt for VS 2022* (MSVC or clang-cl, CMake, Ninja, the CUDA toolkit; no liburing). llama.cpp has to be a shared build, and `LLAMA_CPP_BUILD` is the directory with its DLLs:
+
+```bat
+git init %USERPROFILE%\.unsloth\llama.cpp && git -C %USERPROFILE%\.unsloth\llama.cpp fetch --depth 1 https://github.com/unslothai/llama.cpp ca1426903fabe9af26cd10c42034cb4bbd2e0e11 && git -C %USERPROFILE%\.unsloth\llama.cpp checkout FETCH_HEAD
+cmake -S %USERPROFILE%\.unsloth\llama.cpp -B %USERPROFILE%\.unsloth\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON -DLLAMA_BUILD_APP=OFF
+cmake --build %USERPROFILE%\.unsloth\llama.cpp\build
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_ROOT=%USERPROFILE%\.unsloth\llama.cpp -DLLAMA_CPP_BUILD=%USERPROFILE%\.unsloth\llama.cpp\build\bin
+cmake --build build && build\qwfn-io-test.exe && python tools\qwfn_console.py
+```
+
+The build copies the ggml/llama DLLs and the CUDA runtime DLLs next to the executables, so nothing needs to be on `PATH`. `qwfn-io-test` checks the read engine (direct, bounce-buffered and buffered reads, both backends, failure paths) on either platform; `ctest --test-dir build` runs it too.
+
 `scripts/package.sh` builds the relocatable bundle the installer downloads (`-DQWFN_PORTABLE=ON`: baseline x86-64-v3 code, libraries next to the binaries, and the glibc floor of the machine it is built on — which is the floor the bundle then needs, so build it on the oldest distribution you mean to support). It writes `dist/qwfnfer-linux-x86_64-cuda.zip`, and that zip is what a release carries; its header has the one-time ggml build the bundle links against. The C++ and OpenMP runtimes and liburing are fetched from Ubuntu's archive on the first run, each `.deb` checked against the SHA256 in the archive's own index, and cached in `~/.cache/qwfnfer-build/runtime` (`RUNTIME_LIBS` to point somewhere else, `RUNTIME_SUITE` and `RUNTIME_MIRROR` to take them from elsewhere), rather than copied off the build machine. A copied library is built for the build machine's CPU, and a distribution that compiles its packages for AVX-512 puts AVX-512 into all of them — into libgomp and liburing as instructions that fault where they are not supported, and into `libstdc++.a` and `libgcc.a`, which the portable build used to link statically, as an ISA property the linker ORs into every binary, marking it `x86-64-v4 needed` however the engine itself was compiled and leaving glibc's loader to refuse it on every CPU without AVX-512. Ubuntu's amd64 packages are plain x86-64; `package.sh` fails the build if a v4 binary reaches the bundle anyway, and checks that the bundled libstdc++ covers what the engine and the ggml libraries import.
+
+`scripts\package.ps1` is the Windows counterpart, run from the same developer prompt: it builds the engine against a portable ggml build (the one-time command is in its header), runs `qwfn-io-test`, bundles the ggml DLLs, the CUDA runtime DLLs and the Visual C++ runtime (app-local, so users need no Redistributable), refuses to package if any DLL a bundled binary imports is neither in the bundle, part of Windows, nor the NVIDIA driver's, and writes `dist\qwfnfer-windows-x86_64-cuda.zip` with a `qwfnfer.cmd` launcher.
+
+Releases are built by `.github/workflows/release.yml`: pushing a tag `v*` builds both bundles (Linux in an Ubuntu 22.04 container, so the glibc floor is 2.35; Windows with MSVC and CUDA 13.4) and attaches them to the tag's release with their SHA256SUMS, after unpacking each zip on a machine with no GPU and checking its engine against llama.cpp there (`.github/scripts/bundle_check.py`); a tag with a `-` makes it a prerelease, and `.github/release-notes/<tag>.md`, if present, heads the release notes. Run by hand, or on a pull request that touches packaging, it builds the zips as workflow artifacts and publishes nothing. The portable ggml build each bundle links is cached per llama.cpp commit and CUDA version, so only the first run after one of those changes compiles CUDA. `.github/workflows/ci.yml` builds and tests every push and pull request on Linux and on Windows with MSVC: `qwfn-io-test` on each platform's own filesystem, the tools on a synthetic GGUF, and the console's API.
 
 
 ## How it works
@@ -180,7 +201,14 @@ Qwen3.8-Flash-Next ships the Qwen4-generation design, `qwen4exp` in the GGUF, an
 
 **Q4 or Q3?** Q4 for quality, Q3 for speed: 13.2–15.7 against 19.8–21.2 tok/s in chat, 12.9 against 17.7 on a 155K-token document, same machine and same plan. Q3's expert blocks are 2.27 MB against Q4's 3.13, so more of them fit in the same tiers and every miss reads less; that is most of the difference.
 
-**Windows?** In the works, not there yet. Today it is Linux x86_64 with an NVIDIA GPU, driver 580 or newer: the NVMe path is io_uring, so that layer is what has to be ported first — nothing above it is Linux-specific.
+**Windows?** Yes, natively (not through WSL2, which reads a Windows drive through a virtual filesystem). Only the read engine differs: the worker-pool backend that Linux also runs by default, over unbuffered overlapped reads (`FILE_FLAG_NO_BUFFERING`, the Windows `O_DIRECT`) at the same slice sizes, alignment and bounce-buffer layout. The engine, the graphs and the tiers are the same code. Two settings matter for its speed:
+
+- *CUDA - Sysmem Fallback Policy*, in the NVIDIA Control Panel (Manage 3D settings, Program settings, add `qwfn-server.exe`): set it to **Prefer No Sysmem Fallback**. The driver's default lets an allocation past the free VRAM succeed in shared system memory, where everything the GPU reads crosses PCIe. The engine already sizes its VRAM expert tier from the free memory the driver reports, so the tier stays out of system memory either way, but the KV cache and the graphs' buffers are only protected by this setting. Without it, a plan that asks for more VRAM than there is runs slowly instead of failing.
+- *Hardware-accelerated GPU scheduling* (Settings, System, Display, Graphics): on. A decoded token is a few hundred graph launches and synchronisations, and Windows' default scheduling adds latency to each.
+
+The drive matters as on Linux, and one thing is Windows' own: a BitLocker-encrypted volume (the default on many Windows 11 machines) is usually decrypted by the CPU, which can hold an NVMe well under the rate the expert reads want. The console's drive probe reads through the same path as the engine, so its number is what the plan gets; the model files are public, so keeping them on an unencrypted volume costs nothing.
+
+To compare the two on one machine, run a source build's `qwfn-gen` with the same file and flags on both systems, e.g. `QWFN_IO_PROFILE=1 build/qwfn-gen <shard.gguf> --gen 128 --ctx 8192 --vram 9 --ram 16` (`set QWFN_IO_PROFILE=1` first on Windows). The last lines split each token into GPU graph time, GPU and CPU experts and read waits, and give the VRAM share of the experts, which shows where a difference comes from.
 
 **AMD or Intel GPU? Two GPUs?** One NVIDIA GPU: the dense core, the replayed graphs and the VRAM expert tier run on ggml's CUDA backend, and the engine builds for a single device. `--cpu` runs everything on the CPU path — the one the forward pass is validated bit-exact against — but that path exists for validation, not for use.
 

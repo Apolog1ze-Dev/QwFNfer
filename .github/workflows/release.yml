@@ -1,0 +1,222 @@
+# The release bundles, built here: dist/qwfnfer-linux-x86_64-cuda.zip (scripts/package.sh) and
+# dist\qwfnfer-windows-x86_64-cuda.zip (scripts/package.ps1), both x86_64 with NVIDIA CUDA.
+#
+#   push a tag v*                      -> both zips are built and attached to the tag's release,
+#                                         which is created if it does not exist (a prerelease when
+#                                         the tag has a '-', e.g. v0.3.0-rc1); scripts/install.sh
+#                                         downloads the Linux one from releases/latest
+#   Run workflow (manual)              -> both zips as workflow artifacts, nothing published
+#   a pull request touching packaging  -> the same, so a packaging change is built before it lands
+#
+# Each bundle links a one-time portable ggml/llama.cpp build (every CPU variant, CUDA
+# architectures 75-120): the scripts' headers carry its command. It is cached per llama.cpp
+# commit, CUDA version and flags, so only the first run after one of those changes compiles it
+# (an hour or more per platform); bump the -vN suffix of a cache key to force a rebuild.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/package.sh
+      - scripts/package.ps1
+      - CMakeLists.txt
+      - cmake/**
+      - .github/workflows/release.yml
+      - .github/actions/**
+      - .github/scripts/bundle_check.py
+      - .github/scripts/tiny_model_check.py
+      - tools/make_tiny_model.py
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # a newer push waits: cancelling would throw away an hour of CUDA compilation
+env:
+  LLAMA_SHA: ca1426903fabe9af26cd10c42034cb4bbd2e0e11   # Unsloth's llama.cpp, mtp/qwen4exp-nextn (README, "Building from source")
+  CUDA_ARCHS: "75;80;86;89;90;120"                      # Turing to Blackwell; in the cache keys as sm75-120
+  GGML_FLAGS: >-
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
+    -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON
+    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
+
+jobs:
+  linux:
+    name: linux-x86_64-cuda
+    runs-on: ubuntu-24.04
+    # Ubuntu 22.04's glibc (2.35) becomes the floor the bundle needs (install.sh refuses it on an
+    # older one); the container keeps it whatever image the runner itself has.
+    container: ubuntu:22.04
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates curl wget gnupg xz-utils zstd binutils file python3 python3-pip \
+            zip unzip gcc-12 g++-12 liburing-dev
+          python3 -m pip install --no-cache-dir cmake ninja
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: CUDA 13.3 (compiler, runtime, cuBLAS)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          dpkg -i cuda-keyring_1.1-1_all.deb
+          apt-get update
+          apt-get install -y --no-install-recommends cuda-nvcc-13-3 cuda-cudart-dev-13-3 libcublas-dev-13-3 cuda-cccl-13-3 cuda-driver-dev-13-3 \
+            || apt-get install -y --no-install-recommends cuda-toolkit-13-3
+          C=/usr/local/cuda-13.3
+          test -x "$C/bin/nvcc"
+          echo "$C/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=$C" >> "$GITHUB_ENV"
+          # package.sh checks the bundle with ldd. This runner has no NVIDIA driver, so the
+          # driver's libcuda.so.1 resolves to the toolkit's link stub (never loaded, only found).
+          ln -sf "$C/targets/x86_64-linux/lib/stubs/libcuda.so" /usr/lib/x86_64-linux-gnu/libcuda.so.1
+          ldconfig
+      - name: llama.cpp source
+        run: |
+          git init -q "$HOME/llama.cpp"
+          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/unslothai/llama.cpp "$LLAMA_SHA"
+          git -C "$HOME/llama.cpp" checkout -q FETCH_HEAD
+      # restore and save are separate steps so the build is kept the moment it exists, even when a
+      # later step fails (the combined action saves only at the end of a successful job)
+      - name: Cached portable ggml build
+        id: ggml-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/ggml-build/bin
+          key: release-linux-ggml-${{ env.LLAMA_SHA }}-cuda13.3-sm75-120-${{ hashFiles('cmake/glibc_compat.h') }}-v1
+      - name: Portable ggml build (scripts/package.sh's header)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          H="$GITHUB_WORKSPACE/cmake/glibc_compat.h"
+          export CC=gcc-12 CXX=g++-12
+          cmake -S "$HOME/llama.cpp" -B "$HOME/ggml-build" -G Ninja $GGML_FLAGS \
+            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCMAKE_CUDA_HOST_COMPILER=g++-12 \
+            -DCMAKE_C_FLAGS="-include $H -fno-math-errno" -DCMAKE_CXX_FLAGS="-include $H -fno-math-errno" \
+            -DCMAKE_CUDA_FLAGS="-Xcompiler=-fno-math-errno -Xcompiler=-include,$H"
+          cmake --build "$HOME/ggml-build"
+      - uses: actions/cache/save@v5
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/ggml-build/bin
+          key: ${{ steps.ggml-cache.outputs.cache-primary-key }}
+      - name: Package
+        run: |
+          export CC=gcc-12 CXX=g++-12
+          if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="$GITHUB_REF_NAME"; fi
+          LLAMA_CPP_ROOT="$HOME/llama.cpp" GGML_LIBS="$HOME/ggml-build/bin" \
+            CUDA_LIBS="$CUDA_HOME/targets/x86_64-linux/lib" bash scripts/package.sh
+      - name: The zip, unpacked, on the CPU (.github/scripts/bundle_check.py)
+        run: |
+          cmake --build build-portable --target qwfn-gen qwfn-refdump qwfn-logits | tail -2
+          # no NVIDIA driver here: without the link stub the bundle meets the missing libcuda.so.1
+          # of a machine that has none, and runs on the CPU
+          rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && ldconfig
+          python3 .github/scripts/bundle_check.py dist/qwfnfer-linux-x86_64-cuda.zip build-portable "$RUNNER_TEMP/bundle-check"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qwfnfer-linux-x86_64-cuda
+          path: dist/qwfnfer-linux-x86_64-cuda.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    name: windows-x86_64-cuda
+    runs-on: windows-2022
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/windows-setup-cuda
+      - uses: ./.github/actions/windows-msvc-env
+      - name: Ninja
+        run: choco install ninja -y --no-progress
+      - name: llama.cpp source
+        run: |
+          git init -q "$env:RUNNER_TEMP\llama.cpp"
+          git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/unslothai/llama.cpp $env:LLAMA_SHA
+          git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
+      - name: Cached portable ggml build
+        id: ggml-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.temp }}\ggml-build\bin
+            ${{ runner.temp }}\ggml-build\ggml\src\*.lib
+            ${{ runner.temp }}\ggml-build\src\*.lib
+          key: release-windows-ggml-${{ env.LLAMA_SHA }}-cuda13.4-sm75-120-v1
+      - name: Portable ggml build (scripts\package.ps1's header)
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          $flags = $env:GGML_FLAGS -split ' '
+          cmake -S "$env:RUNNER_TEMP\llama.cpp" -B "$env:RUNNER_TEMP\ggml-build" -G Ninja @flags "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS"
+          if ($LASTEXITCODE) { exit 1 }
+          cmake --build "$env:RUNNER_TEMP\ggml-build"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/cache/save@v5
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}\ggml-build\bin
+            ${{ runner.temp }}\ggml-build\ggml\src\*.lib
+            ${{ runner.temp }}\ggml-build\src\*.lib
+          key: ${{ steps.ggml-cache.outputs.cache-primary-key }}
+      - name: Package
+        # Windows PowerShell 5.1, the one the script's header tells users to run it with
+        shell: powershell
+        run: |
+          $env:LLAMA_CPP_ROOT = "$env:RUNNER_TEMP\llama.cpp"
+          $env:GGML_LIBS = "$env:RUNNER_TEMP\ggml-build\bin"
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:VERSION = $env:GITHUB_REF_NAME }
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
+          if ($LASTEXITCODE) { exit 1 }
+      - name: The zip, unpacked, on the CPU (.github\scripts\bundle_check.py)
+        # no NVIDIA driver on the runner, so ggml-cuda.dll does not load: the CPU variants run
+        run: |
+          cmake --build build-portable-win --target qwfn-gen qwfn-refdump qwfn-logits
+          if ($LASTEXITCODE) { exit 1 }
+          python .github\scripts\bundle_check.py dist\qwfnfer-windows-x86_64-cuda.zip build-portable-win "$env:RUNNER_TEMP\bundle-check"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qwfnfer-windows-x86_64-cuda
+          path: dist/qwfnfer-windows-x86_64-cuda.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [linux, windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/release-notes
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          cd dist && sha256sum qwfnfer-*.zip > SHA256SUMS && cat SHA256SUMS && cd ..
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            pre=""; case "$tag" in *-*) pre="--prerelease" ;; esac
+            # .github/release-notes/<tag>.md, when there is one, goes above GitHub's generated list
+            notes=(); if [ -f ".github/release-notes/$tag.md" ]; then notes=(--notes-file ".github/release-notes/$tag.md"); fi
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --title "QwFNfer $tag" --generate-notes "${notes[@]}" $pre
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/qwfnfer-linux-x86_64-cuda.zip dist/qwfnfer-windows-x86_64-cuda.zip dist/SHA256SUMS

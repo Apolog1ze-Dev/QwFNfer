@@ -16,6 +16,8 @@
 // you cannot simply forget the tail of a scan.
 
 #include "qwfn_engine.h"
+#include "qwfn_files.h"
+#include "qwfn_home.h"
 #include "qwfn_model.h"
 #include "qwfn_vocab.h"
 #include "qwfn_vision.h"
@@ -25,22 +27,41 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <csignal>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
-#include <sys/stat.h>
-#include <execinfo.h>
-#include <csignal>
-#include <atomic>
-#include <pthread.h>
 #include <vector>
+
+#ifdef _WIN32
+// The stall watchdog and fatal-signal backtraces use POSIX signals and
+// glibc's execinfo. Windows keeps the fatal handlers (signal() exists and
+// SEGV/ABRT/FPE arrive); the STALL probe and stack dump degrade to a plain
+// message -- CaptureStackBackTrace from a signal handler is not safe to run
+// cross-thread, and the watchdog's purpose ("where is it stuck") is already
+// answered by the expert-cache wait state it logs right before.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <execinfo.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace qwfn;
 using json = nlohmann::ordered_json;
@@ -549,20 +570,37 @@ struct tool_streamer {
 // Backtraces without a debugger (ptrace is restricted on this machine): a
 // fatal signal prints the dying thread's stack; SIGUSR2, sent by the stall
 // watchdog to the generating thread, prints where it is stuck.
+#ifdef _WIN32
+using thread_id = DWORD;
+static thread_id current_thread() { return GetCurrentThreadId(); }
+#else
+using thread_id = pthread_t;
+static thread_id current_thread() { return pthread_self(); }
+#endif
 static void print_backtrace(const char * why) {
+#ifdef _WIN32
+    char head[160];
+    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s in thread %lu (no stack on this platform) ===\n", why, (unsigned long) current_thread());
+    (void) !_write(2, head, (unsigned) hl);
+#else
     void * frames[64];
     const int n = backtrace(frames, 64);
     char head[160];
-    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: backtrace of thread %lu (%d frames) ===\n", why, (unsigned long) pthread_self(), n);
+    const int hl = snprintf(head, sizeof head, "\n[qwfn-server] === %s: backtrace of thread %lu (%d frames) ===\n", why, (unsigned long) current_thread(), n);
     (void) !write(2, head, hl);
     backtrace_symbols_fd(frames, n, 2);
+#endif
 }
 static void on_fatal(int sig) {
+#ifdef _WIN32
+    print_backtrace(sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : sig == SIGFPE ? "SIGFPE" : "fatal signal");
+#else
     print_backtrace(sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : sig == SIGBUS ? "SIGBUS" : sig == SIGFPE ? "SIGFPE" : "fatal signal");
+#endif
     signal(sig, SIG_DFL); raise(sig);
 }
 static void on_stall_probe(int) { print_backtrace("STALL probe (SIGUSR2)"); }
-static pthread_t g_gen_thread;
+static thread_id g_gen_thread;
 static std::atomic<bool> g_gen_thread_set{false};
 
 struct live_stats {
@@ -702,6 +740,28 @@ static bool render_content(server & S, const json & content, std::string & text,
             imgs.emplace_back(text.size(), std::move(pi));   // marker position in text
             continue;
         }
+        if (ty == "file" || ty == "input_file") {
+            // A file, inline: Chat Completions' {"type":"file","file":{"filename","file_data"}} or
+            // the Responses API's {"type":"input_file","filename","file_data"}, file_data a data: URL
+            // or bare base64. Text files and zip archives of them read as text (qwfn_files.h);
+            // anything else, and a file sent by id (this server keeps no uploads), is named so the
+            // model knows what it was not given.
+            const json & f = part.contains("file") && part["file"].is_object() ? part["file"] : part;
+            const std::string name = f.value("filename", "attachment");
+            std::string data = f.value("file_data", "");
+            if (data.empty()) { text += "[attached file not read: " + name + " (sent by file id; this server keeps no uploaded files)]\n"; continue; }
+            std::string media;
+            if (data.rfind("data:", 0) == 0) {
+                const size_t comma = data.find(',');
+                if (comma == std::string::npos) { err = "bad data: URL in file_data"; return false; }
+                media = data.substr(5, data.find(';') < comma ? data.find(';') - 5 : comma - 5);
+                data = data.substr(comma + 1);
+            }
+            std::vector<uint8_t> raw;
+            if (!b64_decode(data, raw)) { err = "bad base64 in file_data"; return false; }
+            text += file_as_text(name, media, raw.data(), raw.size());
+            continue;
+        }
     }
     return true;
 }
@@ -744,10 +804,18 @@ static bool anthropic_part(const json & b, json & part, std::string & err) {
         return true;
     }
     if (ty == "document") {
-        // A text document reads as text; anything else (a PDF) is named, so the
-        // model knows what it was not given, instead of failing the turn.
-        const std::string text = src.value("type", "") == "text" ? src.value("data", "")
-                               : "[document not available: " + src.value("media_type", "unknown type") + " is not supported by this server]";
+        // A text document reads as text, a base64 one through file_as_text (text files and zip
+        // archives of them read; anything else, a PDF say, is named, so the model knows what it
+        // was not given instead of the turn failing).
+        const std::string kind = src.value("type", "");
+        std::string text;
+        if (kind == "text") text = src.value("data", "");
+        else if (kind == "content") text = anthropic_text(src.value("content", json::array()));
+        else if (kind == "base64") {
+            std::vector<uint8_t> raw;
+            if (!b64_decode(src.value("data", ""), raw)) { err = "bad base64 in a document block"; return false; }
+            text = file_as_text(b.value("title", "document"), src.value("media_type", ""), raw.data(), raw.size());
+        } else text = "[document not available: a " + (kind.empty() ? std::string("missing") : kind) + " source is not supported by this server]";
         part = json{{"type", "text"}, {"text", text}};
         return true;
     }
@@ -987,8 +1055,7 @@ int main(int argc, char ** argv) {
     // graph on the cores), so it takes no VRAM: nothing is reserved for it and
     // the expert tier is not lent while an image is encoded. Loaded after the
     // engine, which loads the ggml backends.
-    if (!S.eng.init(&S.mi, nullptr, cfg,
-                    std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!S.eng.init(&S.mi, nullptr, cfg, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", S.eng.memory_summary().c_str());
@@ -1254,7 +1321,7 @@ int main(int argc, char ** argv) {
         // Whatever way this returns (an eval error, a client that went away), the
         // counters must not say "busy" forever.
         struct busy_guard { live_stats & L; ~busy_guard() { std::lock_guard<std::mutex> lk(L.mu); L.busy = false; L.prefilling = false; } } guard{S.live};
-        g_gen_thread = pthread_self(); g_gen_thread_set = true;
+        g_gen_thread = current_thread(); g_gen_thread_set = true;
         smp.gen.clear();
 
         const auto tp = clk::now();
@@ -1500,18 +1567,27 @@ int main(int argc, char ** argv) {
     // only when both sockets carry the same option. With REUSEPORT only, switching between
     // this server and llama-server or vLLM failed with "address in use" in both directions
     // until TIME_WAIT expired. REUSEPORT would also let a stale instance share the port.
+    // Windows keeps httplib's default: there is no SO_REUSEPORT there, and the default is
+    // already SO_REUSEADDR, with which the port was tested.
+#ifndef _WIN32
     svr.set_socket_options([](socket_t sock) { httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1); });
+#endif
     // httplib's socket timeouts default to 5 s per write and per read. A client
     // UI that stops draining the stream for 5 s (rendering a long reasoning
     // trace) would get the connection cut without a trailer and without a log
     // line here -- "peer closed connection without sending complete message
     // body" on its side. A local server can afford to wait.
+#ifndef _WIN32
     // prime the unwinder: glibc's first backtrace() dlopens libgcc_s, taking the loader and malloc locks.
     // Done first inside the stall probe's handler, it deadlocked a generation thread interrupted inside
     // malloc (a long first-request JIT compile) for good. Loaded here, while nothing is interrupted.
     { void * f[2]; (void) backtrace(f, 2); }
-    signal(SIGSEGV, on_fatal); signal(SIGABRT, on_fatal); signal(SIGBUS, on_fatal); signal(SIGFPE, on_fatal);
+#endif
+    signal(SIGSEGV, on_fatal); signal(SIGABRT, on_fatal); signal(SIGFPE, on_fatal);
+#ifndef _WIN32
+    signal(SIGBUS, on_fatal);   // SIGBUS does not exist on Windows
     signal(SIGUSR2, on_stall_probe);
+#endif
     // A local web page (the console, a harness) may read /stats and /props
     // from another origin: allow it.
     svr.set_default_headers({{"Access-Control-Allow-Origin", "*"}, {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
@@ -1545,7 +1621,21 @@ int main(int argc, char ** argv) {
                 else
                     fprintf(stderr, "[qwfn-server] STALL: no new token for %.0f s at generated token %d; expert cache waiting on %s (%zu reads)\n",
                             stalled, n, what, S.eng.cache_wait_count());
-                if (g_gen_thread_set) pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
+                if (g_gen_thread_set)
+#ifdef _WIN32
+                    // No cross-thread stack here: CaptureStackBackTrace is not safe to
+                    // call on another thread, and the SIGUSR2 path POSIX uses does not
+                    // exist. What print_backtrace() does on Windows is print the
+                    // CALLING thread's id -- the watchdog's -- so the line reads
+                    // "stuck in thread N" and sends whoever reads the log to the wrong
+                    // thread entirely. Name the thread that holds the generation and
+                    // say the stack is unavailable; the wait state above is the part
+                    // that actually says where the time is going.
+                    fprintf(stderr, "[qwfn-server] === STALL probe: the generating thread is %lu; no cross-thread stack on this platform ===\n",
+                            (unsigned long) g_gen_thread);
+#else
+                    pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
+#endif
             }
         }
     }).detach();
@@ -1621,7 +1711,7 @@ int main(int argc, char ** argv) {
             std::unique_lock<std::mutex> lk(S.mu, std::try_to_lock);
             if (!lk.owns_lock()) { fail(res, 409, "a request is running; set threads between requests"); return; }
             S.eng.set_n_threads(n);
-            fprintf(stderr, "[qwfn-server] threads set to %d\n", n);
+            fprintf(stderr, "[qwfn-server] threads set to %d\n", S.eng.n_threads());
         }
         res.set_content(props_json().dump(2, ' ', false, json::error_handler_t::replace), "application/json");
     });

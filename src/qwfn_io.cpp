@@ -1,20 +1,58 @@
 #include "qwfn_io.h"
 
+#ifdef _WIN32
+// Windows runs the thread-pool backend over unbuffered reads (see qwfn_io.h).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <filesystem>
+#else
 #include <liburing.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
-#include <unistd.h>
+#include <algorithm>
 
 namespace qwfn {
 
 static uint64_t g_dio_align = 512;
 uint64_t dio_align() { return g_dio_align; }
 void     set_dio_align(uint64_t a) { g_dio_align = a == QWFN_DIO_PAGE ? QWFN_DIO_PAGE : 512; }
+
+#ifdef _WIN32
+
+// --- aligned allocation ----------------------------------------------------
+// Same contract as the POSIX side: 4096-aligned, dio_align_up-sized, freeable
+// with dio_free. _aligned_malloc already rounds internally; the explicit
+// rounding keeps the *size* contract identical (>= dio_align_up(bytes)).
+void * dio_alloc(size_t bytes) {
+    const size_t sz = dio_align_up(bytes ? bytes : 1);
+    return _aligned_malloc(sz, 4096);
+}
+
+void dio_free(void * p) { _aligned_free(p); }
+
+// --- available memory ------------------------------------------------------
+// GlobalMemoryStatusEx's ullAvailPhys is the Windows analogue of
+// MemAvailable: what can be handed out without swapping to the pagefile.
+uint64_t mem_available_bytes() {
+    MEMORYSTATUSEX s;
+    s.dwLength = sizeof(s);
+    if (!GlobalMemoryStatusEx(&s)) return 0;
+    return s.ullAvailPhys;
+}
+
+#else // !_WIN32
 
 void * dio_alloc(size_t bytes) {
     void * p = nullptr;
@@ -37,6 +75,21 @@ uint64_t mem_available_bytes() {
     return kb * 1024ull;
 }
 
+#endif // _WIN32
+
+void disable_power_throttling() {
+#ifdef _WIN32
+    // PROCESS_POWER_THROTTLING_STATE {Version 1, ControlMask EXECUTION_SPEED, StateMask 0}
+    // for ProcessPowerThrottling (4), spelled out and looked up at run time: the call is
+    // Windows 10 1709+, and older SDK and MinGW headers do not declare the struct.
+    struct { ULONG version, control_mask, state_mask; } st = { 1, 0x1, 0 };
+    using set_info_t = BOOL (WINAPI *)(HANDLE, int, LPVOID, DWORD);
+    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+        if (auto fn = (set_info_t) (void *) GetProcAddress(k32, "SetProcessInformation"))
+            fn(GetCurrentProcess(), 4, &st, (DWORD) sizeof st);
+#endif
+}
+
 size_t clamp_to_available(size_t want, double frac, size_t headroom) {
     const uint64_t avail = mem_available_bytes();
     if (avail == 0) return want;                       // unknown: trust the caller
@@ -46,35 +99,129 @@ size_t clamp_to_available(size_t want, double frac, size_t headroom) {
     if ((uint64_t) want <= safe) return want;
     fprintf(stderr,
             "[qwfn] requested %.1f GB RAM tier but only %.1f GB is available; "
-            "clamping to %.1f GB (%.0f%% of MemAvailable minus %.1f GB headroom)\n",
+            "clamping to %.1f GB (%.0f%% of available memory minus %.1f GB headroom)\n",
             want / 1e9, avail / 1e9, safe / 1e9, frac * 100, headroom / 1e9);
     return (size_t) safe;
 }
 
 io_engine::~io_engine() { shutdown(); }
 
+// --- shard files -------------------------------------------------------------
+// The one place the platforms differ below the backends: how a shard is opened
+// for direct reads, read at an offset, and closed. Everything else -- the thread
+// pool, the bounce path, the completion accounting -- is shared, so a fix to one
+// platform's backend is a fix to both.
+
+#ifdef _WIN32
+
+// FILE_FLAG_NO_BUFFERING is the documented Windows equivalent of O_DIRECT:
+// sector-aligned reads that bypass the cache manager, with the same alignment
+// contract (offset, length and destination follow dio_align()). The handle is
+// opened overlapped so positional reads from several workers run in parallel; a
+// synchronous handle serializes them.
+static bool open_shard(const std::string & p, bool & direct, io_engine::file_t & out, std::string & err) {
+    const std::wstring wp = std::filesystem::path(p).wstring();
+    HANDLE h = CreateFileW(wp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED | (direct ? FILE_FLAG_NO_BUFFERING : 0), nullptr);
+    if (h == INVALID_HANDLE_VALUE && direct) {
+        // Some filesystems refuse unbuffered access; fall back rather than fail, as on Linux.
+        h = CreateFileW(wp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED, nullptr);
+        if (h != INVALID_HANDLE_VALUE) direct = false;
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        char buf[256] = {};
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                       nullptr, GetLastError(), 0, buf, sizeof(buf), nullptr);
+        err = "open failed for " + p + ": " + buf;
+        return false;
+    }
+    out = h;
+    return true;
+}
+
+static void close_shard(io_engine::file_t f) { CloseHandle((HANDLE) f); }
+
+// n bytes at off, looping over short pieces like the POSIX pread loop; returns
+// the bytes read (short at end of file) or -1. Each worker thread has its own
+// event: an OVERLAPPED with a NULL event shared by several threads makes
+// GetOverlappedResult unreliable, and the io test caught exactly that.
+static int64_t read_full(io_engine::file_t f, void * dst, size_t n, uint64_t off) {
+    struct thread_event { HANDLE h = nullptr; ~thread_event() { if (h) CloseHandle(h); } };
+    static thread_local thread_event tev;   // closed when the worker exits
+    if (!tev.h && !(tev.h = CreateEventW(nullptr, TRUE, FALSE, nullptr))) return -1;
+    const HANDLE ev = tev.h;
+    size_t done = 0;
+    while (done < n) {
+        OVERLAPPED ov{};
+        const uint64_t at = off + done;
+        ov.Offset     = (DWORD) (at & 0xFFFFFFFFull);
+        ov.OffsetHigh = (DWORD) (at >> 32);
+        ov.hEvent     = ev;
+        DWORD got = 0;
+        if (!ReadFile((HANDLE) f, (char *) dst + done, (DWORD) (n - done), nullptr, &ov)) {
+            const DWORD e = GetLastError();
+            if (e == ERROR_HANDLE_EOF) break;
+            if (e != ERROR_IO_PENDING) return done ? (int64_t) done : -1;
+        }
+        if (!GetOverlappedResult((HANDLE) f, &ov, &got, TRUE)) {
+            if (GetLastError() == ERROR_HANDLE_EOF) break;
+            return done ? (int64_t) done : -1;
+        }
+        if (got == 0) break;
+        done += got;
+    }
+    return (int64_t) done;
+}
+
+#else // !_WIN32
+
+static bool open_shard(const std::string & p, bool & direct, io_engine::file_t & out, std::string & err) {
+    int fd = ::open(p.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
+    if (fd < 0 && direct) {
+        // Some filesystems refuse O_DIRECT; fall back rather than fail.
+        fd = ::open(p.c_str(), O_RDONLY);
+        if (fd >= 0) direct = false;
+    }
+    if (fd < 0) {
+        err = "open failed for " + p + ": " + strerror(errno);
+        return false;
+    }
+    out = fd;
+    return true;
+}
+
+static void close_shard(io_engine::file_t f) { ::close(f); }
+
+// pread is positional and thread-safe, so the shard fds are shared by the workers.
+static int64_t read_full(io_engine::file_t fd, void * dst, size_t n, uint64_t off) {
+    size_t done = 0;
+    while (done < n) {
+        const ssize_t r = ::pread(fd, (char *) dst + done, n - done, (off_t) (off + done));
+        if (r <= 0) break;
+        done += (size_t) r;
+    }
+    return (int64_t) done;
+}
+
+#endif // _WIN32
+
 bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_depth,
                      bool direct_io, std::string & err, backend be) {
     shutdown();
     direct_ = direct_io;
+#ifdef _WIN32
+    be_     = backend::threads;   // no io_uring here; see the backend notes in qwfn_io.h
+    (void) be;
+#else
     be_     = be;
+#endif
     qd_     = queue_depth ? queue_depth : 256;
 
     for (const auto & p : paths) {
-        int flags = O_RDONLY;
-        if (direct_) flags |= O_DIRECT;
-        int fd = ::open(p.c_str(), flags);
-        if (fd < 0 && direct_) {
-            // Some filesystems refuse O_DIRECT; fall back rather than fail.
-            fd = ::open(p.c_str(), O_RDONLY);
-            if (fd >= 0) direct_ = false;
-        }
-        if (fd < 0) {
-            err = "open failed for " + p + ": " + strerror(errno);
-            shutdown();
-            return false;
-        }
-        fds_.push_back(fd);
+        file_t f{};
+        if (!open_shard(p, direct_, f, err)) { shutdown(); return false; }
+        fds_.push_back(f);
     }
 
     // With a 512-byte layout a direct read of the exact window would be served
@@ -82,13 +229,13 @@ bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_dept
     // window into their own buffer and copy the payload into the slot instead.
     bounce_ = direct_ && dio_align() < QWFN_DIO_PAGE;
     if (be_ == backend::threads) {
-        // pread is positional and thread-safe, so the shard fds are shared.
         const unsigned n = qd_ ? std::min(qd_, 32u) : 8u;
         stop_ = false;
         for (unsigned i = 0; i < n; i++) workers_.emplace_back([this] { worker_loop(); });
         return true;
     }
 
+#ifndef _WIN32
     ring_ = (io_uring *) calloc(1, sizeof(io_uring));
     if (!ring_) { err = "out of memory allocating io_uring"; shutdown(); return false; }
 
@@ -110,6 +257,7 @@ bool io_engine::init(const std::vector<std::string> & paths, unsigned queue_dept
     if (!registered_files) {
         fprintf(stderr, "[qwfn] io_uring_register_files failed (%s); using plain fds\n", strerror(-rr));
     }
+#endif
     return true;
 }
 
@@ -122,12 +270,14 @@ void io_engine::shutdown() {
         q_.clear(); done_.clear();
         stop_ = false;
     }
+#ifndef _WIN32
     if (ring_) {
         io_uring_queue_exit(ring_);
         free(ring_);
         ring_ = nullptr;
     }
-    for (int fd : fds_) if (fd >= 0) ::close(fd);
+#endif
+    for (file_t f : fds_) close_shard(f);
     fds_.clear();
     rejected_.clear();
     in_flight_ = 0;
@@ -146,9 +296,13 @@ size_t io_engine::submit(const io_request * reqs, size_t n) {
                     // Completed here as an error rather than dropped: see rejected_.
                     // Returning n while quietly queueing fewer jobs is what used to
                     // leave fetch_end() waiting on a completion nothing would produce.
+                    // It goes straight to done_ and is NOT counted in in_flight_: on
+                    // this backend in_flight_ is reads not yet completed, which the
+                    // workers decrement, and none will ever decrement it for this one
+                    // -- counting it left in_flight() stuck above zero for good, and
+                    // every `while (in_flight()) reap(...)` loop waiting forever.
                     stat_errors++;
                     done_.push_back(r.tag);
-                    in_flight_++;
                     continue;
                 }
                 uint64_t off = r.offset;
@@ -172,6 +326,7 @@ size_t io_engine::submit(const io_request * reqs, size_t n) {
         return n;
     }
 
+#ifndef _WIN32
     if (!ring_) return 0;
     // `prepped` counts SQEs; `accepted` counts requests this call takes
     // responsibility for completing, which includes the rejected ones.
@@ -228,6 +383,9 @@ size_t io_engine::submit(const io_request * reqs, size_t n) {
         in_flight_ += prepped;
     }
     return accepted;
+#else
+    return 0;
+#endif
 }
 
 size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete) {
@@ -250,6 +408,7 @@ size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete
         return got;
     }
 
+#ifndef _WIN32
     if (!ring_ || in_flight_ == 0) return 0;
 
     size_t got = 0;
@@ -303,6 +462,9 @@ size_t io_engine::reap(uint64_t * tags_out, size_t max_tags, size_t min_complete
         if (in_flight_ == 0) break;
     }
     return got;
+#else
+    return 0;
+#endif
 }
 
 
@@ -316,7 +478,7 @@ void io_engine::worker_loop() {
             j = q_.front();
             q_.pop_front();
         }
-        ssize_t got = 0;
+        int64_t got = 0;
         if (bounce_) {
             // The page-aligned window around the requested range, into this
             // worker's buffer; the payload then goes where the 512-byte layout
@@ -332,31 +494,20 @@ void io_engine::worker_loop() {
                 scratch_bytes = wl + (1u << 20);
                 scratch = (uint8_t *) dio_alloc(scratch_bytes);
             }
-            const ssize_t need = (ssize_t) (j.ooff - w0 + j.onb);
-            if (scratch) {
-                while (got < (ssize_t) wl) {
-                    const ssize_t r = ::pread(fds_[j.shard], scratch + got, wl - got, (off_t) (w0 + got));
-                    if (r <= 0) break;
-                    got += r;
-                }
-            }
+            const int64_t need = (int64_t) (j.ooff - w0 + j.onb);
+            if (scratch) got = read_full(fds_[j.shard], scratch, wl, w0);
             if (got >= need) {
                 memcpy((char *) j.dst + dio_pad(j.ooff), scratch + (j.ooff - w0), j.onb);
-                got = (ssize_t) j.len;   // the caller's notion of a complete read
+                got = (int64_t) j.len;   // the caller's notion of a complete read
             } else {
                 got = 0;
             }
         } else {
-            while (got < (ssize_t) j.len) {
-                const ssize_t r = ::pread(fds_[j.shard], (char *) j.dst + got,
-                                          j.len - got, (off_t) (j.off + got));
-                if (r <= 0) break;
-                got += r;
-            }
+            got = read_full(fds_[j.shard], j.dst, j.len, j.off);
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            if (got < (ssize_t) j.len) stat_errors++;
+            if (got < (int64_t) j.len) stat_errors++;
             else { stat_reads++; stat_bytes += (uint64_t) got; }
             done_.push_back(j.tag);
             in_flight_--;

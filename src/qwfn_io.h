@@ -20,7 +20,9 @@
 #include <string>
 #include <vector>
 
-struct io_uring;
+#include "qwfn_platform.h"
+
+struct io_uring;   // never defined on Windows, where ring_ stays null
 
 namespace qwfn {
 
@@ -75,6 +77,16 @@ public:
     //   threads : a pool of workers doing blocking positional preadv. Real
     //             kernel-level parallelism; measured 5.30 GB/s on the same
     //             burst shape.
+    //
+    // Windows has the threads backend only, over unbuffered overlapped reads
+    // (FILE_FLAG_NO_BUFFERING, the documented equivalent of O_DIRECT): the same
+    // slice-sized reads with the same alignment contract. Windows' IoRing was
+    // measured against it on an NVMe (random 640 KiB-1 MiB slices, QD 1-64) and
+    // came out within 0-2.4%: from QD 8 the drive is the limit, so batching
+    // submissions has nothing left to win. Its non-blocking submit also fails
+    // with IORING_E_SUBMISSION_QUEUE_FULL unless the caller waits, which is the
+    // one shape the layer-ahead prefetch cannot use. Asking for `uring` on
+    // Windows gets `threads`.
     enum class backend { uring, threads };
 
     // queue_depth is the io_uring ring size / the worker count.
@@ -106,15 +118,16 @@ public:
     bool     registered_files = false;
 
 private:
-    backend          be_ = backend::uring;
-    io_uring *       ring_ = nullptr;
+    backend          be_ = backend::threads;
+    io_uring *       ring_ = nullptr;   // the uring backend only; always null on Windows
 
     // Tags of requests rejected at submit time (bad shard index, null
     // destination, zero length). Every caller here counts completions, not
     // requests, so a request that vanished silently left reap() waiting for a
     // CQE that could never arrive -- or, on the callers that retry a short
     // submit from the same index, resubmitting the same bad request for ever.
-    // A rejected request is therefore completed, as an error, like any other.
+    // A rejected request is therefore completed, as an error, like any other:
+    // here on the uring backend, straight into done_ on the threads backend.
     std::vector<uint64_t> rejected_;
 
     // --- thread-pool backend ---
@@ -126,7 +139,14 @@ private:
     std::condition_variable   cv_work_, cv_done_;
     bool                      stop_ = false;
     void worker_loop();
-    std::vector<int> fds_;
+public:
+#ifdef _WIN32
+    using file_t = void *;   // a HANDLE
+#else
+    using file_t = int;
+#endif
+private:
+    std::vector<file_t> fds_;
     bool             direct_ = true;
     bool             bounce_ = false;   // direct reads through a page-aligned per-worker buffer (512-byte slot layout)
     size_t           in_flight_ = 0;
@@ -147,8 +167,17 @@ void   dio_free(void * p);
 // Every arena sizing therefore goes through clamp_to_available().
 
 // MemAvailable from /proc/meminfo: the kernel's own estimate of what can be
-// handed out without swapping. Returns 0 if it cannot be read.
+// handed out without swapping (GlobalMemoryStatusEx's ullAvailPhys on Windows).
+// Returns 0 if it cannot be read.
 uint64_t mem_available_bytes();
+
+// Windows: opt this process out of power throttling (EcoQoS). Windows 11 applies it
+// to processes it judges to be in the background -- a server the console starts with
+// no window of its own is one -- and then runs their threads at reduced clocks or on
+// the efficiency cores of a hybrid CPU: the thread launching the GPU graphs, the CPU
+// experts and the read workers alike. llama.cpp opts its compute threads out for the
+// same reason. A no-op elsewhere.
+void disable_power_throttling();
 
 // Largest arena we are willing to take: `frac` of MemAvailable, minus a fixed
 // headroom for activations, CUDA host buffers and the rest of the desktop.

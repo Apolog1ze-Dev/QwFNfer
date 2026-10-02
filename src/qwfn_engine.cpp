@@ -11,6 +11,7 @@
 #include <chrono>
 #include <numeric>
 #include <sstream>
+#include <thread>
 
 namespace qwfn {
 
@@ -72,6 +73,13 @@ static void qwfn_ggml_log(enum ggml_log_level level, const char * text, void * /
 }
 
 void engine::set_n_threads(int n) {
+    // Never more than the CPUs there are: every ggml barrier then waits on a descheduled
+    // thread. With libgomp, the default 8 on a 4-CPU machine ran decode 50x slower than 4.
+    const int hw = (int) std::thread::hardware_concurrency();
+    if (hw > 0 && n > hw) {
+        fprintf(stderr, "[qwfn] %d threads asked for, %d CPUs: using %d\n", n, hw, hw);
+        n = hw;
+    }
     n_threads_ = std::max(1, n);
     wh_.set_n_threads(n_threads_);
     w_.set_n_threads(n_threads_);
@@ -80,6 +88,7 @@ void engine::set_n_threads(int n) {
 bool engine::init(const model_index * hot, const model_index * cold,
                   const engine_config & cfg, const std::string & backend_dir, std::string & err) {
     ggml_log_set(qwfn_ggml_log, nullptr);
+    disable_power_throttling();   // Windows only: see qwfn_io.h
     mi_  = hot;
     cfg_ = cfg;
     hp_  = hot->hp();
@@ -2592,7 +2601,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_backend_tensor_get(t_pg_, pgh.data(), 0, nfl * sizeof(float));
                 const bool bc = bad(acc.data(), nfl), bg = bad(pgh.data(), nfl);
                 if (bc || bg) {
-                    fprintf(stderr, "[nan-check] token %d layer %u: %s%s | experts:", n_past, il, bc ? "CPU partial " : "", bg ? "GPU partial" : "");
+                    fprintf(stderr, "[nan-check] token %lld layer %u: %s%s | experts:", (long long) n_past, il, bc ? "CPU partial " : "", bg ? "GPU partial" : "");
                     for (int64_t e = 0; e < U; e++) fprintf(stderr, " %d%s%s%s", sel_[e], eh[e].on_gpu ? "g" : "c", eh[e].from_cold ? "*" : "", eh[e].late ? "L" : "");
                     fprintf(stderr, "\n");
                 }

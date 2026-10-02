@@ -6,6 +6,7 @@
 // but it isolates correctness from the memory-hierarchy work.
 
 #include "qwfn_graph.h"
+#include "qwfn_home.h"
 #include "qwfn_model.h"
 #include "qwfn_ple.h"
 #include "qwfn_state.h"
@@ -64,7 +65,7 @@ int main(int argc, char ** argv) {
     printf("%s\n\n", hp.summary().c_str());
 
     weights w;
-    if (!w.init(&mi, use_gpu, std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    if (!w.init(&mi, use_gpu, qwfn::llama_backend_dir(), err)) {
         fprintf(stderr, "backend: %s\n", err.c_str()); return 1;
     }
     printf("backend: %s\n", w.dev_name());
@@ -154,6 +155,13 @@ int main(int argc, char ** argv) {
             for (uint32_t sIdx = 0; sIdx < r; sIdx++) bc[b * r + sIdx] = (int32_t) (b * r + sIdx);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * r);
         }
+        // The partial tail block maps to its real cells (the last repeated), as the engine's
+        // build_attn_inputs does since #12: left at zero it pointed every query in it at cell 0.
+        if (have_dead) {
+            for (uint32_t sIdx = 0; sIdx < r; sIdx++)
+                bc[dead_bid * r + sIdx] = (int32_t) std::min<int64_t>(dead_bid * (int64_t) r + sIdx, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + dead_bid] = (int32_t) (dead_bid * r);
+        }
         for (int64_t i = 0; i < T; i++) {
             const int64_t q = n_past + i;
             const int64_t tail_start = ((q + 1) / r) * r;   // the ragged tail is always visible
@@ -161,6 +169,10 @@ int main(int argc, char ** argv) {
                 bi[i * n_blocks + b] = (b >= n_bid) ? -INFINITY
                                      : (b * (int64_t) r >= tail_start ? 1e9f : 0.0f);
             if (have_dead) bi[i * n_blocks + dead_bid] = 1e9f;
+            // A block wholly after q is not forced (#12): it would take one of the selection's
+            // slots from a past block, and the causal mask then empties it.
+            for (int64_t b = tail_start / r; b < n_blocks; b++)
+                if (bi[i * n_blocks + b] > 0.0f && b * (int64_t) r > q) bi[i * n_blocks + b] = -1e9f;
         }
         ggml_backend_tensor_set(qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
         ggml_backend_tensor_set(qsa.blk_cells, bc.data(), 0, bc.size() * 4);

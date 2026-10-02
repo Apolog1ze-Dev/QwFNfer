@@ -42,7 +42,14 @@ def hf_hubs():
 HF_HUBS = hf_hubs()
 HF = HF_HUBS[0]          # the one the page names; the others are scanned too when they exist
 # The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
-SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server"))
+# The engine: bin/ in the release bundle, build/ in a source checkout (on
+# Windows a separate build-win/ is common to keep a Linux build around), or
+# QWFN_SERVER.
+_EXE = "qwfn-server" + (".exe" if os.name == "nt" else "")
+_CANDS = [os.path.join(ROOT, "bin", _EXE), os.path.join(ROOT, "build", _EXE)]
+if os.name == "nt":
+    _CANDS.append(os.path.join(ROOT, "build-win", _EXE))
+SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in _CANDS if os.path.exists(p)), _CANDS[1])
 LOG_DIR = os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
 os.makedirs(LOG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(LOG_DIR, "config.json")
@@ -143,16 +150,17 @@ def list_gguf(loc):
     if loc["kind"] == "hf":
         return glob.glob(os.path.join(p, "models--*", "snapshots", "*", "*.gguf")) + glob.glob(os.path.join(p, "models--*", "snapshots", "*", "*", "*.gguf"))
     out = []
-    base_depth = p.rstrip("/").count("/")
+    base_depth = p.rstrip("/\\").count("/") + p.rstrip("/\\").count("\\")
     for d, dirs, files in os.walk(p, followlinks=True):
         dirs[:] = [x for x in dirs if not x.startswith(".")]
-        if d.count("/") - base_depth >= 4: dirs[:] = []
+        depth = d.count("/") + d.count("\\")
+        if depth - base_depth >= 4: dirs[:] = []
         out += [os.path.join(d, f) for f in files if f.endswith(".gguf")]
     return out
 
 def repo_dirs(model_dir):
     """Every snapshot directory of the model's Hugging Face repo, when it is laid out that way."""
-    parts = model_dir.split(os.sep)
+    parts = os.path.normpath(model_dir).split(os.sep)   # normpath first: glob may hand back /
     if "snapshots" in parts:
         i = len(parts) - 1 - parts[::-1].index("snapshots")
         return glob.glob(os.path.join(os.sep.join(parts[:i]), "snapshots", "*"))
@@ -175,7 +183,7 @@ def find_mtp(model_dir):
     return None
 
 def repo_label(path, loc):
-    parts = path.split(os.sep)
+    parts = os.path.normpath(path).split(os.sep)
     for x in parts:
         if x.startswith("models--"): return x[8:].replace("--", "/")
     return os.path.relpath(os.path.dirname(path), loc["path"]) if loc["kind"] != "file" else os.path.dirname(path)
@@ -252,31 +260,102 @@ def hardware():
     except Exception:
         pass
     try:
-        mi = {}
-        for line in open("/proc/meminfo"):
-            k, v = line.split(":", 1); mi[k] = int(v.strip().split()[0])
-        hw["ram_total_gb"] = round(mi.get("MemTotal", 0) / 1048576, 1)
-        hw["ram_available_gb"] = round(mi.get("MemAvailable", 0) / 1048576, 1)
+        if os.name == "nt":
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                hw["ram_total_gb"] = round(ms.ullTotalPhys / (1024 ** 3), 1)
+                hw["ram_available_gb"] = round(ms.ullAvailPhys / (1024 ** 3), 1)
+        else:
+            mi = {}
+            for line in open("/proc/meminfo"):
+                k, v = line.split(":", 1); mi[k] = int(v.strip().split()[0])
+            hw["ram_total_gb"] = round(mi.get("MemTotal", 0) / 1048576, 1)
+            hw["ram_available_gb"] = round(mi.get("MemAvailable", 0) / 1048576, 1)
     except Exception:
         pass
     try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("model name"): hw["cpu"] = line.split(":", 1)[1].strip(); break
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                 "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            if out.isdigit(): hw["cpu_cores"] = int(out)
+            hw["cpu"] = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                 "(Get-CimInstance Win32_Processor)[0].Name"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        else:
+            for line in open("/proc/cpuinfo"):
+                if line.startswith("model name"): hw["cpu"] = line.split(":", 1)[1].strip(); break
     except Exception:
         pass
     # Physical cores: the thread count the CPU experts want (see the threads field).
-    try:
-        cores = set()
-        for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
-            pkg = p.replace("core_id", "physical_package_id")
-            cores.add((open(pkg).read().strip() if os.path.exists(pkg) else "0", open(p).read().strip()))
-        hw["cpu_cores"] = len(cores) or hw["cpu_threads"]
-    except Exception:
-        hw["cpu_cores"] = hw["cpu_threads"]
+    if os.name == "nt":
+        # Taken above through Win32_Processor; keep the thread fallback.
+        if not hw.get("cpu_cores"): hw["cpu_cores"] = hw["cpu_threads"]
+    else:
+        try:
+            cores = set()
+            for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
+                pkg = p.replace("core_id", "physical_package_id")
+                cores.add((open(pkg).read().strip() if os.path.exists(pkg) else "0", open(p).read().strip()))
+            hw["cpu_cores"] = len(cores) or hw["cpu_threads"]
+        except Exception:
+            hw["cpu_cores"] = hw["cpu_threads"]
     hw["smt"] = hw["cpu_threads"] > hw["cpu_cores"]
     return hw
 
+def parse_pcie(text):
+    """nvidia-smi's pcie.link.gen.current, .gen.max, .width.current, .width.max (csv, no units), first
+    GPU: {"gen", "gen_max", "width", "width_max"}, the maxima being what this GPU and this slot can
+    do together; None when the line does not parse."""
+    try:
+        v = [int(x) for x in text.strip().splitlines()[0].split(",")]
+        return dict(zip(("gen", "gen_max", "width", "width_max"), v)) if len(v) == 4 else None
+    except Exception:
+        return None
+
+def pcie_link():
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+        return parse_pcie(out)
+    except Exception:
+        return None
+
+def link_note(seen):
+    """A note when the link never reached the generation or width the GPU and slot can do while the
+    tune loaded it. At idle a healthy link drops to Gen1 to save power, so only the best it reached
+    under load counts. One reporter's link trained down to Gen1 under load and stayed there (issue #6):
+    prefill 241 -> 643 tok/s and decode 8.1 -> 15.6 once the BIOS set the slot to Gen4."""
+    if not seen or (seen["gen"] >= seen["gen_max"] and seen["width"] >= seen["width_max"]): return None
+    return ("the GPU's PCIe link reached only Gen%d x%d while the tune loaded it, against Gen%d x%d that this GPU and slot can do: every expert "
+            "the RAM tier serves crosses that link. A link that trains down under load is usually fixed in the BIOS, by setting the slot's "
+            "PCIe generation from Auto to the GPU's" % (seen["gen"], seen["width"], seen["gen_max"], seen["width_max"]))
+
 def mem_available_gb():
+    if os.name == "nt":
+        try:
+            # GlobalMemoryStatusEx through ctypes: the same number the engine's
+            # clamp_to_available reads (ullAvailPhys).
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return ms.ullAvailPhys / (1024 ** 3)
+        except Exception:
+            pass
+        return 0.0
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"): return int(line.split()[1]) / 1048576
@@ -285,9 +364,40 @@ def mem_available_gb():
     return 0.0
 
 def drive_info(path):
-    """The block device under a path (through /proc/self/mountinfo, since btrfs hides the
-    device behind an anonymous st_dev), its model and whether it spins."""
+    """The block device under a path: its model and whether it spins.
+    Linux reads /proc/self/mountinfo and /sys/class/block (btrfs hides the
+    device behind an anonymous st_dev); Windows asks each disk drive for its
+    model and SSD/rotation through the PowerShell storage cmdlets."""
     info = {"mount": "/", "device": None, "disk": None, "model": None, "rotational": None, "fstype": None}
+    if os.name == "nt":
+        try:
+            drive = os.path.splitdrive(os.path.abspath(path))[0] or "C:"
+            info["mount"] = drive + "\\"
+            fs = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-Volume -DriveLetter %s).FileSystemType" % drive.rstrip(":")],
+                capture_output=True, text=True, timeout=10).stdout.strip()
+            if fs: info["fstype"] = fs
+            num = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Partition -DriveLetter %s | Select-Object -ExpandProperty DiskNumber" % drive.rstrip(":")],
+                capture_output=True, text=True, timeout=10).stdout.strip()
+            if num.isdigit():
+                # DiskNumber maps to Get-Disk's Number (DeviceId in Get-PhysicalDisk
+                # is a different counter on some systems).
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Disk -Number %s | Select-Object Model,BusType | ConvertTo-Json -Compress" % num],
+                    capture_output=True, text=True, timeout=10).stdout
+                d = json.loads(out) if out.strip() else {}
+                if isinstance(d, list): d = d[0] if d else {}
+                if d.get("Model"):
+                    info["model"] = d["Model"].strip()
+                    info["disk"] = info["model"]
+                    info["rotational"] = (d.get("BusType") or "") == "ATA"   # SATA spinning disks report ATA; NVMe/USB report otherwise
+        except Exception:
+            pass
+        return info
     try:
         best = ("", None, None)
         for line in open("/proc/self/mountinfo"):
@@ -313,22 +423,79 @@ def drive_info(path):
     return info
 
 def probe_nvme(path, seconds=2.0, nth=8, bs=2 << 20):
-    """Random O_DIRECT reads of the model file at the size and depth the engine's expert
-    reads have (2 MiB blocks, 8 in flight): GB/s. The rate the cost model prices a miss at."""
+    """Random unbuffered reads of the model file at the size and depth the engine's
+    expert reads have (2 MiB blocks, 8 in flight): GB/s. The rate the cost model
+    prices a miss at. Linux: O_DIRECT+preadv; Windows: FILE_FLAG_NO_BUFFERING+
+    overlapped ReadFile through ctypes -- the same slice-shaped, cache-bypassing
+    reads the engine itself issues on each platform."""
     sz = os.path.getsize(path)
     if sz < bs * 64: return None
     tot = [0] * nth; err = [None] * nth
     deadline = time.time() + seconds
-    def w(i):
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-            buf = mmap.mmap(-1, bs)   # page-aligned, required by O_DIRECT
-            rng = random.Random(1000 + i); n = 0
-            while time.time() < deadline:
-                n += os.preadv(fd, [buf], rng.randrange(0, (sz - bs) // 4096) * 4096)
-            tot[i] = n; os.close(fd)
-        except Exception as e:
-            err[i] = repr(e)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        # use_last_error: ctypes must capture the thread's last error at the
+        # ReadFile call itself -- any intervening Python/WinAPI call (what the
+        # plain windll GetLastError() would see) has already overwritten it.
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        GENERIC_READ = 0x80000000; FILE_SHARE_READ = 1; OPEN_EXISTING = 3
+        FILE_FLAG_NO_BUFFERING = 0x20000000; FILE_FLAG_OVERLAPPED = 0x40000000
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        k32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.GetOverlappedResult.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # OVERLAPPED on x64: Internal/InternalHigh are ULONG_PTR (8 bytes);
+        # c_ulong would be 4 and hand ReadFile a malformed struct (error 87).
+        class OV(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_ulonglong), ("InternalHigh", ctypes.c_ulonglong),
+                        ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                        ("hEvent", ctypes.c_void_p)]
+        assert ctypes.sizeof(OV) == 32, "OVERLAPPED layout must match the x64 ABI"
+        def w(i):
+            try:
+                h = k32.CreateFileW(os.path.abspath(path), GENERIC_READ, FILE_SHARE_READ,
+                                    None, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, None)
+                if not h or h == ctypes.c_void_p(-1).value:
+                    err[i] = "CreateFileW failed"; return
+                ev = k32.CreateEventW(None, True, False, None)
+                # FILE_FLAG_NO_BUFFERING needs a sector-aligned buffer address;
+                # malloc (what create_string_buffer uses) only promises 16 B.
+                # Allocate with slack and round up to the next 4096 boundary.
+                raw = ctypes.create_string_buffer(bs + 4096)
+                base = (ctypes.addressof(raw) + 4095) & ~4095
+                buf = (ctypes.c_char * bs).from_buffer(raw, base - ctypes.addressof(raw))
+                rng = random.Random(1000 + i); n = 0
+                while time.time() < deadline:
+                    off = rng.randrange(0, (sz - bs) // 4096) * 4096
+                    ov = OV(0, 0, off & 0xFFFFFFFF, off >> 32, ev)
+                    got = wintypes.DWORD(0)
+                    ok = k32.ReadFile(h, buf, bs, ctypes.byref(got), ctypes.byref(ov))
+                    if not ok and ctypes.get_last_error() == 997:   # ERROR_IO_PENDING
+                        if not k32.GetOverlappedResult(h, ctypes.byref(ov), ctypes.byref(got), True):
+                            err[i] = "ReadFile failed"; break
+                    elif not ok:
+                        err[i] = "ReadFile error %d" % ctypes.get_last_error(); break
+                    n += got.value
+                tot[i] = n
+                k32.CloseHandle(h); k32.CloseHandle(ev)
+            except Exception as e:
+                err[i] = repr(e)
+    else:
+        def w(i):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+                buf = mmap.mmap(-1, bs)   # page-aligned, required by O_DIRECT
+                rng = random.Random(1000 + i); n = 0
+                while time.time() < deadline:
+                    n += os.preadv(fd, [buf], rng.randrange(0, (sz - bs) // 4096) * 4096)
+                tot[i] = n; os.close(fd)
+            except Exception as e:
+                err[i] = repr(e)
     ts = [threading.Thread(target=w, args=(i,)) for i in range(nth)]
     t0 = time.time()
     for t in ts: t.start()
@@ -625,11 +792,25 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
 _ENGINES = {"t": 0.0, "v": []}
 def engines_running(max_age=0.0):
     if max_age and time.time() - _ENGINES["t"] < max_age: return _ENGINES["v"]
+    procs = []
     try:
-        out = subprocess.run(["pgrep", "-a", "-x", "qwfn-server"], capture_output=True, text=True, timeout=3).stdout
-        procs = [l for l in out.splitlines() if l.strip()]
-        out2 = subprocess.run(["pgrep", "-l", "qwfn-gen"], capture_output=True, text=True, timeout=3).stdout
-        procs += [l for l in out2.splitlines() if l.strip()]
+        if os.name == "nt":
+            # Windows: qwfn-server.exe / qwfn-gen.exe via tasklist (no pgrep).
+            # Emitted as "<pid> <name>" -- the same shape pgrep -l gives on Linux,
+            # which is what stop_server parses (l.split()[0]).
+            for name in ("qwfn-server.exe", "qwfn-gen.exe"):
+                out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + name, "/FO", "CSV", "/NH"],
+                                     capture_output=True, text=True, timeout=3).stdout
+                for l in out.splitlines():
+                    if name in l:
+                        f = [x for x in l.replace('"', "").split(",") if x]
+                        if len(f) >= 2:
+                            procs.append("%s %s" % (f[1], f[0]))   # pid first, like pgrep -l
+        else:
+            out = subprocess.run(["pgrep", "-a", "-x", "qwfn-server"], capture_output=True, text=True, timeout=3).stdout
+            procs = [l for l in out.splitlines() if l.strip()]
+            out2 = subprocess.run(["pgrep", "-l", "qwfn-gen"], capture_output=True, text=True, timeout=3).stdout
+            procs += [l for l in out2.splitlines() if l.strip()]
     except Exception:
         procs = []
     _ENGINES.update(t=time.time(), v=procs)
@@ -698,10 +879,22 @@ def start_server(model, s):
             log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
         log.flush()
         # The bundle keeps ggml, the CUDA and C++ runtimes and liburing next to the engine; the
-        # loader needs the directory for the libraries the CUDA backend dlopens.
+        # loader needs that directory on its search path (LD_LIBRARY_PATH on Linux, PATH on
+        # Windows, where the CUDA backend LoadLibrary's its DLLs). A source checkout instead
+        # uses the engine's own backend dir (~/.unsloth/llama.cpp/build/bin, the same place
+        # qwfn::llama_backend_dir() looks) or an explicit QWFN_BACKENDS.
         env = dict(os.environ); bindir = os.path.dirname(SERVER_BIN)
-        if os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
-            env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        lib_name = "libggml-base.so.0" if os.name != "nt" else "ggml-base.dll"
+        cands = [bindir]
+        if os.name == "nt":
+            cands.append(os.path.join(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "", ".unsloth", "llama.cpp", "build", "bin"))
+            if os.environ.get("QWFN_BACKENDS"): cands.append(os.environ["QWFN_BACKENDS"])
+        libdir = next((d for d in cands if d and os.path.exists(os.path.join(d, lib_name))), None)
+        if libdir:
+            if os.name == "nt":
+                env["PATH"] = libdir + os.pathsep + env.get("PATH", "")
+            else:
+                env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         try:
             proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
         except Exception as e:
@@ -739,11 +932,18 @@ def log_tail(n=60):
         return []
 
 def log_tiers():
-    """What the engine actually built, from its log: the VRAM and RAM expert tiers."""
+    """What the engine actually built, from its log: the VRAM and RAM expert tiers.
+    When the engine has no device memory for a VRAM tier it says "VRAM tier disabled" and prints
+    no "expert VRAM tier:" line at all; that absence is a zero tier, not the planned one (read as
+    the plan, a 12 GB card was reported at 17.3 tok/s predicted against 2.5 measured)."""
     out = {}
     for l in log_tail(400):
-        if "expert VRAM tier:" in l:
-            try: out["vram_tier_gb"] = float(l.split("expert VRAM tier:")[1].split("GB")[0]); out["vram_tier_blocks"] = int(l.split("GB,")[1].split("blocks")[0])
+        if "VRAM tier disabled" in l:
+            out["vram_tier_gb"] = 0.0; out["vram_tier_blocks"] = 0; out["vram_tier_disabled"] = True
+        elif "expert VRAM tier:" in l:
+            try:
+                out["vram_tier_gb"] = float(l.split("expert VRAM tier:")[1].split("GB")[0]); out["vram_tier_blocks"] = int(l.split("GB,")[1].split("blocks")[0])
+                out.pop("vram_tier_disabled", None)
             except Exception: pass
         if "expert RAM tier:" in l:
             try: out["ram_tier_gb"] = float(l.split("expert RAM tier:")[1].split("GB")[0])
@@ -790,9 +990,11 @@ def status():
 def set_threads(n):
     port = STATE["port"]
     r = fetch_json(f"http://127.0.0.1:{port}/props", 5.0, {"threads": int(n)})
-    if r and r.get("n_threads") == int(n):
-        if STATE["settings"]: STATE["settings"]["threads"] = int(n)
-        return {"ok": True, "threads": int(n)}
+    got = r.get("n_threads") if r else None
+    # the engine takes at most as many threads as there are CPUs
+    if isinstance(got, int) and 1 <= got <= int(n):
+        if STATE["settings"]: STATE["settings"]["threads"] = got
+        return {"ok": True, "threads": got}
     return {"error": "the server did not take the thread count (is a request running?)"}
 
 # ---- measurements through the server (the self-test and the tune share them) ----
@@ -960,10 +1162,16 @@ def run_tune(model, preset, settings_in):
     def check_cancel():
         if T["cancel"]: raise RuntimeError("cancelled")
     result = {"model": model["name"], "preset": preset, "date": time.strftime("%Y-%m-%d %H:%M"), "notes": []}
-    mem_watch = {"min": 1e9, "stop": False}
+    mem_watch = {"min": 1e9, "stop": False, "link": None, "link_t": 0.0}
     def watch():
+        # memory every half second; the GPU's PCIe link every 3 s, keeping the best it reached
         while not mem_watch["stop"]:
-            mem_watch["min"] = min(mem_watch["min"], mem_available_gb()); time.sleep(0.5)
+            mem_watch["min"] = min(mem_watch["min"], mem_available_gb())
+            if time.time() - mem_watch["link_t"] >= 3.0:
+                mem_watch["link_t"] = time.time()
+                lk, best = pcie_link(), mem_watch["link"]
+                if lk: mem_watch["link"] = lk if not best else {**lk, "gen": max(lk["gen"], best["gen"]), "width": max(lk["width"], best["width"])}
+            time.sleep(0.5)
     watcher = None
     try:
         # 0. a running server goes first: the drive is probed idle and the memory the plan
@@ -1017,6 +1225,8 @@ def run_tune(model, preset, settings_in):
         if r.get("note"): result["notes"].append(r["note"])
         st = wait_ready(log); port = st["port"]
         built = log_tiers(); result["built"] = built
+        if built.get("vram_tier_disabled"):
+            result["notes"].append("the engine could not build a VRAM expert tier (no device memory): every expert the RAM tier does not hold is computed on the CPU, and the speed estimate for this plan does not apply")
         if built.get("vram_tier_gb") is not None:
             log("engine built a %.1f GB VRAM expert tier (planned %.1f) and a %.1f GB RAM tier (planned %d)" % (built["vram_tier_gb"], plan["estimates"]["vram_tier_gb"], built.get("ram_tier_gb", 0), plan["ram"]), 0.3)
             if plan["estimates"]["vram_tier_gb"] > 0 and built["vram_tier_gb"] < plan["estimates"]["vram_tier_gb"] - 1.0:
@@ -1071,14 +1281,22 @@ def run_tune(model, preset, settings_in):
             result["threads"] = plan["threads"]; log("thread sweep skipped: %d CPU threads" % hw.get("cpu_threads"), 0.92)
         stats = fetch_json(f"http://127.0.0.1:{port}/stats", 3.0) or {}
         c = stats.get("expert_cache") or {}
+        # With no VRAM tier built the estimate describes a run that did not happen: no prediction.
+        no_tier = bool(built.get("vram_tier_disabled"))
+        pred_chat = None if no_tier else plan["estimates"]["decode_tps_short"]
+        pred_doc = None if no_tier else plan["estimates"]["decode_tps_long_doc"]
         result["verify"] = {"chat_tps": chat["tok_s"], "chat_n": chat["n"], "doc_tps": doc["tok_s"], "doc_prefill_tps": doc["prefill_tok_s"], "doc_tokens": doc["tokens"], "doc_prefill_s": doc["prefill_s"],
                             "found": doc["found"], "hit": round(c.get("hit_rate", 0), 3), "vram_served": round(c.get("vram_served", 0), 3),
-                            "predicted_chat": plan["estimates"]["decode_tps_short"], "predicted_doc": plan["estimates"]["decode_tps_long_doc"]}
-        log("chat %.1f tok/s (predicted %.1f) · document prefill %.0f tok/s, decode %.1f tok/s (predicted %.1f) · passphrase %s" % (chat["tok_s"], plan["estimates"]["decode_tps_short"], doc["prefill_tok_s"], doc["tok_s"], plan["estimates"]["decode_tps_long_doc"], "found" if doc["found"] else "NOT found"), 0.96)
+                            "predicted_chat": pred_chat, "predicted_doc": pred_doc}
+        pfmt = lambda v: "n/a, no VRAM tier" if v is None else "%.1f" % v
+        log("chat %.1f tok/s (predicted %s) · document prefill %.0f tok/s, decode %.1f tok/s (predicted %s) · passphrase %s" % (chat["tok_s"], pfmt(pred_chat), doc["prefill_tok_s"], doc["tok_s"], pfmt(pred_doc), "found" if doc["found"] else "NOT found"), 0.96)
         if not doc["found"]: result["notes"].append("the answer did not quote the passphrase planted in the document: check the Log tab; a smaller context or the Q4 file may read better")
         # 6. memory: what the server needs besides the tier, measured; then the tier that
         #    leaves the headroom, and a restart with it when that is a different size
         mem_watch["stop"] = True; time.sleep(0.6)
+        if mem_watch["link"]:
+            result["pcie"] = mem_watch["link"]; note = link_note(mem_watch["link"])
+            if note: result["notes"].append(note); log("PCIe link: Gen%d x%d at best under load, of Gen%d x%d" % (mem_watch["link"]["gen"], mem_watch["link"]["width"], mem_watch["link"]["gen_max"], mem_watch["link"]["width_max"]))
         mn = mem_watch["min"]; result["mem_min_gb"] = round(mn, 1)
         built_ram = float(built.get("ram_tier_gb") or plan["ram"])
         host_other = max(2.0, result["avail_gb"] - mn - built_ram)

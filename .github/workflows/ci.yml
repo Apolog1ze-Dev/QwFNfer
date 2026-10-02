@@ -1,0 +1,163 @@
+# Build and test on Linux and Windows, for every push to master and every pull request.
+#
+# No GPU on the runners, so this is what can be checked without one: the engine and every tool
+# build against the pinned llama.cpp (CPU backend only, cached), qwfn-io-test runs the read engine
+# on the platform's own filesystem (O_DIRECT and io_uring on Linux, FILE_FLAG_NO_BUFFERING on
+# NTFS on Windows), qwfn-inspect and qwfn-iobench read a synthetic qwen4exp GGUF, the server
+# starts, and the console serves its API over a model cache holding that file -- on Windows that
+# runs the console's Windows code (GlobalMemoryStatusEx, Win32_Processor, tasklist).
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  LLAMA_SHA: ca1426903fabe9af26cd10c42034cb4bbd2e0e11   # Unsloth's llama.cpp, mtp/qwen4exp-nextn (README, "Building from source")
+  LLAMA_CPU_FLAGS: >-
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF
+    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Toolchain and liburing
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build liburing-dev
+      - name: llama.cpp source
+        run: |
+          git init -q "$HOME/llama.cpp"
+          git -C "$HOME/llama.cpp" fetch -q --depth 1 https://github.com/unslothai/llama.cpp "$LLAMA_SHA"
+          git -C "$HOME/llama.cpp" checkout -q FETCH_HEAD
+      - name: Cached llama.cpp CPU build
+        id: llama-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/llama-cpu/bin
+          key: ci-linux-llama-cpu-${{ env.LLAMA_SHA }}-v2
+      - name: llama.cpp CPU build
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S "$HOME/llama.cpp" -B "$HOME/llama-cpu" -G Ninja $LLAMA_CPU_FLAGS
+          cmake --build "$HOME/llama-cpu"
+      - uses: actions/cache/save@v5
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/llama-cpu/bin
+          key: ${{ steps.llama-cache.outputs.cache-primary-key }}
+      - name: Engine
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_ROOT="$HOME/llama.cpp" -DLLAMA_CPP_BUILD="$HOME/llama-cpu/bin"
+          cmake --build build
+      - name: io tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Synthetic model through the tools
+        run: |
+          python3 tools/make_synth_gguf.py synth.gguf
+          build/qwfn-inspect synth.gguf
+          build/qwfn-iobench synth.gguf --tokens 8 --ram 2
+          build/qwfn-iobench synth.gguf --tokens 8 --ram 1 | grep "less than 1 GB"   # a refused tier is reported, not a crash
+          { build/qwfn-server 2>&1 || true; } | grep -q "usage: qwfn-server"
+      - name: Tiny model, the engine against llama.cpp
+        run: |
+          # the tools look for the ggml backends where a source checkout keeps them
+          mkdir -p "$HOME/.unsloth/llama.cpp/build" && ln -sfn "$HOME/llama-cpu/bin" "$HOME/.unsloth/llama.cpp/build/bin"
+          python3 .github/scripts/tiny_model_check.py build "$RUNNER_TEMP"
+      - name: Console API over a model cache
+        run: |
+          python3 -m py_compile tools/qwfn_console.py tools/qwfn_router.py tools/make_synth_gguf.py
+          python3 .github/scripts/console_units.py
+          snap="$RUNNER_TEMP/hf/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/0000000/UD-Q4_K_XL"
+          mkdir -p "$snap" && cp synth.gguf "$snap/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00001.gguf"
+          HF_HUB_CACHE="$RUNNER_TEMP/hf" python3 tools/qwfn_console.py --port 18090 > console.log 2>&1 &
+          python3 .github/scripts/console_smoke.py 18090 || { cat console.log; exit 1; }
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/windows-msvc-env
+      - name: Ninja
+        run: choco install ninja -y --no-progress
+      - name: llama.cpp source
+        run: |
+          git init -q "$env:RUNNER_TEMP\llama.cpp"
+          git -C "$env:RUNNER_TEMP\llama.cpp" fetch -q --depth 1 https://github.com/unslothai/llama.cpp $env:LLAMA_SHA
+          git -C "$env:RUNNER_TEMP\llama.cpp" checkout -q FETCH_HEAD
+      - name: Cached llama.cpp CPU build
+        id: llama-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.temp }}\llama-cpu\bin
+            ${{ runner.temp }}\llama-cpu\ggml\src\*.lib
+            ${{ runner.temp }}\llama-cpu\src\*.lib
+          key: ci-windows-llama-cpu-${{ env.LLAMA_SHA }}-v2
+      - name: llama.cpp CPU build (MSVC)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          $flags = $env:LLAMA_CPU_FLAGS -split ' '
+          cmake -S "$env:RUNNER_TEMP\llama.cpp" -B "$env:RUNNER_TEMP\llama-cpu" -G Ninja @flags
+          if ($LASTEXITCODE) { exit 1 }
+          cmake --build "$env:RUNNER_TEMP\llama-cpu"
+          if ($LASTEXITCODE) { exit 1 }
+      - uses: actions/cache/save@v5
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ${{ runner.temp }}\llama-cpu\bin
+            ${{ runner.temp }}\llama-cpu\ggml\src\*.lib
+            ${{ runner.temp }}\llama-cpu\src\*.lib
+          key: ${{ steps.llama-cache.outputs.cache-primary-key }}
+      - name: Engine (MSVC)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DLLAMA_CPP_ROOT=$env:RUNNER_TEMP\llama.cpp" "-DLLAMA_CPP_BUILD=$env:RUNNER_TEMP\llama-cpu\bin"
+          if ($LASTEXITCODE) { exit 1 }
+          cmake --build build
+          if ($LASTEXITCODE) { exit 1 }
+      - name: io tests (unbuffered overlapped reads on NTFS)
+        run: |
+          ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Synthetic model through the tools
+        run: |
+          python tools\make_synth_gguf.py synth.gguf
+          if ($LASTEXITCODE) { exit 1 }
+          build\qwfn-inspect.exe synth.gguf
+          if ($LASTEXITCODE) { exit 1 }
+          build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 2
+          if ($LASTEXITCODE) { "qwfn-iobench exited with $LASTEXITCODE"; exit 1 }
+          $out = (cmd /c "build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 1 2>&1") -join "`n"
+          if ($LASTEXITCODE -or $out -notmatch 'less than 1 GB') { $out; "qwfn-iobench with a refused RAM tier exited with $LASTEXITCODE"; exit 1 }
+          $out = (cmd /c "build\qwfn-server.exe 2>&1") -join "`n"
+          if ($out -notmatch 'usage: qwfn-server') { $out; throw 'qwfn-server does not start (missing DLL?)' }
+          # the usage exits 1, and the runner's wrapper ends the step with `exit $LASTEXITCODE`
+          exit 0
+      - name: Tiny model, the engine against llama.cpp
+        # no ~/.unsloth tree here: the tools take the ggml backends staged next to them
+        run: |
+          python .github\scripts\tiny_model_check.py build $env:RUNNER_TEMP
+          if ($LASTEXITCODE) { exit 1 }
+      - name: Console API over a model cache
+        run: |
+          python -m py_compile tools\qwfn_console.py tools\qwfn_router.py tools\make_synth_gguf.py
+          if ($LASTEXITCODE) { exit 1 }
+          python .github\scripts\console_units.py
+          if ($LASTEXITCODE) { exit 1 }
+          $snap = "$env:RUNNER_TEMP\hf\models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots\0000000\UD-Q4_K_XL"
+          New-Item -ItemType Directory -Force $snap | Out-Null
+          Copy-Item synth.gguf "$snap\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00001.gguf"
+          $env:HF_HUB_CACHE = "$env:RUNNER_TEMP\hf"
+          $console = Start-Process python -ArgumentList 'tools\qwfn_console.py', '--port', '18090' -PassThru -NoNewWindow -RedirectStandardOutput console.log -RedirectStandardError console.err
+          python .github\scripts\console_smoke.py 18090
+          $rc = $LASTEXITCODE
+          Stop-Process -Id $console.Id -Force -ErrorAction SilentlyContinue
+          if ($rc) { Get-Content console.log, console.err; exit 1 }

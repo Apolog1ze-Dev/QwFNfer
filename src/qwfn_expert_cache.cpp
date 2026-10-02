@@ -15,6 +15,26 @@ inline uint64_t xorshift(uint64_t & s) {
     s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s;
 }
 constexpr uint16_t SLOT_EMPTY = 0xFFFF;
+
+// Every VRAM tier allocation goes through here. The sizing below backs off until an
+// allocation fits, and lend_end() takes the dynamic part back after a prefill only if it
+// fits: both read a failed allocation as "the device is full". On Windows the NVIDIA
+// driver's default CUDA sysmem fallback policy does not fail it -- an allocation past the
+// free VRAM is placed in shared system memory, and every expert in it is then read by the
+// GPU across PCIe, a tier slower than the RAM tier it was meant to beat, with nothing in
+// the log. So on Windows an allocation the device's free memory cannot hold is refused
+// here, and the back-off behaves as it does on Linux. The slack covers the driver's
+// allocation granularity.
+ggml_backend_buffer_t alloc_vram(ggml_backend_buffer_type_t buft, size_t bytes) {
+#ifdef _WIN32
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total && bytes + (64ull << 20) > free) return nullptr;
+    }
+#endif
+    return ggml_backend_buft_alloc_buffer(buft, bytes);
+}
 } // namespace
 
 bool expert_cache::init(const model_index * hot, const model_index * cold,
@@ -204,7 +224,7 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
         }
         ggml_backend_buffer_t fit = nullptr;
         while (want > std::max<size_t>(256ull << 20, lend + (1ull << 20)) &&
-               !(fit = ggml_backend_buft_alloc_buffer(cfg.vram_buft, want + cfg.vram_reserve))) {
+               !(fit = alloc_vram(cfg.vram_buft, want + cfg.vram_reserve))) {
             want = 1ull << 20;
             for (uint32_t il = 0; il < n_layer; il++) {
                 gslots[il] = (uint32_t) std::max<size_t>(1, (size_t) (gslots[il] * 0.96));
@@ -232,12 +252,12 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
             for (uint32_t il = 0; il < K; il++)       perm_bytes += lbytes[il];
             for (uint32_t il = K; il < n_layer; il++) ext_bytes  += lbytes[il];
             if (ext_bytes) ext_bytes += 1ull << 20;
-            vram_buf_ = ggml_backend_buft_alloc_buffer(cfg.vram_buft, perm_bytes);
+            vram_buf_ = alloc_vram(cfg.vram_buft, perm_bytes);
             if (vram_buf_ && ext_bytes) {
-                vram_extra_ = ggml_backend_buft_alloc_buffer(cfg.vram_buft, ext_bytes);
+                vram_extra_ = alloc_vram(cfg.vram_buft, ext_bytes);
                 if (!vram_extra_) {   // no split possible: everything permanent, nothing dynamic
                     ggml_backend_buffer_free(vram_buf_);
-                    vram_buf_ = ggml_backend_buft_alloc_buffer(cfg.vram_buft, perm_bytes + ext_bytes);
+                    vram_buf_ = alloc_vram(cfg.vram_buft, perm_bytes + ext_bytes);
                     K = n_layer; ext_bytes = 0;
                 }
             }
@@ -1055,7 +1075,7 @@ void expert_cache::lend_end() {
     // many ubatches); halve everything so the generation that follows can
     // displace them as its own routing settles.
     for (layer_pool & lp : blk_) for (auto & f : lp.ef) f >>= 1;
-    vram_extra_ = ggml_backend_buft_alloc_buffer(cfg_.vram_buft, extra_bytes_);
+    vram_extra_ = alloc_vram(cfg_.vram_buft, extra_bytes_);
     if (!vram_extra_) {
         static bool warned = false;
         if (!warned) { warned = true; fprintf(stderr, "[qwfn] could not take the dynamic VRAM tier back after the prefill; those layers stay CPU-served until the next one\n"); }

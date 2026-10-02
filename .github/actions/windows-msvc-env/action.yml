@@ -1,0 +1,20 @@
+# The x64 MSVC developer environment (what "x64 Native Tools Command Prompt" sets: cl, link,
+# dumpbin, the Windows SDK, VCToolsRedistDir) for every later step of the job.
+name: Windows - MSVC environment
+description: Exports vcvars64's environment to the rest of the job
+runs:
+  using: composite
+  steps:
+    - name: vcvars64
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if (-not $vs) { throw 'no Visual Studio with the x64 C++ tools on this runner' }
+        $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+        if ($LASTEXITCODE) { throw 'vcvars64.bat failed' }
+        foreach ($line in $vars) {
+          if ($line -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+        }
+        Write-Host "MSVC environment from $vs"
