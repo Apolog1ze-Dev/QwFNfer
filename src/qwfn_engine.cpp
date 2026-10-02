@@ -913,8 +913,18 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
         }
-        // Row i: 0 for whole blocks before the tail, 1e9 from the tail block on
-        // (still whole), -inf for blocks past n_bid; the dead block gets 1e9.
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
+        }
+        // Row i (query q): 0 for whole blocks before the tail, 1e9 for the block holding q
+        // (whole or the dead one), -1e9 for blocks wholly after q, -inf for blocks past
+        // n_bid. A block after q must not be forced: in a prefill chunk it would take one
+        // of the selection's slots from a past block, and the causal mask empties it.
         for (int64_t i = 0; i < Tc; i++) {
             float * row = bi.data() + i * n_blocks;
             const int64_t q = n_past_c + i;
@@ -923,6 +933,8 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
             std::fill(row + tail_b, row + n_bid, 1e9f);
             std::fill(row + n_bid, row + n_blocks, -INFINITY);
             if (have_dead) row[dead] = 1e9f;
+            for (int64_t b = tail_b; b < n_blocks; b++)
+                if (row[b] > 0.0f && b * (int64_t) ratio > q) row[b] = -1e9f;
         }
         ggml_backend_tensor_set(ai.qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
         ggml_backend_tensor_set(ai.qsa.blk_cells, bc.data(), 0, bc.size() * 4);
@@ -1707,6 +1719,14 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
         }
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
+        }
         for (int64_t i = 0; i < T; i++) {
             const int64_t q = n_past + i;
             const int64_t tail = ((q + 1) / ratio) * ratio;   // the ragged tail stays visible
@@ -1714,6 +1734,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 bi[i * n_blocks + b] = (b >= n_bid) ? -INFINITY
                                      : (b * (int64_t) ratio >= tail ? 1e9f : 0.0f);
             if (have_dead) bi[i * n_blocks + dead] = 1e9f;
+            // blocks wholly after q are not forced (see build_attn_inputs)
+            for (int64_t b = tail / ratio; b < n_blocks; b++)
+                if (bi[i * n_blocks + b] > 0.0f && b * (int64_t) ratio > q) bi[i * n_blocks + b] = -1e9f;
         }
         ggml_backend_tensor_set(qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
         ggml_backend_tensor_set(qsa.blk_cells, bc.data(), 0, bc.size() * 4);
