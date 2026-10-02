@@ -1182,9 +1182,10 @@ int main(int argc, char ** argv) {
 
     // The prefix the engine can continue from: everything it holds, when the
     // prompt strictly extends it (images included: the pads match any image of
-    // the same size, so each one's embedding is compared by hash); else 0.
+    // the same size, so each one's embedding is compared by hash); else 0. A prompt
+    // equal to it has no tail to produce logits from, so it re-prefills.
     auto prefix_reuse = [&](const server::prompt & P) -> int32_t {
-        if (S.consumed.empty() || P.tok.size() < S.consumed.size() ||
+        if (S.consumed.empty() || P.tok.size() <= S.consumed.size() ||
             !std::equal(S.consumed.begin(), S.consumed.end(), P.tok.begin())) return 0;
         for (const auto & sp : P.splices)
             if (sp.first < (int32_t) S.consumed.size()) {
@@ -1217,14 +1218,32 @@ int main(int argc, char ** argv) {
               + " tokens exceeds the " + std::to_string(S.n_ctx) + " token context";
             return false;
         }
+        // From here on this call mutates the engine's sequence state. A failure
+        // after this point can leave it inconsistent: the layer graphs advance the
+        // DeltaNet scan as they run, while n_past_ is only bumped once the whole
+        // eval succeeds, so a mid-eval error (a short expert read, say) leaves some
+        // layers ahead of the token count. KV and the indexer survive that -- they
+        // are positional and get overwritten -- but a scan cannot be rewound, so the
+        // next request must not continue from it.
+        bool state_dirty = false;
+        struct dirty_guard {
+            server & st; const bool & dirty; bool ok = false;
+            ~dirty_guard() {
+                if (ok || !dirty) return;
+                st.last_msgs = json(); st.consumed.clear(); st.consumed_img.clear();
+                st.eng.reset(); st.eng.clear_embeddings();
+            }
+        } dg{S, state_dirty};
         for (const auto & sp : P.splices) {
             if (sp.first < (int32_t) S.consumed.size()) continue;   // already evaluated (and verified above)
+            state_dirty = true;
             S.eng.set_embeddings(sp.first, sp.second.data(),
                                  (int32_t) (sp.second.size() / 2560));
             S.consumed_img[sp.first] = hash_bytes(sp.second.data(), sp.second.size() * sizeof(float));
         }
 
         std::vector<int32_t> hist = P.tok;
+        if ((int32_t) P.tok.size() > (int32_t) S.consumed.size()) state_dirty = true;   // a tail will be fed
         int32_t fed = (int32_t) S.consumed.size();
         const int32_t fed0 = fed;
         R.n_input  = (int32_t) hist.size();
@@ -1459,6 +1478,7 @@ int main(int argc, char ** argv) {
         // Close the turn so the next request can continue from here. The sampled
         // end-of-turn token was appended but never evaluated, so the engine's
         // n_past -- not hist.size() -- is what it has actually consumed.
+        dg.ok = true;   // finished cleanly: the state describes exactly S.consumed
         S.consumed.assign(hist.begin(), hist.begin() + S.eng.n_past());
         S.last_gen.assign(hist.begin() + P.tok.size(), hist.end());
         // Generation stops before <|im_end|>\n closes the turn; add it so a
@@ -1474,11 +1494,22 @@ int main(int argc, char ** argv) {
     // ---- HTTP ---------------------------------------------------------------
     httplib::Server svr;
     svr.set_payload_max_length(256ull << 20);   // base64 images are bulky
+    // SO_REUSEADDR, as llama-server sets, instead of httplib's default SO_REUSEPORT. A
+    // supervisor may reuse one child port across servers: connections the previous
+    // server closed stay in TIME_WAIT on it for up to 60 s, and Linux lets a new bind through
+    // only when both sockets carry the same option. With REUSEPORT only, switching between
+    // this server and llama-server or vLLM failed with "address in use" in both directions
+    // until TIME_WAIT expired. REUSEPORT would also let a stale instance share the port.
+    svr.set_socket_options([](socket_t sock) { httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1); });
     // httplib's socket timeouts default to 5 s per write and per read. A client
     // UI that stops draining the stream for 5 s (rendering a long reasoning
     // trace) would get the connection cut without a trailer and without a log
     // line here -- "peer closed connection without sending complete message
     // body" on its side. A local server can afford to wait.
+    // prime the unwinder: glibc's first backtrace() dlopens libgcc_s, taking the loader and malloc locks.
+    // Done first inside the stall probe's handler, it deadlocked a generation thread interrupted inside
+    // malloc (a long first-request JIT compile) for good. Loaded here, while nothing is interrupted.
+    { void * f[2]; (void) backtrace(f, 2); }
     signal(SIGSEGV, on_fatal); signal(SIGABRT, on_fatal); signal(SIGBUS, on_fatal); signal(SIGFPE, on_fatal);
     signal(SIGUSR2, on_stall_probe);
     // A local web page (the console, a harness) may read /stats and /props
@@ -1487,21 +1518,33 @@ int main(int argc, char ** argv) {
                              {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
     svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) { res.status = 204; });
     svr.set_write_timeout(3600, 0);
-    // Stall watchdog: a generation that produces no token for 30 s is logged
-    // with what the expert cache is waiting on, every 30 s until it moves.
+    // Stall watchdog: a request that makes no progress is logged with what the expert cache is
+    // waiting on, and the stuck thread prints its own stack. Progress is prefill layers AND generated
+    // tokens: the engine advances prompt_done after every layer of every chunk, so a long prefill that
+    // is moving is not a stall (it used to be reported every 30 s as "no new token ... at generated
+    // token 0"). Thresholds: 30 s while generating, 120 s while prefilling, because one layer of the
+    // first prefill after a load can spend ~60 s in kernel JIT.
     std::thread([&]() {
-        int last_n = -1; double stalled = 0;
+        double last_p = -1, stalled = 0;
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
-            bool busy; int n;
-            { std::lock_guard<std::mutex> lk(S.live.mu); busy = S.live.busy; n = S.live.n_prompt * 0 + S.live.n_gen; }
-            if (!busy) { last_n = -1; stalled = 0; continue; }
-            if (n != last_n) { last_n = n; stalled = 0; continue; }
+            bool busy, prefilling; int n; double done, input;
+            { std::lock_guard<std::mutex> lk(S.live.mu); busy = S.live.busy; prefilling = S.live.prefilling;
+              n = S.live.n_gen; done = S.live.prompt_done; input = (double) S.live.n_prompt; }
+            if (!busy) { last_p = -1; stalled = 0; continue; }
+            const double p = done + (double) n;
+            if (p != last_p) { last_p = p; stalled = 0; continue; }
             stalled += 5;
-            if (stalled >= 30 && ((int) stalled % 30) == 0) {
+            const double limit = prefilling ? 120 : 30;
+            if (stalled >= limit && ((int) stalled % 30) == 0) {
                 const int ws = S.eng.cache_wait_state();
-                fprintf(stderr, "[qwfn-server] STALL: no new token for %.0f s at generated token %d; expert cache waiting on %s (%zu reads)\n",
-                        stalled, n, ws == 1 ? "demand reads" : ws == 2 ? "speculative reads" : "nothing (compute or lock)", S.eng.cache_wait_count());
+                const char * what = ws == 1 ? "demand reads" : ws == 2 ? "speculative reads" : "nothing (compute or lock)";
+                if (prefilling)
+                    fprintf(stderr, "[qwfn-server] STALL: prefill has not advanced for %.0f s (at %.0f of %.0f prompt tokens); expert cache waiting on %s (%zu reads)\n",
+                            stalled, done, input, what, S.eng.cache_wait_count());
+                else
+                    fprintf(stderr, "[qwfn-server] STALL: no new token for %.0f s at generated token %d; expert cache waiting on %s (%zu reads)\n",
+                            stalled, n, what, S.eng.cache_wait_count());
                 if (g_gen_thread_set) pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
             }
         }

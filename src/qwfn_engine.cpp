@@ -99,6 +99,9 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 for (int q = 0; q < EXPERT_NPARTS; q++) {
                     const byte_range a = mi->expert_range(il, 0, (expert_part) q);
                     const byte_range b = mi->expert_range(il, 1, (expert_part) q);
+                    // The first slice's own offset counts too: a page-multiple stride off a
+                    // 32-byte GGUF tensor offset would make every in-place O_DIRECT read fail.
+                    if (a.valid() && (a.offset % QWFN_DIO_PAGE) != 0) return false;
                     if (a.valid() && b.valid() && ((b.offset - a.offset) % QWFN_DIO_PAGE) != 0) return false;
                 }
             return true;
