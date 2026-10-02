@@ -145,12 +145,17 @@ else()
   target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# Per-tool optimization flags, in the compiler's own syntax.
+# Per-tool optimization flags, in the compiler's own syntax: -O3 unless the tool asks
+# for -O2 (MSVC has /O2 only).
 function(qwfn_opts target)
+  set(level -O3)
+  if(ARGV1)
+    set(level ${ARGV1})
+  endif()
   if(MSVC)
     target_compile_options(${target} PRIVATE /O2 ${QWFN_ARCH_FLAGS} /permissive-)
   else()
-    target_compile_options(${target} PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+    target_compile_options(${target} PRIVATE ${level} ${QWFN_ARCH_FLAGS})
   endif()
 endfunction()
 
@@ -181,7 +186,7 @@ qwfn_opts(qwfn-logits)
 add_executable(qwfn-refdump tools/qwfn_refdump.cpp)
 target_include_directories(qwfn-refdump PRIVATE "${LLAMA_CPP_ROOT}/include" "${LLAMA_CPP_ROOT}/ggml/include" src)
 target_link_libraries(qwfn-refdump PRIVATE llama_ref ggml_base ggml_all)
-qwfn_opts(qwfn-refdump)
+qwfn_opts(qwfn-refdump -O2)
 
 add_executable(qwfn-run tools/qwfn_run.cpp)
 target_link_libraries(qwfn-run PRIVATE qwfn_core)
@@ -204,7 +209,7 @@ target_link_libraries(qwfn-server PRIVATE qwfn_core llama_ref)
 if(WIN32)
   target_link_libraries(qwfn-server PRIVATE ws2_32)   # httplib's sockets; MSVC links it by pragma, MinGW does not
 endif()
-qwfn_opts(qwfn-server)
+qwfn_opts(qwfn-server -O2)
 
 add_executable(qwfn-chat tools/qwfn_chat.cpp src/qwfn_vocab.cpp)
 target_include_directories(qwfn-chat PRIVATE "${LLAMA_CPP_ROOT}/include")
@@ -214,7 +219,7 @@ qwfn_opts(qwfn-chat)
 add_executable(qwfn-tok tools/qwfn_tok.cpp src/qwfn_vocab.cpp)
 target_include_directories(qwfn-tok PRIVATE "${LLAMA_CPP_ROOT}/include")
 target_link_libraries(qwfn-tok PRIVATE qwfn_core llama_ref)
-qwfn_opts(qwfn-tok)
+qwfn_opts(qwfn-tok -O2)
 
 add_executable(qwfn-gen tools/qwfn_gen.cpp)
 target_link_libraries(qwfn-gen PRIVATE qwfn_core)
