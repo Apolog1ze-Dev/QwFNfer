@@ -22,14 +22,7 @@
 
 #include "qwfn_platform.h"
 
-#ifdef _WIN32
-// On Windows the thread-pool backend (also the engine's Linux default) is
-// the only backend; the ring pointer below is unused and stays null.
-struct io_uring;   // never defined on this platform; the member exists only to
-                   // keep the class layout identical across platforms
-#else
-struct io_uring;
-#endif
+struct io_uring;   // never defined on Windows, where ring_ stays null
 
 namespace qwfn {
 
@@ -85,18 +78,15 @@ public:
     //             kernel-level parallelism; measured 5.30 GB/s on the same
     //             burst shape.
     //
-    // Windows runs the threads backend only, over unbuffered overlapped reads
-    // (FILE_FLAG_NO_BUFFERING): sector-aligned slice reads that bypass the
-    // cache manager, the documented Windows equivalent of O_DIRECT. Windows'
-    // own IoRing (io_uring's SQ/CQ design, Win11 21H2+) was considered and
-    // deliberately not used: it is Win11-only, its versioned op set is still
-    // maturing, and its win is syscall batching at thousands of in-flight
-    // ops -- not the engine's ~8-deep expert bursts, where per-read syscall
-    // count is 1 in both designs. Measured on this project's target NVMe
-    // (random 640 KiB-1 MiB slices, QD 4-64): thread pool + unbuffered reads
-    // 3.4-4.8 GB/s vs IoRing 1.3-1.9 GB/s -- the port is 2.5-3.6x faster.
-    // The submit/reap shape below is IoRing-like, so a future backend can
-    // slot in without touching this interface.
+    // Windows has the threads backend only, over unbuffered overlapped reads
+    // (FILE_FLAG_NO_BUFFERING, the documented equivalent of O_DIRECT): the same
+    // slice-sized reads with the same alignment contract. Windows' IoRing was
+    // measured against it on an NVMe (random 640 KiB-1 MiB slices, QD 1-64) and
+    // came out within 0-2.4%: from QD 8 the drive is the limit, so batching
+    // submissions has nothing left to win. Its non-blocking submit also fails
+    // with IORING_E_SUBMISSION_QUEUE_FULL unless the caller waits, which is the
+    // one shape the layer-ahead prefetch cannot use. Asking for `uring` on
+    // Windows gets `threads`.
     enum class backend { uring, threads };
 
     // queue_depth is the io_uring ring size / the worker count.
@@ -129,14 +119,15 @@ public:
 
 private:
     backend          be_ = backend::threads;
-    io_uring *       ring_ = nullptr;   // POSIX uring backend only; null on Windows
+    io_uring *       ring_ = nullptr;   // the uring backend only; always null on Windows
 
     // Tags of requests rejected at submit time (bad shard index, null
     // destination, zero length). Every caller here counts completions, not
     // requests, so a request that vanished silently left reap() waiting for a
     // CQE that could never arrive -- or, on the callers that retry a short
     // submit from the same index, resubmitting the same bad request for ever.
-    // A rejected request is therefore completed, as an error, like any other.
+    // A rejected request is therefore completed, as an error, like any other:
+    // here on the uring backend, straight into done_ on the threads backend.
     std::vector<uint64_t> rejected_;
 
     // --- thread-pool backend ---
@@ -148,7 +139,14 @@ private:
     std::condition_variable   cv_work_, cv_done_;
     bool                      stop_ = false;
     void worker_loop();
-    std::vector<int> fds_;
+public:
+#ifdef _WIN32
+    using file_t = void *;   // a HANDLE
+#else
+    using file_t = int;
+#endif
+private:
+    std::vector<file_t> fds_;
     bool             direct_ = true;
     bool             bounce_ = false;   // direct reads through a page-aligned per-worker buffer (512-byte slot layout)
     size_t           in_flight_ = 0;
@@ -169,7 +167,8 @@ void   dio_free(void * p);
 // Every arena sizing therefore goes through clamp_to_available().
 
 // MemAvailable from /proc/meminfo: the kernel's own estimate of what can be
-// handed out without swapping. Returns 0 if it cannot be read.
+// handed out without swapping (GlobalMemoryStatusEx's ullAvailPhys on Windows).
+// Returns 0 if it cannot be read.
 uint64_t mem_available_bytes();
 
 // Largest arena we are willing to take: `frac` of MemAvailable, minus a fixed

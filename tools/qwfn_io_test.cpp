@@ -25,8 +25,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <unistd.h>
@@ -120,10 +124,14 @@ static void exercise_reads(io_engine & io, const std::string & path,
     const size_t submitted = io.submit(reqs.data(), reqs.size());
     CHECK(submitted == reqs.size(), "%s: submit accepted all %zu requests", label, reqs.size());
 
+    // Reap until every tag is back, as the engine's callers do. Not while
+    // in_flight(): on the threads backend that drops when a read completes, not
+    // when it is reaped, so the loop could end with completions still queued.
     std::vector<uint64_t> got;
     uint64_t tags[64];
-    while (io.in_flight()) {
+    while (got.size() < submitted) {
         const size_t n = io.reap(tags, 64, 1);
+        if (n == 0) break;
         for (size_t i = 0; i < n; i++) got.push_back(tags[i]);
     }
     CHECK(got.size() == reqs.size(), "%s: reaped %zu of %zu completions", label, got.size(), reqs.size());
@@ -261,6 +269,49 @@ int main() {
         // And a good init still works after the failed one on the same object.
         CHECK(io.init({tmp}, 8, true, err), "re-init after failure works");
         io.shutdown();
+    }
+
+    printf("\n[9] io_engine: a rejected request completes as an error\n");
+    set_dio_align(QWFN_DIO_PAGE);
+    for (int b = 0; b < 2; b++) {
+        // A request naming a shard that does not exist is refused at submit, and
+        // must still come back from reap(): every caller counts completions, so
+        // one that never arrives hangs it, and one counted in flight for ever
+        // hangs every `while (in_flight()) reap()` loop.
+        const io_engine::backend be = b ? io_engine::backend::threads : io_engine::backend::uring;
+        const char * name = b ? "threads" : "default";
+        io_engine io;
+        std::string err;
+        CHECK(io.init({tmp}, 8, true, err, be), "%s: init", name);
+        void * d1 = dio_alloc(1u << 20);
+        void * d2 = dio_alloc(1u << 20);
+        io_request r[3] = { { 0, 4096 * 10, 4096, d1, 1 },
+                            { 7, 0,         4096, d1, 2 },     // shard 7 does not exist
+                            { 0, 4096 * 20, 4096, d2, 3 } };
+        CHECK(io.submit(r, 3) == 3, "%s: submit takes all three, the bad one included", name);
+        std::vector<uint64_t> got;
+        uint64_t tags[8];
+        while (got.size() < 3) {
+            const size_t n = io.reap(tags, 8, 1);
+            if (n == 0) break;
+            got.insert(got.end(), tags, tags + n);
+        }
+        std::sort(got.begin(), got.end());
+        CHECK(got == std::vector<uint64_t>({ 1, 2, 3 }), "%s: every tag comes back once, the rejected one too (%zu reaped)", name, got.size());
+        CHECK(io.in_flight() == 0, "%s: nothing left in flight (in_flight=%zu)", name, io.in_flight());
+        CHECK(io.stat_errors == 1, "%s: the rejection is one error (stat_errors=%llu)", name,
+              (unsigned long long) io.stat_errors);
+        CHECK(payload_matches(io, d1, r[0].offset, r[0].nbytes) && payload_matches(io, d2, r[2].offset, r[2].nbytes),
+              "%s: the good reads around it landed", name);
+        // and the engine still serves reads afterwards
+        io_request again{ 0, 4096 * 30 + 5, 1000, d1, 9 };
+        CHECK(io.submit(&again, 1) == 1, "%s: a later submit is accepted", name);
+        const size_t n = io.reap(tags, 8, 1);
+        CHECK(n == 1 && tags[0] == 9 && payload_matches(io, d1, again.offset, again.nbytes),
+              "%s: and completes with its payload", name);
+        io.shutdown();
+        dio_free(d1);
+        dio_free(d2);
     }
 
     printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
