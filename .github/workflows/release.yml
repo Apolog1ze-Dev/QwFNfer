@@ -25,6 +25,9 @@ on:
       - cmake/**
       - .github/workflows/release.yml
       - .github/actions/**
+      - .github/scripts/bundle_check.py
+      - .github/scripts/tiny_model_check.py
+      - tools/make_tiny_model.py
 permissions:
   contents: read
 concurrency:
@@ -110,6 +113,13 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then export VERSION="$GITHUB_REF_NAME"; fi
           LLAMA_CPP_ROOT="$HOME/llama.cpp" GGML_LIBS="$HOME/ggml-build/bin" \
             CUDA_LIBS="$CUDA_HOME/targets/x86_64-linux/lib" bash scripts/package.sh
+      - name: The zip, unpacked, on the CPU (.github/scripts/bundle_check.py)
+        run: |
+          cmake --build build-portable --target qwfn-gen qwfn-refdump qwfn-logits | tail -2
+          # no NVIDIA driver here: without the link stub the bundle meets the missing libcuda.so.1
+          # of a machine that has none, and runs on the CPU
+          rm -f /usr/lib/x86_64-linux-gnu/libcuda.so.1 && ldconfig
+          python3 .github/scripts/bundle_check.py dist/qwfnfer-linux-x86_64-cuda.zip build-portable "$RUNNER_TEMP/bundle-check"
       - uses: actions/upload-artifact@v6
         with:
           name: qwfnfer-linux-x86_64-cuda
@@ -167,6 +177,13 @@ jobs:
           $env:GGML_LIBS = "$env:RUNNER_TEMP\ggml-build\bin"
           if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:VERSION = $env:GITHUB_REF_NAME }
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
+          if ($LASTEXITCODE) { exit 1 }
+      - name: The zip, unpacked, on the CPU (.github\scripts\bundle_check.py)
+        # no NVIDIA driver on the runner, so ggml-cuda.dll does not load: the CPU variants run
+        run: |
+          cmake --build build-portable-win --target qwfn-gen qwfn-refdump qwfn-logits
+          if ($LASTEXITCODE) { exit 1 }
+          python .github\scripts\bundle_check.py dist\qwfnfer-windows-x86_64-cuda.zip build-portable-win "$env:RUNNER_TEMP\bundle-check"
           if ($LASTEXITCODE) { exit 1 }
       - uses: actions/upload-artifact@v6
         with:

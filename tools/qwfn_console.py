@@ -990,9 +990,11 @@ def status():
 def set_threads(n):
     port = STATE["port"]
     r = fetch_json(f"http://127.0.0.1:{port}/props", 5.0, {"threads": int(n)})
-    if r and r.get("n_threads") == int(n):
-        if STATE["settings"]: STATE["settings"]["threads"] = int(n)
-        return {"ok": True, "threads": int(n)}
+    got = r.get("n_threads") if r else None
+    # the engine takes at most as many threads as there are CPUs
+    if isinstance(got, int) and 1 <= got <= int(n):
+        if STATE["settings"]: STATE["settings"]["threads"] = got
+        return {"ok": True, "threads": got}
     return {"error": "the server did not take the thread count (is a request running?)"}
 
 # ---- measurements through the server (the self-test and the tune share them) ----

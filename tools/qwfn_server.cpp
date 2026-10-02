@@ -1711,7 +1711,7 @@ int main(int argc, char ** argv) {
             std::unique_lock<std::mutex> lk(S.mu, std::try_to_lock);
             if (!lk.owns_lock()) { fail(res, 409, "a request is running; set threads between requests"); return; }
             S.eng.set_n_threads(n);
-            fprintf(stderr, "[qwfn-server] threads set to %d\n", n);
+            fprintf(stderr, "[qwfn-server] threads set to %d\n", S.eng.n_threads());
         }
         res.set_content(props_json().dump(2, ' ', false, json::error_handler_t::replace), "application/json");
     });

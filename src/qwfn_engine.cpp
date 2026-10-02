@@ -11,6 +11,7 @@
 #include <chrono>
 #include <numeric>
 #include <sstream>
+#include <thread>
 
 namespace qwfn {
 
@@ -72,6 +73,13 @@ static void qwfn_ggml_log(enum ggml_log_level level, const char * text, void * /
 }
 
 void engine::set_n_threads(int n) {
+    // Never more than the CPUs there are: every ggml barrier then waits on a descheduled
+    // thread. With libgomp, the default 8 on a 4-CPU machine ran decode 50x slower than 4.
+    const int hw = (int) std::thread::hardware_concurrency();
+    if (hw > 0 && n > hw) {
+        fprintf(stderr, "[qwfn] %d threads asked for, %d CPUs: using %d\n", n, hw, hw);
+        n = hw;
+    }
     n_threads_ = std::max(1, n);
     wh_.set_n_threads(n_threads_);
     w_.set_n_threads(n_threads_);
