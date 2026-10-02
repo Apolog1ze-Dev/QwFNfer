@@ -199,6 +199,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/release-notes
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -211,7 +214,9 @@ jobs:
           cd dist && sha256sum qwfnfer-*.zip > SHA256SUMS && cat SHA256SUMS && cd ..
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             pre=""; case "$tag" in *-*) pre="--prerelease" ;; esac
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$tag" --generate-notes $pre
+            # .github/release-notes/<tag>.md, when there is one, goes above GitHub's generated list
+            notes=(); if [ -f ".github/release-notes/$tag.md" ]; then notes=(--notes-file ".github/release-notes/$tag.md"); fi
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --title "QwFNfer $tag" --generate-notes "${notes[@]}" $pre
           fi
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
             dist/qwfnfer-linux-x86_64-cuda.zip dist/qwfnfer-windows-x86_64-cuda.zip dist/SHA256SUMS
