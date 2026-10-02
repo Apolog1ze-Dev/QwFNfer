@@ -62,8 +62,14 @@ jobs:
         run: |
           python3 tools/make_synth_gguf.py synth.gguf
           build/qwfn-inspect synth.gguf
-          build/qwfn-iobench synth.gguf --tokens 8 --ram 1
+          build/qwfn-iobench synth.gguf --tokens 8 --ram 2
+          build/qwfn-iobench synth.gguf --tokens 8 --ram 1 | grep "less than 1 GB"   # a refused tier is reported, not a crash
           { build/qwfn-server 2>&1 || true; } | grep -q "usage: qwfn-server"
+      - name: Tiny model, the engine against llama.cpp
+        run: |
+          # the tools look for the ggml backends where a source checkout keeps them
+          mkdir -p "$HOME/.unsloth/llama.cpp/build" && ln -sfn "$HOME/llama-cpu/bin" "$HOME/.unsloth/llama.cpp/build/bin"
+          python3 .github/scripts/tiny_model_check.py build "$RUNNER_TEMP"
       - name: Console API over a model cache
         run: |
           python3 -m py_compile tools/qwfn_console.py tools/qwfn_router.py tools/make_synth_gguf.py
@@ -127,10 +133,17 @@ jobs:
           if ($LASTEXITCODE) { exit 1 }
           build\qwfn-inspect.exe synth.gguf
           if ($LASTEXITCODE) { exit 1 }
-          build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 1
-          if ($LASTEXITCODE) { exit 1 }
+          build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 2
+          if ($LASTEXITCODE) { "qwfn-iobench exited with $LASTEXITCODE"; exit 1 }
+          $out = (cmd /c "build\qwfn-iobench.exe synth.gguf --tokens 8 --ram 1 2>&1") -join "`n"
+          if ($LASTEXITCODE -or $out -notmatch 'less than 1 GB') { $out; "qwfn-iobench with a refused RAM tier exited with $LASTEXITCODE"; exit 1 }
           $out = (cmd /c "build\qwfn-server.exe 2>&1") -join "`n"
           if ($out -notmatch 'usage: qwfn-server') { $out; throw 'qwfn-server does not start (missing DLL?)' }
+      - name: Tiny model, the engine against llama.cpp
+        # no ~/.unsloth tree here: the tools take the ggml backends staged next to them
+        run: |
+          python .github\scripts\tiny_model_check.py build $env:RUNNER_TEMP
+          if ($LASTEXITCODE) { exit 1 }
       - name: Console API over a model cache
         run: |
           python -m py_compile tools\qwfn_console.py tools\qwfn_router.py tools\make_synth_gguf.py
