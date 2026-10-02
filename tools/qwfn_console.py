@@ -310,6 +310,34 @@ def hardware():
     hw["smt"] = hw["cpu_threads"] > hw["cpu_cores"]
     return hw
 
+def parse_pcie(text):
+    """nvidia-smi's pcie.link.gen.current, .gen.max, .width.current, .width.max (csv, no units), first
+    GPU: {"gen", "gen_max", "width", "width_max"}, the maxima being what this GPU and this slot can
+    do together; None when the line does not parse."""
+    try:
+        v = [int(x) for x in text.strip().splitlines()[0].split(",")]
+        return dict(zip(("gen", "gen_max", "width", "width_max"), v)) if len(v) == 4 else None
+    except Exception:
+        return None
+
+def pcie_link():
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout
+        return parse_pcie(out)
+    except Exception:
+        return None
+
+def link_note(seen):
+    """A note when the link never reached the generation or width the GPU and slot can do while the
+    tune loaded it. At idle a healthy link drops to Gen1 to save power, so only the best it reached
+    under load counts. One reporter's link trained down to Gen1 under load and stayed there (issue #6):
+    prefill 241 -> 643 tok/s and decode 8.1 -> 15.6 once the BIOS set the slot to Gen4."""
+    if not seen or (seen["gen"] >= seen["gen_max"] and seen["width"] >= seen["width_max"]): return None
+    return ("the GPU's PCIe link reached only Gen%d x%d while the tune loaded it, against Gen%d x%d that this GPU and slot can do: every expert "
+            "the RAM tier serves crosses that link. A link that trains down under load is usually fixed in the BIOS, by setting the slot's "
+            "PCIe generation from Auto to the GPU's" % (seen["gen"], seen["width"], seen["gen_max"], seen["width_max"]))
+
 def mem_available_gb():
     if os.name == "nt":
         try:
@@ -1132,10 +1160,16 @@ def run_tune(model, preset, settings_in):
     def check_cancel():
         if T["cancel"]: raise RuntimeError("cancelled")
     result = {"model": model["name"], "preset": preset, "date": time.strftime("%Y-%m-%d %H:%M"), "notes": []}
-    mem_watch = {"min": 1e9, "stop": False}
+    mem_watch = {"min": 1e9, "stop": False, "link": None, "link_t": 0.0}
     def watch():
+        # memory every half second; the GPU's PCIe link every 3 s, keeping the best it reached
         while not mem_watch["stop"]:
-            mem_watch["min"] = min(mem_watch["min"], mem_available_gb()); time.sleep(0.5)
+            mem_watch["min"] = min(mem_watch["min"], mem_available_gb())
+            if time.time() - mem_watch["link_t"] >= 3.0:
+                mem_watch["link_t"] = time.time()
+                lk, best = pcie_link(), mem_watch["link"]
+                if lk: mem_watch["link"] = lk if not best else {**lk, "gen": max(lk["gen"], best["gen"]), "width": max(lk["width"], best["width"])}
+            time.sleep(0.5)
     watcher = None
     try:
         # 0. a running server goes first: the drive is probed idle and the memory the plan
@@ -1258,6 +1292,9 @@ def run_tune(model, preset, settings_in):
         # 6. memory: what the server needs besides the tier, measured; then the tier that
         #    leaves the headroom, and a restart with it when that is a different size
         mem_watch["stop"] = True; time.sleep(0.6)
+        if mem_watch["link"]:
+            result["pcie"] = mem_watch["link"]; note = link_note(mem_watch["link"])
+            if note: result["notes"].append(note); log("PCIe link: Gen%d x%d at best under load, of Gen%d x%d" % (mem_watch["link"]["gen"], mem_watch["link"]["width"], mem_watch["link"]["gen_max"], mem_watch["link"]["width_max"]))
         mn = mem_watch["min"]; result["mem_min_gb"] = round(mn, 1)
         built_ram = float(built.get("ram_tier_gb") or plan["ram"])
         host_other = max(2.0, result["avail_gb"] - mn - built_ram)
