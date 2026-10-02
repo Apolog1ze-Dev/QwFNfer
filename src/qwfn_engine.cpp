@@ -2593,7 +2593,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 ggml_backend_tensor_get(t_pg_, pgh.data(), 0, nfl * sizeof(float));
                 const bool bc = bad(acc.data(), nfl), bg = bad(pgh.data(), nfl);
                 if (bc || bg) {
-                    fprintf(stderr, "[nan-check] token %d layer %u: %s%s | experts:", n_past, il, bc ? "CPU partial " : "", bg ? "GPU partial" : "");
+                    fprintf(stderr, "[nan-check] token %lld layer %u: %s%s | experts:", (long long) n_past, il, bc ? "CPU partial " : "", bg ? "GPU partial" : "");
                     for (int64_t e = 0; e < U; e++) fprintf(stderr, " %d%s%s%s", sel_[e], eh[e].on_gpu ? "g" : "c", eh[e].from_cold ? "*" : "", eh[e].late ? "L" : "");
                     fprintf(stderr, "\n");
                 }
